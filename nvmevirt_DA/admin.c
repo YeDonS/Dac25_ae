@@ -2,7 +2,9 @@
 
 #include "nvmev.h"
 #include "conv_ftl.h"
+#if 0  // Force disabled ZNS support
 #include "zns_ftl.h"
+#endif
 
 #define sq_entry(entry_id) \
 	queue->nvme_sq[SQ_ENTRY_TO_PAGE_NUM(entry_id)][SQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
@@ -207,7 +209,7 @@ static void __nvmev_admin_get_log_page(int eid, int cq_head)
 				// [nvme_admin_keep_alive] = cpu_to_le32(NVME_CMD_EFFECTS_CSUPP),
 			},
 			.iocs = {
-#if SUPPORTED_SSD_TYPE(ZNS)
+#if 0  // Force disabled ZNS support
 				/*
 				 * Zone Append is unsupported at the moment, but we fake it so that
 				 * Linux device driver doesn't lock it to R/O.
@@ -353,6 +355,7 @@ static void __nvmev_admin_identify_namespace_desc(int eid, int cq_head)
 	cq_entry(cq_head).status = queue->phase | NVME_SC_SUCCESS << 1;
 }
 
+#if 0  // Force disabled ZNS support - ZNS functions completely removed
 static void __nvmev_admin_identify_zns_namespace(int eid, int cq_head)
 {
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
@@ -416,6 +419,7 @@ static void __nvmev_admin_identify_zns_ctrl(int eid, int cq_head)
 	cq_entry(cq_head).sq_head = eid;
 	cq_entry(cq_head).status = queue->phase | NVME_SC_SUCCESS << 1;
 }
+#endif
 
 static void __nvmev_admin_set_features(int eid, int cq_head)
 {
@@ -509,12 +513,14 @@ static void __nvmev_proc_admin_req(int entry_id)
 		case 0x03:
 			__nvmev_admin_identify_namespace_desc(entry_id, cq_head);
 			break;
+#if 0  // Force disabled ZNS support
 		case 0x05:
 			__nvmev_admin_identify_zns_namespace(entry_id, cq_head);
 			break;
 		case 0x06:
 			__nvmev_admin_identify_zns_ctrl(entry_id, cq_head);
 			break;
+#endif
 		default:
 			NVMEV_ERROR("I don't know %d\n", cns);
 		}
@@ -576,4 +582,4 @@ void nvmev_proc_admin_sq(int new_db, int old_db)
 
 void nvmev_proc_admin_cq(int new_db, int old_db)
 {
-}
+} 
