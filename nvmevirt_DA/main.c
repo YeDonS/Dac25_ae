@@ -18,7 +18,9 @@
 
 #include "nvmev.h"
 #include "conv_ftl.h"
+#if (BASE_SSD == WD_ZN540)
 #include "zns_ftl.h"
+#endif
 #include "simple_ftl.h"
 #include "kv_ftl.h"
 #include "dma.h"
@@ -517,8 +519,10 @@ void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 			simple_init_namespace(&ns[i], i, size, ns_addr, disp_no);
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_CONV)
 			conv_init_namespace(&ns[i], i, size, ns_addr, disp_no);
+#if (BASE_SSD == WD_ZN540)
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_ZNS)
 			zns_init_namespace(&ns[i], i, size, ns_addr, disp_no);
+#endif
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_KV)
 			kv_init_namespace(&ns[i], i, size, ns_addr, disp_no);
 		else
@@ -546,8 +550,10 @@ void NVMEV_NAMESPACE_FINAL(struct nvmev_dev *nvmev_vdev)
 			simple_remove_namespace(&ns[i]);
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_CONV)
 			conv_remove_namespace(&ns[i]);
+#if (BASE_SSD == WD_ZN540)
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_ZNS)
 			zns_remove_namespace(&ns[i]);
+#endif
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_KV)
 			kv_remove_namespace(&ns[i]);
 		else

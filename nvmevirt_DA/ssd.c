@@ -6,10 +6,7 @@
 #include "nvmev.h"
 #include "ssd.h"
 
-static inline uint64_t __get_ioclock(struct ssd *ssd)
-{
-	return cpu_clock(ssd->cpu_nr_dispatcher);
-}
+/* __get_ioclock 函数已移至 ssd.h */
 
 void buffer_init(struct buffer *buf, size_t size)
 {
@@ -203,6 +200,10 @@ static void ssd_init_nand_page(struct nand_page *pg, struct ssdparams *spp)
 	int i;
 	pg->nsecs = spp->secs_per_pg;
 	pg->sec = kmalloc(sizeof(nand_sec_status_t) * pg->nsecs, GFP_KERNEL);
+	if (!pg->sec) {
+		NVMEV_ERROR("Failed to allocate page sectors memory\n");
+		return;
+	}
 	for (i = 0; i < pg->nsecs; i++) {
 		pg->sec[i] = SEC_FREE;
 	}
@@ -219,6 +220,10 @@ static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp)
 	int i;
 	blk->npgs = spp->pgs_per_blk;
 	blk->pg = kmalloc(sizeof(struct nand_page) * blk->npgs, GFP_KERNEL);
+	if (!blk->pg) {
+		NVMEV_ERROR("Failed to allocate block pages memory\n");
+		return;
+	}
 	for (i = 0; i < blk->npgs; i++) {
 		ssd_init_nand_page(&blk->pg[i], spp);
 	}
@@ -243,6 +248,10 @@ static void ssd_init_nand_plane(struct nand_plane *pl, struct ssdparams *spp)
 	int i;
 	pl->nblks = spp->blks_per_pl;
 	pl->blk = kmalloc(sizeof(struct nand_block) * pl->nblks, GFP_KERNEL);
+	if (!pl->blk) {
+		NVMEV_ERROR("Failed to allocate plane blocks memory\n");
+		return;
+	}
 	for (i = 0; i < pl->nblks; i++) {
 		ssd_init_nand_blk(&pl->blk[i], spp);
 	}
@@ -263,6 +272,10 @@ static void ssd_init_nand_lun(struct nand_lun *lun, struct ssdparams *spp)
 	int i;
 	lun->npls = spp->pls_per_lun;
 	lun->pl = kmalloc(sizeof(struct nand_plane) * lun->npls, GFP_KERNEL);
+	if (!lun->pl) {
+		NVMEV_ERROR("Failed to allocate lun planes memory\n");
+		return;
+	}
 	for (i = 0; i < lun->npls; i++) {
 		ssd_init_nand_plane(&lun->pl[i], spp);
 	}
@@ -285,11 +298,19 @@ static void ssd_init_ch(struct ssd_channel *ch, struct ssdparams *spp)
 	int i;
 	ch->nluns = spp->luns_per_ch;
 	ch->lun = kmalloc(sizeof(struct nand_lun) * ch->nluns, GFP_KERNEL);
+	if (!ch->lun) {
+		NVMEV_ERROR("Failed to allocate channel luns memory\n");
+		return;
+	}
 	for (i = 0; i < ch->nluns; i++) {
 		ssd_init_nand_lun(&ch->lun[i], spp);
 	}
 
 	ch->perf_model = kmalloc(sizeof(struct channel_model), GFP_KERNEL);
+	if (!ch->perf_model) {
+		NVMEV_ERROR("Failed to allocate channel performance model memory\n");
+		return;
+	}
 	chmodel_init(ch->perf_model, spp->ch_bandwidth);
 
 	/* Add firmware overhead */
@@ -321,26 +342,33 @@ static void ssd_remove_pcie(struct ssd_pcie *pcie)
 
 void ssd_init(struct ssd *ssd, struct ssdparams *spp, uint32_t cpu_nr_dispatcher)
 {
-	uint32_t i;
-	/* copy spp */
+	int i;
+
 	ssd->sp = *spp;
-
-	/* initialize conv_ftl internal layout architecture */
-	ssd->ch = kmalloc(sizeof(struct ssd_channel) * spp->nchs, GFP_KERNEL); // 40 * 8 = 320
-	for (i = 0; i < spp->nchs; i++) {
-		ssd_init_ch(&(ssd->ch[i]), spp);
-	}
-
-	/* Set CPU number to use same cpuclock as io.c */
 	ssd->cpu_nr_dispatcher = cpu_nr_dispatcher;
 
+	ssd->ch = kmalloc(sizeof(struct ssd_channel) * spp->nchs, GFP_KERNEL); // 40 * 8 = 320
+	if (!ssd->ch) {
+		NVMEV_ERROR("Failed to allocate SSD channels memory\n");
+		return;
+	}
+	for (i = 0; i < spp->nchs; i++) {
+		ssd_init_ch(&ssd->ch[i], spp);
+	}
+
 	ssd->pcie = kmalloc(sizeof(struct ssd_pcie), GFP_KERNEL);
+	if (!ssd->pcie) {
+		NVMEV_ERROR("Failed to allocate SSD PCIe memory\n");
+		return;
+	}
 	ssd_init_pcie(ssd->pcie, spp);
 
 	ssd->write_buffer = kmalloc(sizeof(struct buffer), GFP_KERNEL);
+	if (!ssd->write_buffer) {
+		NVMEV_ERROR("Failed to allocate SSD write buffer memory\n");
+		return;
+	}
 	buffer_init(ssd->write_buffer, spp->write_buffer_size);
-
-	return;
 }
 
 void ssd_remove(struct ssd *ssd)
@@ -390,7 +418,7 @@ uint64_t ssd_advance_write_buffer(struct ssd *ssd, uint64_t request_time, uint64
 static bool is_qlc_block_ssd(struct ssd *ssd, uint32_t blk_id)
 {
 	/* 简单的判断：前 20% 是 SLC，后 80% 是 QLC */
-	uint32_t slc_blks = ssd->sp.blks_per_pl * 0.2;
+	uint32_t slc_blks = ssd->sp.blks_per_pl / 5;  /* 0.2 = 1/5 */
 	return blk_id >= slc_blks;
 }
 
