@@ -424,15 +424,30 @@ static bool is_qlc_block_ssd(struct ssd *ssd, uint32_t blk_id)
 
 uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 {
-	int c = ncmd->cmd;
-	uint64_t cmd_stime = (ncmd->stime == 0) ? __get_ioclock(ssd) : ncmd->stime;
+    /* Defensive checks to avoid NULL deref and invalid operations */
+    uint64_t safe_now = __get_ioclock(ssd);
+    if (unlikely(!ssd)) {
+        return safe_now;
+    }
+    if (unlikely(!ncmd)) {
+        NVMEV_ERROR("ssd_advance_nand: NULL ncmd\n");
+        return safe_now;
+    }
+    if (unlikely(!ncmd->ppa)) {
+        NVMEV_ERROR("ssd_advance_nand: NULL ncmd->ppa (cmd=0x%x, xfer=%llu)\n", ncmd->cmd, ncmd->xfer_size);
+        /* return a bounded timestamp so callers can continue without crashing */
+        return (ncmd->stime == 0) ? safe_now : ncmd->stime;
+    }
+
+    int c = ncmd->cmd;
+    uint64_t cmd_stime = (ncmd->stime == 0) ? safe_now : ncmd->stime;
 	uint64_t nand_stime, nand_etime;
 	uint64_t chnl_stime, chnl_etime;
 	uint64_t remaining, xfer_size, completed_time;
 	struct ssdparams *spp;
 	struct nand_lun *lun;
 	struct ssd_channel *ch;
-	struct ppa *ppa = ncmd->ppa;
+    struct ppa *ppa = ncmd->ppa;
 	uint32_t cell;
 	bool is_qlc;
 	
@@ -440,10 +455,29 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 		"SSD: %p, Enter stime: %lld, ch %d lun %d blk %d page %d command %d ppa 0x%llx\n",
 		ssd, ncmd->stime, ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg, c, ppa->ppa);
 
-	if (ppa->ppa == UNMAPPED_PPA) {
+    if (unlikely(ppa->ppa == UNMAPPED_PPA)) {
 		NVMEV_ERROR("Error ppa 0x%llx\n", ppa->ppa);
 		return cmd_stime;
 	}
+
+    /* Validate address range before dereferencing channels/luns */
+    {
+        int ch_idx = ppa->g.ch;
+        int lun_idx = ppa->g.lun;
+        int pl_idx = ppa->g.pl;
+        int blk_idx = ppa->g.blk;
+        int pg_idx = ppa->g.pg;
+        struct ssdparams *vspp = &ssd->sp;
+        if (unlikely(ch_idx < 0 || ch_idx >= vspp->nchs ||
+                     lun_idx < 0 || lun_idx >= vspp->luns_per_ch ||
+                     pl_idx < 0 || pl_idx >= vspp->pls_per_lun ||
+                     blk_idx < 0 || blk_idx >= vspp->blks_per_pl ||
+                     pg_idx < 0 || pg_idx >= vspp->pgs_per_blk)) {
+            NVMEV_ERROR("ssd_advance_nand: invalid PPA ch=%d lun=%d pl=%d blk=%d pg=%d\n",
+                        ch_idx, lun_idx, pl_idx, blk_idx, pg_idx);
+            return cmd_stime;
+        }
+    }
 
 	spp = &ssd->sp;
 	lun = get_lun(ssd, ppa);
