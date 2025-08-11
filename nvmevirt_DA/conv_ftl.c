@@ -2,6 +2,7 @@
 
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
+#include <linux/delay.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -546,6 +547,7 @@ static struct ppa get_new_page_DA(struct conv_ftl *conv_ftl, uint32_t io_type)
 static void init_maptbl(struct conv_ftl *conv_ftl)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
+    int i;
 
 	conv_ftl->maptbl = vmalloc(sizeof(struct ppa) * spp->tt_pgs);
 	if (!conv_ftl->maptbl) {
@@ -553,7 +555,7 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 		return;
 	}
 
-	for (int i = 0; i < spp->tt_pgs; i++) {
+    for (i = 0; i < spp->tt_pgs; i++) {
 		conv_ftl->maptbl[i].ppa = UNMAPPED_PPA;
 	}
 }
@@ -566,6 +568,7 @@ static void remove_maptbl(struct conv_ftl *conv_ftl)
 static void init_rmap(struct conv_ftl *conv_ftl)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
+    int i;
 
 	conv_ftl->rmap = vmalloc(sizeof(uint64_t) * spp->tt_pgs);
 	if (!conv_ftl->rmap) {
@@ -573,7 +576,7 @@ static void init_rmap(struct conv_ftl *conv_ftl)
 		return;
 	}
 
-	for (int i = 0; i < spp->tt_pgs; i++) {
+    for (i = 0; i < spp->tt_pgs; i++) {
 		conv_ftl->rmap[i] = INVALID_LPN;
 	}
 }
@@ -582,6 +585,9 @@ static void remove_rmap(struct conv_ftl *conv_ftl)
 {
 	vfree(conv_ftl->rmap);
 }
+
+/* forward declaration to satisfy C90 before first use */
+static int init_slc_qlc_blocks_fallback(struct conv_ftl *conv_ftl);
 
 static int init_slc_qlc_blocks_with_retry(struct conv_ftl *conv_ftl, int max_retries)
 {
@@ -2237,21 +2243,43 @@ static void migrate_batch_to_qlc(struct conv_ftl *conv_ftl, struct ppa *slc_ppas
                                  uint64_t *lpns, uint32_t count)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct ppa new_ppas[count];
-	struct nand_cmd srds[count], swrs[count];
+    struct ppa *new_ppas;
+    struct nand_cmd *srds, *swrs;
 	uint64_t nsecs_completed;
 	uint32_t i;
 	
 	NVMEV_DEBUG("Starting batch migration of %d pages\n", count);
 	
+    new_ppas = kmalloc(sizeof(*new_ppas) * count, GFP_KERNEL);
+    if (!new_ppas) {
+        NVMEV_ERROR("Failed to allocate new_ppas for batch migration\n");
+        return;
+    }
+    srds = kmalloc(sizeof(*srds) * count, GFP_KERNEL);
+    if (!srds) {
+        NVMEV_ERROR("Failed to allocate srds for batch migration\n");
+        kfree(new_ppas);
+        return;
+    }
+    swrs = kmalloc(sizeof(*swrs) * count, GFP_KERNEL);
+    if (!swrs) {
+        NVMEV_ERROR("Failed to allocate swrs for batch migration\n");
+        kfree(srds);
+        kfree(new_ppas);
+        return;
+    }
+
 	/* 阶段1：并发获取QLC页面 - 轮询使用4个区域 */
 	for (i = 0; i < count; i++) {
 		uint32_t region = i % QLC_REGIONS;  /* 均匀分配到4个区域 */
 		new_ppas[i] = get_new_qlc_page(conv_ftl, region);
 		
-		if (!mapped_ppa(&new_ppas[i])) {
+        if (!mapped_ppa(&new_ppas[i])) {
 			NVMEV_ERROR("Failed to get QLC page for batch migration\n");
-			return;
+            kfree(swrs);
+            kfree(srds);
+            kfree(new_ppas);
+            return;
 		}
 	}
 	
@@ -2307,13 +2335,17 @@ static void migrate_batch_to_qlc(struct conv_ftl *conv_ftl, struct ppa *slc_ppas
 	
 	NVMEV_INFO("Batch migrated %d pages using %d QLC regions concurrently\n", 
 		   count, QLC_REGIONS);
+
+    kfree(swrs);
+    kfree(srds);
+    kfree(new_ppas);
 }
 
 /* 智能区域选择 - 根据负载选择最佳QLC区域 */
 static uint32_t select_best_qlc_region(struct conv_ftl *conv_ftl)
 {
-	uint32_t best_region = 0;
-	uint32_t min_load = UINT32_MAX;
+    uint32_t best_region = 0;
+    uint32_t min_load = ~0u;
 	uint32_t i;
 	
 	/* 选择当前负载最小的区域 */
