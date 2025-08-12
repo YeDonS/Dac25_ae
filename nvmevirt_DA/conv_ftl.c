@@ -588,6 +588,8 @@ static void remove_rmap(struct conv_ftl *conv_ftl)
 
 /* forward declaration to satisfy C90 before first use */
 static int init_slc_qlc_blocks_fallback(struct conv_ftl *conv_ftl);
+/* forward declare to avoid implicit declaration before first use */
+static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
 
 static int init_slc_qlc_blocks_with_retry(struct conv_ftl *conv_ftl, int max_retries)
 {
@@ -775,9 +777,13 @@ static void init_migration_mgmt(struct conv_ftl *conv_ftl)
 	conv_ftl->migration.migration_in_progress = false;
 	
 	/* 初始化统计计数器 */
-	conv_ftl->slc_write_cnt = 0;
-	conv_ftl->qlc_write_cnt = 0;
-	conv_ftl->migration_cnt = 0;
+    conv_ftl->slc_write_cnt = 0;
+    conv_ftl->qlc_write_cnt = 0;
+    conv_ftl->migration_cnt = 0;
+
+    /* 初始化账本并发保护锁 */
+    spin_lock_init(&conv_ftl->slc_lock);
+    spin_lock_init(&conv_ftl->qlc_lock);
 }
 
 /* 初始化 SLC line 管理 */
@@ -1117,17 +1123,20 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	bool was_full_line = false;
 	struct line *line;
 
-	/* update corresponding page status */
-	pg = get_pg(conv_ftl->ssd, ppa);
-	NVMEV_ASSERT(pg->status == PG_VALID);
-	pg->status = PG_INVALID;
+    /* update corresponding page status */
+    pg = get_pg(conv_ftl->ssd, ppa);
+    NVMEV_ASSERT(pg->status == PG_VALID);
+    pg->status = PG_INVALID;
 
-	/* update corresponding block status */
-	blk = get_blk(conv_ftl->ssd, ppa);
-	NVMEV_ASSERT(blk->ipc >= 0 && blk->ipc < spp->pgs_per_blk);
-	blk->ipc++;
-	NVMEV_ASSERT(blk->vpc > 0 && blk->vpc <= spp->pgs_per_blk);
-	blk->vpc--;
+    /* update corresponding block status (防御：vpc>0 才能减) */
+    blk = get_blk(conv_ftl->ssd, ppa);
+    NVMEV_ASSERT(blk->ipc >= 0 && blk->ipc < spp->pgs_per_blk);
+    blk->ipc++;
+    if (blk->vpc > 0) {
+        blk->vpc--;
+    } else {
+        NVMEV_ERROR("blk->vpc already 0 before decrement, blk=%d\n", ppa->g.blk);
+    }
 
     /* update corresponding line status (map blk -> line index in对应账本) */
     if (in_slc) {
@@ -1138,19 +1147,30 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         NVMEV_ASSERT(idx < lm->tt_lines);
         line = &lm->lines[idx];
     }
-	NVMEV_ASSERT(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
+    if (in_slc)
+        NVMEV_ASSERT(line->ipc >= 0 && line->ipc < spp->pgs_per_lun_line);
+    else
+        NVMEV_ASSERT(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
 	if (line->vpc == spp->pgs_per_line) {
 		NVMEV_ASSERT(line->ipc == 0);
 		was_full_line = true;
 	}
-	line->ipc++;
-	NVMEV_ASSERT(line->vpc > 0 && line->vpc <= spp->pgs_per_line);
+    line->ipc++;
+    /* 自增后再防御性校验并钳制 */
+    if (in_slc && line->ipc > spp->pgs_per_lun_line)
+        line->ipc = spp->pgs_per_lun_line;
+    if (!in_slc && line->ipc > spp->pgs_per_line)
+        line->ipc = spp->pgs_per_line;
+    if (in_slc)
+        NVMEV_ASSERT(line->vpc > 0 && line->vpc <= spp->pgs_per_lun_line);
+    else
+        NVMEV_ASSERT(line->vpc > 0 && line->vpc <= spp->pgs_per_line);
 	/* Adjust the position of the victime line in the pq under over-writes */
-	if (line->pos) {
+    if (line->pos) {
 		/* Note that line->vpc will be updated by this call */
-		pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
+        pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
 	} else {
-		line->vpc--;
+        if (line->vpc > 0) line->vpc--; else line->vpc = 0;
 	}
 
 	if (was_full_line) {
@@ -1173,15 +1193,16 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
     struct line_mgmt *lm = in_slc ? &conv_ftl->slc_lm : &conv_ftl->qlc_lm;
     struct line *line;
 
-	/* update page status */
-	pg = get_pg(conv_ftl->ssd, ppa);
-	NVMEV_ASSERT(pg->status == PG_FREE);
-	pg->status = PG_VALID;
+    /* update page status */
+    pg = get_pg(conv_ftl->ssd, ppa);
+    NVMEV_ASSERT(pg->status == PG_FREE);
+    pg->status = PG_VALID;
 
-	/* update corresponding block status */
-	blk = get_blk(conv_ftl->ssd, ppa);
-	NVMEV_ASSERT(blk->vpc >= 0 && blk->vpc < spp->pgs_per_blk);
-	blk->vpc++;
+    /* update corresponding block status */
+    blk = get_blk(conv_ftl->ssd, ppa);
+    NVMEV_ASSERT(blk->vpc >= 0 && blk->vpc < spp->pgs_per_blk);
+    blk->vpc++;
+    if (blk->vpc > spp->pgs_per_blk) blk->vpc = spp->pgs_per_blk;
 
     /* update corresponding line status */
     if (in_slc) {
@@ -1192,8 +1213,15 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         NVMEV_ASSERT(idx < lm->tt_lines);
         line = &lm->lines[idx];
     }
-	NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
-	line->vpc++;
+    if (in_slc)
+        NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_lun_line);
+    else
+        NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
+    line->vpc++;
+    if (in_slc && line->vpc > spp->pgs_per_lun_line)
+        line->vpc = spp->pgs_per_lun_line;
+    if (!in_slc && line->vpc > spp->pgs_per_line)
+        line->vpc = spp->pgs_per_line;
 
 }
 
@@ -1539,13 +1567,13 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 		};
 	}
 	
-	/* 获取当前页 */
-	ppa.ppa = 0;
-	ppa.g.ch = wp->ch;
-	ppa.g.lun = wp->lun;
-	ppa.g.pg = wp->pg;
-	ppa.g.blk = wp->blk;
-	ppa.g.pl = wp->pl;
+    /* 获取当前页 */
+    ppa.ppa = 0;
+    ppa.g.ch = wp->ch;
+    ppa.g.lun = wp->lun;
+    ppa.g.pg = wp->pg;
+    ppa.g.blk = wp->blk;
+    ppa.g.pl = wp->pl;
 	
 	return ppa;
 }
@@ -1560,7 +1588,7 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
 		NVMEV_ERROR("advance_slc_write_pointer: SLC WP not initialized\n");
 		return;
 	}
-	wp->pg++;
+    wp->pg++;
 	
 	/* 检查是否需要移到下一个 block */
 	if (wp->pg >= spp->pgs_per_blk) {
@@ -1651,7 +1679,7 @@ static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region
 	wp->pg++;
 	
 	/* QLC 每个块的页数是 SLC 的配置倍数 */
-	if ((wp->pg % spp->pgs_per_oneshotpg) != 0)
+    if ((wp->pg % spp->pgs_per_oneshotpg) != 0)
 		goto out;
 	
 	wp->pg -= spp->pgs_per_oneshotpg;
@@ -1813,11 +1841,13 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 	NVMEV_ASSERT(conv_ftls);
 	NVMEV_DEBUG("conv_read: start_lpn=%lld, len=%lld, end_lpn=%lld", start_lpn, nr_lba, end_lpn);
-	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
-		NVMEV_ERROR("conv_read: lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
-			    start_lpn, spp->tt_pgs);
-		return false;
-	}
+    if ((end_lpn / nr_parts) >= spp->tt_pgs) {
+        NVMEV_ERROR("conv_read: lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
+                    start_lpn, spp->tt_pgs);
+        ret->status = NVME_SC_LBA_RANGE;
+        ret->nsecs_target = nsecs_start;
+        return true; /* Return completion with error to avoid host timeout */
+    }
 
 	if (LBA_TO_BYTE(nr_lba) <= (KB(4) * nr_parts)) {
 		srd.stime += spp->fw_4kb_rd_lat;
@@ -1972,16 +2002,23 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 	NVMEV_DEBUG("conv_write: start_lpn=%lld, len=%lld, end_lpn=%lld", start_lpn, nr_lba, end_lpn);
 	//NVMEV_ERROR("conv_write: start_lpn=%lld, len=%lld, end_lpn=%lld", start_lpn, nr_lba, end_lpn);
-	if ((end_lpn / nr_parts) >= spp->tt_pgs) {
-		NVMEV_ERROR("conv_write: lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
-			    start_lpn, spp->tt_pgs);
-		return false;
-	}
+    if ((end_lpn / nr_parts) >= spp->tt_pgs) {
+        NVMEV_ERROR("conv_write: lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
+                    start_lpn, spp->tt_pgs);
+        ret->status = NVME_SC_LBA_RANGE;
+        ret->nsecs_target = req->nsecs_start;
+        return true; /* Return completion with error to avoid host timeout */
+    }
 
-	allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
+    allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
 	//NVMEV_ERROR("conv_write: buffer alloc size = %u\n", allocated_buf_size);
-	if (allocated_buf_size < LBA_TO_BYTE(nr_lba))
-		return false;
+    if (allocated_buf_size < LBA_TO_BYTE(nr_lba)) {
+        NVMEV_ERROR("conv_write: insufficient write buffer (%u < %lu)\n",
+                    allocated_buf_size, LBA_TO_BYTE(nr_lba));
+        ret->status = NVME_SC_WRITE_FAULT;
+        ret->nsecs_target = req->nsecs_start;
+        return true; /* Complete with error */
+    }
 
 	nsecs_latest = ssd_advance_write_buffer(conv_ftl->ssd, req->nsecs_start, LBA_TO_BYTE(nr_lba));
 	nsecs_xfer_completed = nsecs_latest;
@@ -1991,9 +2028,9 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
 		uint64_t local_lpn;
 		uint64_t nsecs_completed = 0;
-		uint64_t write_lat;  /* 移动变量声明到循环开头 */
-		struct ppa ppa;
-		struct ppa old_ppa;  /* 用于迁移检查 */
+        uint64_t write_lat;  /* 移动变量声明到循环开头 */
+        struct ppa ppa;
+        struct ppa old_ppa = { .ppa = UNMAPPED_PPA };  /* 用于迁移检查 */
 
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
@@ -2048,11 +2085,12 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		/* 修改：所有新写入都先写到 SLC */
 		/* 使用 Die Affinity 写入 SLC */
 		ppa = get_new_slc_page(conv_ftl);
-		if (!mapped_ppa(&ppa)) {
-			NVMEV_ERROR("Failed to get SLC page for write\n");
-			ret->status = NVME_SC_WRITE_FAULT;
-			return false;
-		}
+        if (!mapped_ppa(&ppa)) {
+            NVMEV_ERROR("Failed to get SLC page for write\n");
+            ret->status = NVME_SC_WRITE_FAULT;
+            ret->nsecs_target = nsecs_latest;
+            return true; /* Complete with error */
+        }
 		
 		/* 记录页面在 SLC 中 */
 		conv_ftl->page_in_slc[local_lpn] = true;
@@ -2103,7 +2141,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		conv_ftl->heat_track.last_access_time[local_lpn] = ktime_get_ns();
 		
 		/* 如果之前标记了需要迁移，现在执行迁移 */
-		if (mapped_ppa(&old_ppa) && conv_ftl->page_in_slc[local_lpn]) {
+        if (mapped_ppa(&old_ppa) && conv_ftl->page_in_slc[local_lpn]) {
 			if (should_migrate_to_qlc(conv_ftl, local_lpn)) {
 				/* 异步迁移到 QLC */
 				migrate_page_to_qlc(conv_ftl, local_lpn, &old_ppa);
@@ -2165,6 +2203,7 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 		if (ret) ret->status = NVME_SC_INTERNAL;
 		return false;
 	}
+    /* C90: declarations must precede statements */
     struct nvme_command *cmd = req->cmd;
 	NVMEV_ASSERT(ns->csi == NVME_CSI_NVM);
 
