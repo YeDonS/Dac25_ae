@@ -552,12 +552,14 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->maptbl = vmalloc(sizeof(struct ppa) * spp->tt_pgs);
 	if (!conv_ftl->maptbl) {
 		NVMEV_ERROR("Failed to allocate mapping table memory\n");
+        conv_ftl->maptbl_initialized = false;
 		return;
 	}
 
     for (i = 0; i < spp->tt_pgs; i++) {
 		conv_ftl->maptbl[i].ppa = UNMAPPED_PPA;
 	}
+    conv_ftl->maptbl_initialized = true;
 }
 
 static void remove_maptbl(struct conv_ftl *conv_ftl)
@@ -573,12 +575,14 @@ static void init_rmap(struct conv_ftl *conv_ftl)
 	conv_ftl->rmap = vmalloc(sizeof(uint64_t) * spp->tt_pgs);
 	if (!conv_ftl->rmap) {
 		NVMEV_ERROR("Failed to allocate reverse mapping table memory\n");
+        conv_ftl->rmap_initialized = false;
 		return;
 	}
 
     for (i = 0; i < spp->tt_pgs; i++) {
 		conv_ftl->rmap[i] = INVALID_LPN;
 	}
+    conv_ftl->rmap_initialized = true;
 }
 
 static void remove_rmap(struct conv_ftl *conv_ftl)
@@ -1140,8 +1144,10 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
     /* update corresponding line status (map blk -> line index in对应账本) */
     if (in_slc) {
+        spin_lock(&conv_ftl->slc_lock);
         line = &lm->lines[ppa->g.blk];
     } else {
+        spin_lock(&conv_ftl->qlc_lock);
         uint32_t start_blk = conv_ftl->slc_blks_per_pl;
         uint32_t idx = ppa->g.blk - start_blk;
         NVMEV_ASSERT(idx < lm->tt_lines);
@@ -1177,10 +1183,14 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		/* move line: "full" -> "victim" */
 		list_del_init(&line->entry);
 		lm->full_line_cnt--;
-		pqueue_insert(lm->victim_line_pq, line);
+        pqueue_insert(lm->victim_line_pq, line);
 		lm->victim_line_cnt++;
 	}
 
+    if (in_slc)
+        spin_unlock(&conv_ftl->slc_lock);
+    else
+        spin_unlock(&conv_ftl->qlc_lock);
 }
 
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -1206,8 +1216,10 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
     /* update corresponding line status */
     if (in_slc) {
+        spin_lock(&conv_ftl->slc_lock);
         line = &lm->lines[ppa->g.blk];
     } else {
+        spin_lock(&conv_ftl->qlc_lock);
         uint32_t start_blk = conv_ftl->slc_blks_per_pl;
         uint32_t idx = ppa->g.blk - start_blk;
         NVMEV_ASSERT(idx < lm->tt_lines);
@@ -1218,6 +1230,15 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
     else
         NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
     line->vpc++;
+    if (in_slc && line->vpc > spp->pgs_per_lun_line)
+        line->vpc = spp->pgs_per_lun_line;
+    if (!in_slc && line->vpc > spp->pgs_per_line)
+        line->vpc = spp->pgs_per_line;
+
+    if (in_slc)
+        spin_unlock(&conv_ftl->slc_lock);
+    else
+        spin_unlock(&conv_ftl->qlc_lock);
     if (in_slc && line->vpc > spp->pgs_per_lun_line)
         line->vpc = spp->pgs_per_lun_line;
     if (!in_slc && line->vpc > spp->pgs_per_line)
@@ -1545,12 +1566,15 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 		return (struct ppa){ .ppa = UNMAPPED_PPA };
 	}
 	/* 如果 SLC 写指针未初始化，初始化它 */
-	if (!wp->curline) {
+    if (!wp->curline) {
+        /* Protect SLC free list and counters */
+        spin_lock(&conv_ftl->slc_lock);
 		struct line_mgmt *lm = &conv_ftl->slc_lm;
 		struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
 		
         if (!curline) {
             NVMEV_ERROR("No free SLC line available!\n");
+            spin_unlock(&conv_ftl->slc_lock);
             return (struct ppa){ .ppa = UNMAPPED_PPA };
         }
 		
@@ -1565,6 +1589,7 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 			.blk = curline->id,
 			.pl = 0,
 		};
+        spin_unlock(&conv_ftl->slc_lock);
 	}
 	
     /* 获取当前页 */
@@ -1591,7 +1616,8 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
     wp->pg++;
 	
 	/* 检查是否需要移到下一个 block */
-	if (wp->pg >= spp->pgs_per_blk) {
+    if (wp->pg >= spp->pgs_per_blk) {
+        spin_lock(&conv_ftl->slc_lock);
 		/* 当前 line 已满 */
 		if (wp->curline->vpc == spp->pgs_per_lun_line) {
 			list_add_tail(&wp->curline->entry, &lm->full_line_list);
@@ -1607,6 +1633,7 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
         NVMEV_ERROR("No free SLC line available!\n");
         /* 标记为未就绪，下一次 get_new_slc_page 将失败 */
         wp->curline = NULL;
+        spin_unlock(&conv_ftl->slc_lock);
         return;
     }
 		
@@ -1615,6 +1642,7 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
 		
 		wp->blk = wp->curline->id;
 		wp->pg = 0;
+        spin_unlock(&conv_ftl->slc_lock);
 	}
 	
 	/* Die 轮询 - 移到下一个 lun */
@@ -1635,12 +1663,15 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
 	struct write_pointer *wp = &conv_ftl->qlc_wp[region_id];
 	
 	/* 如果 QLC 写指针未初始化，初始化它 */
-	if (!wp->curline) {
+    if (!wp->curline) {
+        /* Protect QLC free list and counters */
+        spin_lock(&conv_ftl->qlc_lock);
 		struct line_mgmt *lm = &conv_ftl->qlc_lm;
 		struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
 		
         if (!curline) {
             NVMEV_ERROR("No free QLC line available in region %d!\n", region_id);
+            spin_unlock(&conv_ftl->qlc_lock);
             return (struct ppa){ .ppa = UNMAPPED_PPA };
         }
 		
@@ -1655,6 +1686,7 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
 			.blk = curline->id,
 			.pl = 0,
 		};
+        spin_unlock(&conv_ftl->qlc_lock);
 	}
 	
 	/* 获取当前页 */
@@ -1701,7 +1733,8 @@ static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region
 	/* 当前 block 已满，移到下一个 */
 	wp->pg = 0;
 	
-	if (wp->curline->vpc == qlc_pgs_per_blk * spp->nchs * spp->luns_per_ch) {
+    spin_lock(&conv_ftl->qlc_lock);
+    if (wp->curline->vpc == qlc_pgs_per_blk * spp->nchs * spp->luns_per_ch) {
 		list_add_tail(&wp->curline->entry, &lm->full_line_list);
 		lm->full_line_cnt++;
 	} else {
@@ -1715,12 +1748,14 @@ static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region
         NVMEV_ERROR("No free QLC line available in region %d!\n", region_id);
         /* 标记为未就绪，等待后续重新获取 */
         wp->curline = NULL;
+        spin_unlock(&conv_ftl->qlc_lock);
         return;
     }
 	
 	list_del_init(&wp->curline->entry);
 	lm->free_line_cnt--;
 	wp->blk = wp->curline->id;
+    spin_unlock(&conv_ftl->qlc_lock);
 	
 out:
 	return;
@@ -2116,23 +2151,28 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 		nsecs_completed = ssd_advance_write_buffer(conv_ftl->ssd, nsecs_latest, conv_ftl->ssd->sp.pgsz);
 
-		/* Check whether we need to do a write in this stripe */
-		if (((end_lpn + 1) % conv_ftl->ssd->sp.pgs_per_oneshotpg) == 0 ||
-		    lpn == end_lpn) {
-			xfer_size = ((lpn % conv_ftl->ssd->sp.pgs_per_oneshotpg) + 1) *
-				    conv_ftl->ssd->sp.pgsz;
+        /* Check whether we need to do a write in this stripe
+         * Use current page offset within oneshot page (flash page)
+         */
+        {
+            uint32_t pg_off = ppa.g.pg % spp->pgs_per_oneshotpg;
+            if (pg_off == (spp->pgs_per_oneshotpg - 1) || lpn == end_lpn) {
+                xfer_size = (pg_off + 1) * spp->pgsz;
 			swr.xfer_size = xfer_size;
 			
 			/* 使用 SLC 写延迟 */
 			write_lat = conv_ftl->ssd->sp.pg_wr_lat;
 			swr.ppa = &ppa;
 			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
+			/* 异步释放写缓冲，避免后续分配失败 */
+			enqueue_writeback_io_req(req->sq_id, nsecs_completed, wbuf, xfer_size);
 			/* schedule_internal_operation 暂时注释掉，函数不存在 */
 			/* schedule_internal_operation(conv_ftl->ssd, nsecs_completed, xfer_size, &ppa); */
 
 			//xfer_size = 0;
 			swr.stime = nsecs_completed;
-		}
+            }
+        }
 
 		nsecs_latest = max(nsecs_completed, nsecs_latest);
 
@@ -2200,21 +2240,25 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
     if (!ns || !ns->ftls || !req || !ret || !req->cmd) {
-		if (ret) ret->status = NVME_SC_INTERNAL;
-		return false;
-	}
+        if (ret) {
+            ret->status = NVME_SC_INTERNAL;
+            ret->nsecs_target = req ? req->nsecs_start : local_clock();
+        }
+        /* 必须完成请求，避免超时导致控制器复位 */
+        return true;
+    }
     /* C90: declarations must precede statements */
     struct nvme_command *cmd = req->cmd;
 	NVMEV_ASSERT(ns->csi == NVME_CSI_NVM);
 
 	switch (cmd->common.opcode) {
 	case nvme_cmd_write:
-		if (!conv_write(ns, req, ret))
-			return false;
+        if (!conv_write(ns, req, ret))
+            return true; /* 出错也返回完成，状态在 ret 内 */
 		break;
 	case nvme_cmd_read:
-		if (!conv_read(ns, req, ret))
-			return false;
+        if (!conv_read(ns, req, ret))
+            return true; /* 出错也返回完成，状态在 ret 内 */
 		break;
 	case nvme_cmd_flush:
 		conv_flush(ns, req, ret);

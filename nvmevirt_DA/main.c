@@ -22,7 +22,9 @@
 #include "zns_ftl.h"
 #endif
 #include "simple_ftl.h"
+#if (BASE_SSD == KV_PROTOTYPE)
 #include "kv_ftl.h"
+#endif
 #include "dma.h"
 
 /****************************************************************
@@ -484,7 +486,7 @@ static bool __load_configs(struct nvmev_config *config)
 	config->nr_io_cpu = 0;
 	config->cpu_nr_dispatcher = -1;
 
-	while ((cpu = strsep(&cpus, ",")) != NULL) {
+    while ((cpu = strsep(&cpus, ",")) != NULL) {
 		cpu_nr = (unsigned int)simple_strtol(cpu, NULL, 10);
 		if (first) {
 			config->cpu_nr_dispatcher = cpu_nr;
@@ -494,6 +496,14 @@ static bool __load_configs(struct nvmev_config *config)
 		}
 		first = false;
 	}
+
+    /* 如果未提供 cpus 参数，保证至少有 1 个 IO worker 和一个调度线程，避免无完成导致超时 */
+    if (config->cpu_nr_dispatcher == -1)
+        config->cpu_nr_dispatcher = 0;
+    if (config->nr_io_cpu == 0) {
+        config->cpu_nr_io_workers[0] = 0;
+        config->nr_io_cpu = 1;
+    }
 
 	return true;
 }
@@ -523,8 +533,10 @@ void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_ZNS)
 			zns_init_namespace(&ns[i], i, size, ns_addr, disp_no);
 #endif
+#if (BASE_SSD == KV_PROTOTYPE)
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_KV)
 			kv_init_namespace(&ns[i], i, size, ns_addr, disp_no);
+#endif
 		else
 			NVMEV_ASSERT(0);
 
@@ -554,8 +566,10 @@ void NVMEV_NAMESPACE_FINAL(struct nvmev_dev *nvmev_vdev)
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_ZNS)
 			zns_remove_namespace(&ns[i]);
 #endif
+#if (BASE_SSD == KV_PROTOTYPE)
 		else if (NS_SSD_TYPE(i) == SSD_TYPE_KV)
 			kv_remove_namespace(&ns[i]);
+#endif
 		else
 			NVMEV_ASSERT(0);
 	}
