@@ -916,12 +916,8 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	init_rmap(conv_ftl); // reverse mapping table (?)
 
 	/* initialize all the lines */
-	NVMEV_INFO("initialize lines\n");
-	init_lines(conv_ftl);
-
-//66f1
-	init_lines_DA(conv_ftl);
-//66f1
+    NVMEV_INFO("initialize lines\n");
+    init_lines(conv_ftl);
 
 	/* 初始化 SLC/QLC 混合存储 */
 	NVMEV_INFO("initialize SLC/QLC blocks\n");
@@ -944,10 +940,8 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	prepare_write_pointer(conv_ftl, USER_IO);
 	prepare_write_pointer(conv_ftl, GC_IO);
 
-//66f1
-	prepare_write_pointer_DA(conv_ftl, USER_IO);
-	conv_ftl->lunpointer = 0;
-//66f1
+    /* SLC Die-Affinity uses per-instance lunpointer */
+    conv_ftl->lunpointer = 0;
 
 	/* 初始化 SLC 写指针 - 使用 Die Affinity */
 	/* 注意：SLC 写指针将在第一次写入时初始化 */
@@ -964,10 +958,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
-	remove_lines(conv_ftl);
-	//66f1
-	remove_lines_DA(conv_ftl);
-	//66f1
+    remove_lines(conv_ftl);
 	
 	/* 清理 SLC/QLC 相关资源 */
 	remove_slc_lines(conv_ftl);
@@ -1003,18 +994,14 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 
 	conv_ftls = kmalloc(sizeof(struct conv_ftl) * nr_parts, GFP_KERNEL);
 
-	for (i = 0; i < nr_parts; i++) {
-//66f1
-		conv_ftls[i].lunlm = kmalloc(sizeof(struct line_mgmt) * NAND_CHANNELS * LUNS_PER_NAND_CH, GFP_KERNEL);
-		conv_ftls[i].lunwp = kmalloc(sizeof(struct write_pointer) * NAND_CHANNELS * LUNS_PER_NAND_CH, GFP_KERNEL);
-//66f1
-		ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
+    for (i = 0; i < nr_parts; i++) {
+        ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
 		ssd_init(ssd, &spp, cpu_nr_dispatcher);
 		conv_init_ftl(&conv_ftls[i], &cpp, ssd);
 	}
 
 	/* PCIe, Write buffer are shared by all instances*/
-	for (i = 1; i < nr_parts; i++) {
+    for (i = 1; i < nr_parts; i++) {
 		kfree(conv_ftls[i].ssd->pcie->perf_model);
 		kfree(conv_ftls[i].ssd->pcie);
 		kfree(conv_ftls[i].ssd->write_buffer);
@@ -1053,10 +1040,7 @@ void conv_remove_namespace(struct nvmev_ns *ns)
 		conv_ftls[i].ssd->pcie = NULL;
 		conv_ftls[i].ssd->write_buffer = NULL;
 		
-		//66f1
-		kfree(conv_ftls[i].lunlm);
-		kfree(conv_ftls[i].lunwp);
-		//66f1
+        /* per-LUN state removed */
 	}
 
 	for (i = 0; i < nr_parts; i++) {
@@ -1124,12 +1108,10 @@ static inline struct line *get_line_DA(struct conv_ftl *conv_ftl, struct ppa *pp
 /* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct line_mgmt *lm = &conv_ftl->lm;
-	//66f1
-	uint32_t glun = get_glun(conv_ftl, ppa);
-	struct line_mgmt *lunlm = conv_ftl->lunlm+glun;
-	//66f1
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    /* 分层记账：按介质选择账本 */
+    bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
+    struct line_mgmt *lm = in_slc ? &conv_ftl->slc_lm : &conv_ftl->qlc_lm;
 	struct nand_block *blk = NULL;
 	struct nand_page *pg = NULL;
 	bool was_full_line = false;
@@ -1147,8 +1129,15 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	NVMEV_ASSERT(blk->vpc > 0 && blk->vpc <= spp->pgs_per_blk);
 	blk->vpc--;
 
-	/* update corresponding line status */
-	line = get_line(conv_ftl, ppa);
+    /* update corresponding line status (map blk -> line index in对应账本) */
+    if (in_slc) {
+        line = &lm->lines[ppa->g.blk];
+    } else {
+        uint32_t start_blk = conv_ftl->slc_blks_per_pl;
+        uint32_t idx = ppa->g.blk - start_blk;
+        NVMEV_ASSERT(idx < lm->tt_lines);
+        line = &lm->lines[idx];
+    }
 	NVMEV_ASSERT(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
 	if (line->vpc == spp->pgs_per_line) {
 		NVMEV_ASSERT(line->ipc == 0);
@@ -1172,41 +1161,17 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		lm->victim_line_cnt++;
 	}
 
-	//66f1 lunlm update
-	was_full_line = false;
-	/* update corresponding line status */
-	line = get_line_DA(conv_ftl, ppa);
-	NVMEV_ASSERT(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
-	if (line->vpc == spp->pgs_per_line) {
-		NVMEV_ASSERT(line->ipc == 0);
-		was_full_line = true;
-	}
-	line->ipc++;
-	NVMEV_ASSERT(line->vpc > 0 && line->vpc <= spp->pgs_per_line);
-	/* Adjust the position of the victime line in the pq under over-writes */
-	if (line->pos) {
-		/* Note that line->vpc will be updated by this call */
-		pqueue_change_priority(lunlm->victim_line_pq, line->vpc - 1, line);
-	} else {
-		line->vpc--;
-	}
-
-	if (was_full_line) {
-		/* move line: "full" -> "victim" */
-		list_del_init(&line->entry);
-		lunlm->full_line_cnt--;
-		pqueue_insert(lunlm->victim_line_pq, line);
-		lunlm->victim_line_cnt++;
-	}
-	//66f1
 }
 
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct nand_block *blk = NULL;
-	struct nand_page *pg = NULL;
-	struct line *line;
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct nand_block *blk = NULL;
+    struct nand_page *pg = NULL;
+    /* 分层记账：按介质选择账本 */
+    bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
+    struct line_mgmt *lm = in_slc ? &conv_ftl->slc_lm : &conv_ftl->qlc_lm;
+    struct line *line;
 
 	/* update page status */
 	pg = get_pg(conv_ftl->ssd, ppa);
@@ -1218,16 +1183,18 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	NVMEV_ASSERT(blk->vpc >= 0 && blk->vpc < spp->pgs_per_blk);
 	blk->vpc++;
 
-	/* update corresponding line status */
-	line = get_line(conv_ftl, ppa);
+    /* update corresponding line status */
+    if (in_slc) {
+        line = &lm->lines[ppa->g.blk];
+    } else {
+        uint32_t start_blk = conv_ftl->slc_blks_per_pl;
+        uint32_t idx = ppa->g.blk - start_blk;
+        NVMEV_ASSERT(idx < lm->tt_lines);
+        line = &lm->lines[idx];
+    }
 	NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
 	line->vpc++;
 
-	//66f1
-	line = get_line_DA(conv_ftl, ppa);
-	NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
-	line->vpc++;
-	//66f1
 }
 
 static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -1319,8 +1286,9 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 
 static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct line_mgmt *lm = &conv_ftl->lm;
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    /* GC仅针对QLC账本选择受害者 */
+    struct line_mgmt *lm = &conv_ftl->qlc_lm;
 	struct line *victim_line = NULL;
 
 	victim_line = pqueue_peek(lm->victim_line_pq);
@@ -1416,8 +1384,17 @@ static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
 static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-	struct line_mgmt *lm = &conv_ftl->lm;
-	struct line *line = get_line(conv_ftl, ppa);
+    bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
+    struct line_mgmt *lm = in_slc ? &conv_ftl->slc_lm : &conv_ftl->qlc_lm;
+    struct line *line;
+    if (in_slc) {
+        line = &lm->lines[ppa->g.blk];
+    } else {
+        uint32_t start_blk = conv_ftl->slc_blks_per_pl;
+        uint32_t idx = ppa->g.blk - start_blk;
+        NVMEV_ASSERT(idx < lm->tt_lines);
+        line = &lm->lines[idx];
+    }
 	line->ipc = 0;
 	line->vpc = 0;
 	/* move this line to free line list */
@@ -1531,16 +1508,23 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	struct write_pointer *wp = &conv_ftl->slc_wp;
-	
+	if (!conv_ftl || !conv_ftl->slc_lm.lines) {
+	        NVMEV_ERROR("SLC lines not initialized\n");
+	        return (struct ppa){ .ppa = UNMAPPED_PPA };
+	}
+	if (!wp || (!wp->curline && list_empty(&conv_ftl->slc_lm.free_line_list))) {
+		NVMEV_ERROR("SLC write pointer not ready and no free SLC line\n");
+		return (struct ppa){ .ppa = UNMAPPED_PPA };
+	}
 	/* 如果 SLC 写指针未初始化，初始化它 */
 	if (!wp->curline) {
 		struct line_mgmt *lm = &conv_ftl->slc_lm;
 		struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
 		
-		if (!curline) {
-			NVMEV_ERROR("No free SLC line available!\n");
-			return (struct ppa){.ppa = INVALID_PPA};
-		}
+        if (!curline) {
+            NVMEV_ERROR("No free SLC line available!\n");
+            return (struct ppa){ .ppa = UNMAPPED_PPA };
+        }
 		
 		list_del_init(&curline->entry);
 		lm->free_line_cnt--;
@@ -1572,7 +1556,10 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct line_mgmt *lm = &conv_ftl->slc_lm;
 	struct write_pointer *wp = &conv_ftl->slc_wp;
-	
+	if (!wp || !wp->curline) {
+		NVMEV_ERROR("advance_slc_write_pointer: SLC WP not initialized\n");
+		return;
+	}
 	wp->pg++;
 	
 	/* 检查是否需要移到下一个 block */
@@ -1588,13 +1575,12 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
 		
 			/* 获取新的 line */
 	wp->curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-	if (!wp->curline) {
-		NVMEV_ERROR("No free SLC line available!\n");
-		/* 设置写指针为无效状态 */
-		wp->blk = INVALID_PPA;
-		wp->pg = INVALID_PPA;
-		return;
-	}
+    if (!wp->curline) {
+        NVMEV_ERROR("No free SLC line available!\n");
+        /* 标记为未就绪，下一次 get_new_slc_page 将失败 */
+        wp->curline = NULL;
+        return;
+    }
 		
 		list_del_init(&wp->curline->entry);
 		lm->free_line_cnt--;
@@ -1625,10 +1611,10 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
 		struct line_mgmt *lm = &conv_ftl->qlc_lm;
 		struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
 		
-		if (!curline) {
-			NVMEV_ERROR("No free QLC line available in region %d!\n", region_id);
-			return (struct ppa){.ppa = INVALID_PPA};
-		}
+        if (!curline) {
+            NVMEV_ERROR("No free QLC line available in region %d!\n", region_id);
+            return (struct ppa){ .ppa = UNMAPPED_PPA };
+        }
 		
 		list_del_init(&curline->entry);
 		lm->free_line_cnt--;
@@ -1696,14 +1682,13 @@ static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region
 	}
 	
 	/* 获取新的 line */
-	wp->curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-	if (!wp->curline) {
-		NVMEV_ERROR("No free QLC line available in region %d!\n", region_id);
-		/* 设置写指针为无效状态 */
-		wp->blk = INVALID_PPA;
-		wp->pg = INVALID_PPA;
-		return;
-	}
+    wp->curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+    if (!wp->curline) {
+        NVMEV_ERROR("No free QLC line available in region %d!\n", region_id);
+        /* 标记为未就绪，等待后续重新获取 */
+        wp->curline = NULL;
+        return;
+    }
 	
 	list_del_init(&wp->curline->entry);
 	lm->free_line_cnt--;
@@ -2035,7 +2020,9 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		{
 			if (bAppend)
 			{
-				ppa = get_maptbl_ent(conv_ftl, plpn); 
+				uint64_t p_local_lpn = plpn / nr_parts;
+				struct conv_ftl* p_conv_ftl = &conv_ftls[plpn % nr_parts];
+				ppa = get_maptbl_ent(p_conv_ftl,p_local_lpn); 
 				if (mapped_ppa(&ppa)) {		
 					uint32_t originlun = conv_ftl->lunpointer;
 					conv_ftl->lunpointer = get_glun(conv_ftl, &ppa); 
@@ -2049,7 +2036,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			}
 			else if (bOverwrite)
 			{				
-				ppa = get_maptbl_ent(conv_ftl, lpn); 
+				ppa = get_maptbl_ent(conv_ftl,local_lpn); 
 				if (mapped_ppa(&ppa)) {
 					uint32_t originlun = conv_ftl->lunpointer;
 					conv_ftl->lunpointer = get_glun(conv_ftl, &ppa); 
@@ -2100,7 +2087,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			
 			/* 使用 SLC 写延迟 */
 			write_lat = conv_ftl->ssd->sp.pg_wr_lat;
-			
+			swr.ppa = &ppa;
 			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
 			/* schedule_internal_operation 暂时注释掉，函数不存在 */
 			/* schedule_internal_operation(conv_ftl->ssd, nsecs_completed, xfer_size, &ppa); */
@@ -2174,8 +2161,11 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
-	struct nvme_command *cmd = req->cmd;
-
+    if (!ns || !ns->ftls || !req || !ret || !req->cmd) {
+		if (ret) ret->status = NVME_SC_INTERNAL;
+		return false;
+	}
+    struct nvme_command *cmd = req->cmd;
 	NVMEV_ASSERT(ns->csi == NVME_CSI_NVM);
 
 	switch (cmd->common.opcode) {
