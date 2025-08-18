@@ -10,6 +10,147 @@
 void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			      struct buffer *write_buffer, unsigned int buffs_to_release);
 
+/* SLC 低水位阈值：空闲行数低于总行数的该百分比则触发迁移 */
+#define SLC_FREE_LOW_WM_PCT 10
+
+/* 当 SLC 空闲低于阈值时，挑选一小批“冷数据”从 SLC 迁移到 QLC。
+ * 最小改动：线性扫描有限数量 LPN，命中条件：page_in_slc && 冷（时间 >1s 且访问计数 < 阈值）。
+ */
+static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
+{
+    struct line_mgmt *slc = &conv_ftl->slc_lm;
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct heat_tracking *ht = &conv_ftl->heat_track;
+    uint64_t now;
+    uint32_t free_pct;
+
+    if (!slc || slc->tt_lines == 0)
+        return;
+
+    /* 未低于阈值则直接返回 */
+    free_pct = (slc->free_line_cnt * 100) / slc->tt_lines;
+    if (free_pct > SLC_FREE_LOW_WM_PCT)
+        return;
+
+    if (!conv_ftl->page_in_slc || !ht || !ht->last_access_time)
+        return;
+
+    /* 采样一小批进行迁移，避免占用太多写缓冲 */
+    {
+        const uint32_t MAX_BATCH = 32;      /* 每次最多迁移 32 页 */
+        const uint32_t MAX_SCAN  = 4096;    /* 最多扫描 4K 个条目 */
+        struct ppa *slc_ppas;
+        uint64_t *lpns;
+        uint32_t found = 0;
+        uint32_t scanned = 0;
+        static uint64_t cursor = 0;         /* 简单游标，跨调用推进，最小改动 */
+        uint64_t start = cursor % spp->tt_pgs;
+        uint64_t idx = start;
+
+        slc_ppas = kmalloc(sizeof(*slc_ppas) * MAX_BATCH, GFP_ATOMIC);
+        lpns     = kmalloc(sizeof(*lpns)     * MAX_BATCH, GFP_ATOMIC);
+        if (!slc_ppas || !lpns) {
+            if (slc_ppas) kfree(slc_ppas);
+            if (lpns) kfree(lpns);
+            return;
+        }
+
+        now = ktime_get_ns();
+        while (scanned < MAX_SCAN && found < MAX_BATCH) {
+            if (conv_ftl->page_in_slc[idx]) {
+                uint64_t last = ht->last_access_time[idx];
+                uint64_t acc  = ht->access_count[idx];
+                if ((now - last) > 1000000000ULL && acc < ht->migration_threshold) {
+                    struct ppa old = get_maptbl_ent(conv_ftl, idx);
+                    if (mapped_ppa(&old) && is_slc_block(conv_ftl, old.g.blk)) {
+                        lpns[found] = idx;
+                        slc_ppas[found] = old;
+                        found++;
+                    }
+                }
+            }
+            scanned++;
+            idx = (idx + 1) % spp->tt_pgs;
+            if (idx == start) break; /* 环回则停止 */
+        }
+
+        cursor = idx; /* 下次从这里继续 */
+
+        if (found > 0) {
+            migrate_batch_to_qlc(conv_ftl, slc_ppas, lpns, found);
+        }
+
+        kfree(slc_ppas);
+        kfree(lpns);
+    }
+}
+
+/* 无阈值：总是尝试从 SLC 迁移少量更冷页面到 QLC，为新写释放 SLC 空间 */
+static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_pages)
+{
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct heat_tracking *ht = &conv_ftl->heat_track;
+    struct ppa *slc_ppas;
+    uint64_t *lpns;
+    uint32_t found = 0;
+    uint32_t scanned = 0;
+    uint64_t now;
+    static uint64_t cursor2 = 0;
+    uint64_t start, idx;
+
+    if (!conv_ftl->page_in_slc || !ht || !ht->last_access_time)
+        return;
+
+    if (max_pages == 0)
+        return;
+
+    slc_ppas = kmalloc(sizeof(*slc_ppas) * max_pages, GFP_ATOMIC);
+    lpns     = kmalloc(sizeof(*lpns)     * max_pages, GFP_ATOMIC);
+    if (!slc_ppas || !lpns) {
+        if (slc_ppas) kfree(slc_ppas);
+        if (lpns) kfree(lpns);
+        return;
+    }
+
+    now = ktime_get_ns();
+    start = cursor2 % spp->tt_pgs;
+    idx = start;
+    while (scanned < 4096 && found < max_pages) {
+        if (conv_ftl->page_in_slc[idx]) {
+            uint64_t last = ht->last_access_time[idx];
+            uint64_t acc  = ht->access_count[idx];
+            /* 冷定义：>1s 且访问计数低于阈值；若严格条件不满足，也放宽为选择更老者 */
+            bool is_cold = ((now - last) > 1000000000ULL && acc < ht->migration_threshold);
+            if (!is_cold) {
+                /* 放宽策略：极老数据（>5s）也作为候选 */
+                if ((now - last) <= 5000000000ULL) {
+                    goto next;
+                }
+            }
+            {
+                struct ppa old = get_maptbl_ent(conv_ftl, idx);
+                if (mapped_ppa(&old) && is_slc_block(conv_ftl, old.g.blk)) {
+                    lpns[found] = idx;
+                    slc_ppas[found] = old;
+                    found++;
+                }
+            }
+        }
+next:
+        scanned++;
+        idx = (idx + 1) % spp->tt_pgs;
+        if (idx == start) break;
+    }
+    cursor2 = idx;
+
+    if (found > 0) {
+        migrate_batch_to_qlc(conv_ftl, slc_ppas, lpns, found);
+    }
+
+    kfree(slc_ppas);
+    kfree(lpns);
+}
+
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -2061,6 +2202,10 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	swr.stime = nsecs_latest;
 
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+		/* 低水位则尝试搬一小批冷页，最小化改动且不影响写入主路径 */
+		if ((lpn & 0x3FF) == 0) { /* 每 1024 页尝试一次，避免频繁开销 */
+			trigger_slc_migration_if_low(conv_ftl);
+		}
 		uint64_t local_lpn;
 		uint64_t nsecs_completed = 0;
         uint64_t write_lat;  /* 移动变量声明到循环开头 */
@@ -2117,19 +2262,45 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			}
 		}
 
-		/* 修改：所有新写入都先写到 SLC */
-		/* 使用 Die Affinity 写入 SLC */
-		ppa = get_new_slc_page(conv_ftl);
-        if (!mapped_ppa(&ppa)) {
-            NVMEV_ERROR("Failed to get SLC page for write\n");
-            ret->status = NVME_SC_WRITE_FAULT;
-            ret->nsecs_target = nsecs_latest;
-            return true; /* Complete with error */
+        /* 修改：所有新写入都先写到 SLC（不直接写 QLC） */
+        /* 若 SLC 暂无可用页，先迁移少量更冷页面到 QLC 腾空，再重试取 SLC 页 */
+        {
+            int tries;
+            bool qlc_has_space = true;
+            
+            for (tries = 0; tries < 4; tries++) {
+                ppa = get_new_slc_page(conv_ftl);
+                if (mapped_ppa(&ppa)) break;
+                
+                /* 检查 QLC 是否有空间进行迁移 */
+                if (qlc_has_space) {
+                    /* 每次迁移最多 32 页，避免占用太多缓冲 */
+                    migrate_some_cold_from_slc(conv_ftl, 32);
+                    
+                    /* 检查迁移后 QLC 是否还有空间 */
+                    struct ppa test_ppa = get_new_qlc_page(conv_ftl, 0);
+                    if (!mapped_ppa(&test_ppa)) {
+                        qlc_has_space = false;
+                        NVMEV_ERROR("QLC is full, cannot migrate from SLC\n");
+                    }
+                }
+            }
+            
+            if (!mapped_ppa(&ppa)) {
+                if (!qlc_has_space) {
+                    NVMEV_ERROR("SLC no space and QLC is full - system exhausted\n");
+                } else {
+                    NVMEV_ERROR("SLC no space after migrations\n");
+                }
+                ret->status = NVME_SC_WRITE_FAULT;
+                ret->nsecs_target = nsecs_latest;
+                return true;
+            }
         }
-		
-		/* 记录页面在 SLC 中 */
-		conv_ftl->page_in_slc[local_lpn] = true;
-		conv_ftl->slc_write_cnt++;
+
+        /* 记录页面在 SLC 中 */
+        conv_ftl->page_in_slc[local_lpn] = true;
+        conv_ftl->slc_write_cnt++;
 
 		//NVMEV_ERROR("PPA: ch:%d, lun:%d, blk:%d, pg:%d \n", ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg );
 
@@ -2146,8 +2317,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		/* need to advance the write pointer here */
 		//need branch
 //66f1
-		/* 使用 SLC 的 Die Affinity 推进写指针 */
-		advance_slc_write_pointer(conv_ftl);
+        /* 使用 SLC 的 Die Affinity 推进写指针 */
+        advance_slc_write_pointer(conv_ftl);
 
 		nsecs_completed = ssd_advance_write_buffer(conv_ftl->ssd, nsecs_latest, conv_ftl->ssd->sp.pgsz);
 
