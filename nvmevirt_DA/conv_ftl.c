@@ -1268,21 +1268,21 @@ static inline struct line *get_line_DA(struct conv_ftl *conv_ftl, struct ppa *pp
 /* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
+    /* 1. 增加全局参数验证 */
+    if (!conv_ftl || !ppa || !conv_ftl->ssd) {
+        NVMEV_ERROR("[mark_page_invalid] Invalid parameters.\n");
+        return;
+    }
+    
     struct ssdparams *spp = &conv_ftl->ssd->sp;
-    /* 分层记账：按介质选择账本 */
-    bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
-    struct line_mgmt *lm = in_slc ? &conv_ftl->slc_lm : &conv_ftl->qlc_lm;
-	struct nand_block *blk = NULL;
-	struct nand_page *pg = NULL;
-	bool was_full_line = false;
-	struct line *line;
+    struct nand_block *blk;
+    struct nand_page *pg;
 
-    /* update corresponding page status */
+    /* 更新页和块的状态 (这部分不涉及共享数据结构，可以在锁外完成) */
     pg = get_pg(conv_ftl->ssd, ppa);
     NVMEV_ASSERT(pg->status == PG_VALID);
     pg->status = PG_INVALID;
 
-    /* update corresponding block status (防御：vpc>0 才能减) */
     blk = get_blk(conv_ftl->ssd, ppa);
     NVMEV_ASSERT(blk->ipc >= 0 && blk->ipc < spp->pgs_per_blk);
     blk->ipc++;
@@ -1292,59 +1292,96 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         NVMEV_ERROR("blk->vpc already 0 before decrement, blk=%d\n", ppa->g.blk);
     }
 
-    /* update corresponding line status (map blk -> line index in对应账本) */
-    uint32_t start_blk, idx;
+    /* 2. 根据介质类型，进入完全独立的原子操作块 */
+    bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
     if (in_slc) {
-        spin_lock(&conv_ftl->slc_lock);
+        struct line_mgmt *lm = &conv_ftl->slc_lm;
+        struct line *line;
+        bool was_full_line = false;
+
+        /* SLC 边界检查 (在加锁前) */
+        if (!lm || !lm->lines || ppa->g.blk >= lm->tt_lines) {
+            NVMEV_ERROR("[mark_page_invalid] SLC block index out of range: %u >= %u\n", 
+                        ppa->g.blk, lm->tt_lines);
+            return;
+        }
+
+        spin_lock(&conv_ftl->slc_lock); // --- SLC 加锁 ---
+
         line = &lm->lines[ppa->g.blk];
-    } else {
-        spin_lock(&conv_ftl->qlc_lock);
-        start_blk = conv_ftl->slc_blks_per_pl;
+
+        /* 所有与 line 和 lm 链表相关的操作都在锁内完成 */
+        if (line->vpc == spp->pgs_per_lun_line) {
+            was_full_line = true;
+        }
+        line->ipc++;
+        
+        if (line->pos) { // 如果在victim队列中
+            pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
+        } else {
+            if (line->vpc > 0) line->vpc--;
+        }
+
+        if (was_full_line) {
+            list_del_init(&line->entry);
+            lm->full_line_cnt--;
+            pqueue_insert(lm->victim_line_pq, line);
+            lm->victim_line_cnt++;
+        }
+
+        spin_unlock(&conv_ftl->slc_lock); // --- SLC 解锁 ---
+
+    } else { // QLC 路径
+        struct line_mgmt *lm = &conv_ftl->qlc_lm;
+        struct line *line;
+        uint32_t start_blk = conv_ftl->slc_blks_per_pl;
+        uint32_t idx;
+        bool was_full_line = false;
+        
+        /* QLC 边界检查 (在加锁前) */
+        if (!lm || !lm->lines) {
+            NVMEV_ERROR("[mark_page_invalid] QLC line management not initialized\n");
+            return;
+        }
+        
+        if (ppa->g.blk < start_blk) {
+            NVMEV_ERROR("[mark_page_invalid] QLC block ID %u is less than start block %u\n", 
+                        ppa->g.blk, start_blk);
+            return;
+        }
         idx = ppa->g.blk - start_blk;
-        NVMEV_ASSERT(idx < lm->tt_lines);
+        if (idx >= lm->tt_lines) {
+            NVMEV_ERROR("[mark_page_invalid] QLC index out of range: %u >= %u\n", 
+                        idx, lm->tt_lines);
+            return;
+        }
+
+        spin_lock(&conv_ftl->qlc_lock); // --- QLC 加锁 ---
+
         line = &lm->lines[idx];
+        
+        /* 所有与 line 和 lm 链表相关的操作都在锁内完成 */
+        if (line->vpc == spp->pgs_per_line) {
+            was_full_line = true;
+        }
+        line->ipc++;
+
+        if (line->pos) { // 如果在victim队列中
+            pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
+        } else {
+            if (line->vpc > 0) line->vpc--;
+        }
+
+        if (was_full_line) {
+            list_del_init(&line->entry);
+            lm->full_line_cnt--;
+            pqueue_insert(lm->victim_line_pq, line);
+            lm->victim_line_cnt++;
+        }
+
+        spin_unlock(&conv_ftl->qlc_lock); // --- QLC 解锁 ---
     }
-    if (in_slc)
-        NVMEV_ASSERT(line->ipc >= 0 && line->ipc < spp->pgs_per_lun_line);
-    else
-        NVMEV_ASSERT(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
-	if (line->vpc == spp->pgs_per_line) {
-		NVMEV_ASSERT(line->ipc == 0);
-		was_full_line = true;
-	}
-    line->ipc++;
-    /* 自增后再防御性校验并钳制 */
-    if (in_slc && line->ipc > spp->pgs_per_lun_line)
-        line->ipc = spp->pgs_per_lun_line;
-    if (!in_slc && line->ipc > spp->pgs_per_line)
-        line->ipc = spp->pgs_per_line;
-    if (in_slc)
-        NVMEV_ASSERT(line->vpc > 0 && line->vpc <= spp->pgs_per_lun_line);
-    else
-        NVMEV_ASSERT(line->vpc > 0 && line->vpc <= spp->pgs_per_line);
-	/* Adjust the position of the victime line in the pq under over-writes */
-    if (line->pos) {
-		/* Note that line->vpc will be updated by this call */
-        pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
-	} else {
-        if (line->vpc > 0) line->vpc--; else line->vpc = 0;
-	}
-
-	if (was_full_line) {
-		/* move line: "full" -> "victim" */
-		list_del_init(&line->entry);
-		lm->full_line_cnt--;
-        pqueue_insert(lm->victim_line_pq, line);
-		lm->victim_line_cnt++;
-	}
-
-    if (in_slc)
-        spin_unlock(&conv_ftl->slc_lock);
-    else
-        spin_unlock(&conv_ftl->qlc_lock);
 }
-
-// ... existing code ...
 
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -2739,40 +2776,4 @@ static void cleanup_on_alloc_failure(struct conv_ftl *conv_ftl)
 	conv_ftl->rmap_initialized = false;
 	conv_ftl->slc_initialized = false;
 	conv_ftl->heat_track_initialized = false;
-}
-
-// 在模块初始化时创建proc文件
-static int create_proc_files(void)
-{
-    struct proc_dir_entry *entry;
-    
-    entry = proc_create("nvmev_debug", 0444, NULL, &nvmev_debug_fops);
-    if (!entry) {
-        NVMEV_ERROR("Failed to create proc file\n");
-        return -ENOMEM;
-    }
-    
-    return 0;
-}
-
-static int nvmev_debug_show(struct seq_file *m, void *v)
-{
-    struct conv_ftl *conv_ftl = get_current_conv_ftl();
-    
-    if (!conv_ftl) {
-        seq_puts(m, "No conv_ftl instance found\n");
-        return 0;
-    }
-    
-    seq_printf(m, "=== NVMeV Debug Information ===\n");
-    seq_printf(m, "Migration attempts: %llu\n", conv_ftl->migration_attempts);
-    seq_printf(m, "Migration successes: %llu\n", conv_ftl->migration_successes);
-    seq_printf(m, "Migration failures: %llu\n", conv_ftl->migration_failures);
-    seq_printf(m, "Boundary check failures: %llu\n", conv_ftl->boundary_check_failures);
-    seq_printf(m, "SLC lines: %d\n", conv_ftl->slc_lm.tt_lines);
-    seq_printf(m, "QLC lines: %d\n", conv_ftl->qlc_lm.tt_lines);
-    seq_printf(m, "SLC blocks per plane: %d\n", conv_ftl->slc_blks_per_pl);
-    seq_printf(m, "QLC blocks per plane: %d\n", conv_ftl->qlc_blks_per_pl);
-    
-    return 0;
 }
