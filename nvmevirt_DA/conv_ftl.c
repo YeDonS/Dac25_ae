@@ -7,6 +7,9 @@
 #include "nvmev.h"
 #include "conv_ftl.h"
 
+#ifndef NVMEV_WARN
+#define NVMEV_WARN(fmt, ...) pr_warn("[nvmev] " fmt, ##__VA_ARGS__)
+#endif
 void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			      struct buffer *write_buffer, unsigned int buffs_to_release);
 
@@ -17,7 +20,8 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn);
 static inline bool mapped_ppa(struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
-
+static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *slc_ppa);
+static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id);
 
 /* 当 SLC 空闲低于阈值时，挑选一小批"冷数据"从 SLC 迁移到 QLC。
  * 最小改动：线性扫描有限数量 LPN，命中条件：page_in_slc && 冷（时间 >1s 且访问计数 < 阈值）。
@@ -1903,7 +1907,7 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
         *wp = (struct write_pointer) {
             .curline = curline,
             .ch = region_id % spp->nchs,
-            .lun = (region_id / spp->nchs) % spp->nluns,
+            .lun = (region_id / spp->nchs) % spp->luns_per_ch,
             .pg = 0,
             .blk = curline->id,
             .pl = 0,
