@@ -17,12 +17,12 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn);
 static inline bool mapped_ppa(struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
-static void migrate_batch_to_qlc(struct conv_ftl *conv_ftl, struct ppa *slc_ppas, 
-                                 uint64_t *lpns, uint32_t count);
+
 
 /* 当 SLC 空闲低于阈值时，挑选一小批"冷数据"从 SLC 迁移到 QLC。
  * 最小改动：线性扫描有限数量 LPN，命中条件：page_in_slc && 冷（时间 >1s 且访问计数 < 阈值）。
  */
+/* 当 SLC 空闲低于阈值时，挑选冷数据从 SLC 迁移到 QLC */
 static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
 {
     struct line_mgmt *slc = &conv_ftl->slc_lm;
@@ -30,6 +30,12 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
     struct heat_tracking *ht = &conv_ftl->heat_track;
     uint64_t now;
     uint32_t free_pct;
+    const uint32_t MAX_MIGRATE = 32;
+    const uint32_t MAX_SCAN = 4096;
+    static uint64_t cursor = 0;
+    uint64_t start, idx;
+    uint32_t scanned = 0;
+    uint32_t migrated = 0;
 
     if (!slc || slc->tt_lines == 0)
         return;
@@ -42,124 +48,90 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
     if (!conv_ftl->page_in_slc || !ht || !ht->last_access_time)
         return;
 
-    /* 采样一小批进行迁移，避免占用太多写缓冲 */
-    {
-        const uint32_t MAX_BATCH = 32;      /* 每次最多迁移 32 页 */
-        const uint32_t MAX_SCAN  = 4096;    /* 最多扫描 4K 个条目 */
-        struct ppa *slc_ppas;
-        uint64_t *lpns;
-        uint32_t found = 0;
-        uint32_t scanned = 0;
-        static uint64_t cursor = 0;         /* 简单游标，跨调用推进，最小改动 */
-        uint64_t start = cursor % spp->tt_pgs;
-        uint64_t idx = start;
-
-        slc_ppas = kmalloc(sizeof(*slc_ppas) * MAX_BATCH, GFP_ATOMIC);
-        lpns     = kmalloc(sizeof(*lpns)     * MAX_BATCH, GFP_ATOMIC);
-        if (!slc_ppas || !lpns) {
-            if (slc_ppas) kfree(slc_ppas);
-            if (lpns) kfree(lpns);
-            return;
-        }
-
-        now = __get_ioclock(conv_ftl->ssd);
-        while (scanned < MAX_SCAN && found < MAX_BATCH) {
-            if (conv_ftl->page_in_slc[idx]) {
-                uint64_t last = ht->last_access_time[idx];
-                uint64_t acc  = ht->access_count[idx];
-                if ((now - last) > 1000000000ULL && acc < ht->migration_threshold) {
-                    struct ppa old = get_maptbl_ent(conv_ftl, idx);
-                    if (mapped_ppa(&old) && is_slc_block(conv_ftl, old.g.blk)) {
-                        lpns[found] = idx;
-                        slc_ppas[found] = old;
-                        found++;
-                    }
-                }
-            }
-            scanned++;
-            idx = (idx + 1) % spp->tt_pgs;
-            if (idx == start) break; /* 环回则停止 */
-        }
-
-        cursor = idx; /* 下次从这里继续 */
-
-        if (found > 0) {
-            migrate_batch_to_qlc(conv_ftl, slc_ppas, lpns, found);
-        }
-
-        kfree(slc_ppas);
-        kfree(lpns);
-    }
-}
-
-
-
-/* 无阈值：总是尝试从 SLC 迁移少量更冷页面到 QLC，为新写释放 SLC 空间 */
-static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_pages)
-{
-    struct ssdparams *spp = &conv_ftl->ssd->sp;
-    struct heat_tracking *ht = &conv_ftl->heat_track;
-    struct ppa *slc_ppas;
-    uint64_t *lpns;
-    uint32_t found = 0;
-    uint32_t scanned = 0;
-    uint64_t now;
-    static uint64_t cursor2 = 0;
-    uint64_t start, idx;
-
-    if (!conv_ftl->page_in_slc || !ht || !ht->last_access_time)
-        return;
-
-    if (max_pages == 0)
-        return;
-
-    slc_ppas = kmalloc(sizeof(*slc_ppas) * max_pages, GFP_ATOMIC);
-    lpns     = kmalloc(sizeof(*lpns)     * max_pages, GFP_ATOMIC);
-    if (!slc_ppas || !lpns) {
-        if (slc_ppas) kfree(slc_ppas);
-        if (lpns) kfree(lpns);
-        return;
-    }
-
     now = __get_ioclock(conv_ftl->ssd);
-    start = cursor2 % spp->tt_pgs;
+    start = cursor % spp->tt_pgs;
     idx = start;
-    while (scanned < 4096 && found < max_pages) {
+    
+    while (scanned < MAX_SCAN && migrated < MAX_MIGRATE) {
         if (conv_ftl->page_in_slc[idx]) {
             uint64_t last = ht->last_access_time[idx];
-            uint64_t acc  = ht->access_count[idx];
-            /* 冷定义：>1s 且访问计数低于阈值；若严格条件不满足，也放宽为选择更老者 */
-            bool is_cold = ((now - last) > 1000000000ULL && acc < ht->migration_threshold);
-            if (!is_cold) {
-                /* 放宽策略：极老数据（>5s）也作为候选 */
-                if ((now - last) <= 5000000000ULL) {
-                    goto next;
-                }
-            }
-            {
-                struct ppa old = get_maptbl_ent(conv_ftl, idx);
-                if (mapped_ppa(&old) && is_slc_block(conv_ftl, old.g.blk)) {
-                    lpns[found] = idx;
-                    slc_ppas[found] = old;
-                    found++;
+            uint64_t acc = ht->access_count[idx];
+            
+            if ((now - last) > 1000000000ULL && acc < ht->migration_threshold) {
+                struct ppa old_ppa = get_maptbl_ent(conv_ftl, idx);
+                if (mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk)) {
+                    /* 直接调用单页迁移函数 */
+                    migrate_page_to_qlc(conv_ftl, idx, &old_ppa);
+                    migrated++;
                 }
             }
         }
-next:
+        
         scanned++;
         idx = (idx + 1) % spp->tt_pgs;
         if (idx == start) break;
     }
-    cursor2 = idx;
-
-    if (found > 0) {
-        migrate_batch_to_qlc(conv_ftl, slc_ppas, lpns, found);
+    
+    cursor = idx;
+    
+    if (migrated > 0) {
+        NVMEV_DEBUG("Migrated %d cold pages from SLC to QLC\n", migrated);
     }
-
-    kfree(slc_ppas);
-    kfree(lpns);
 }
 
+
+
+/* 无阈值：总是尝试从 SLC 迁移少量更冷页面到 QLC */
+static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_pages)
+{
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct heat_tracking *ht = &conv_ftl->heat_track;
+    uint32_t migrated = 0;
+    uint32_t scanned = 0;
+    uint64_t now;
+    static uint64_t cursor2 = 0;
+    uint64_t idx;
+
+    if (!conv_ftl->page_in_slc || !ht || !ht->last_access_time || max_pages == 0)
+        return;
+
+    now = __get_ioclock(conv_ftl->ssd);
+    idx = cursor2 % spp->tt_pgs;
+    
+    while (scanned < 4096 && migrated < max_pages) {
+        if (conv_ftl->page_in_slc[idx]) {
+            uint64_t last = ht->last_access_time[idx];
+            uint64_t acc = ht->access_count[idx];
+            
+            /* 冷数据判断 */
+            bool is_cold = ((now - last) > 1000000000ULL && acc < ht->migration_threshold);
+            if (!is_cold) {
+                /* 放宽策略：极老数据（>5s）也作为候选 */
+                if ((now - last) > 5000000000ULL) {
+                    is_cold = true;
+                }
+            }
+            
+            if (is_cold) {
+                struct ppa old_ppa = get_maptbl_ent(conv_ftl, idx);
+                if (mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk)) {
+                    /* 执行单页迁移 */
+                    migrate_page_to_qlc(conv_ftl, idx, &old_ppa);
+                    migrated++;
+                }
+            }
+        }
+        
+        scanned++;
+        idx = (idx + 1) % spp->tt_pgs;
+    }
+    
+    cursor2 = idx;
+    
+    if (migrated > 0) {
+        NVMEV_DEBUG("Migrated %d pages from SLC to QLC\n", migrated);
+    }
+}
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -1385,22 +1357,44 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-    /* 1. 增加全局参数验证 */
+    NVMEV_DEBUG("Entering mark_page_valid: ch=%d, lun=%d, blk=%d, pg=%d\n",
+                ppa ? ppa->g.ch : -1, ppa ? ppa->g.lun : -1, 
+                ppa ? ppa->g.blk : -1, ppa ? ppa->g.pg : -1);
+	/* 1. 增加全局参数验证 */
     if (!conv_ftl || !ppa || !conv_ftl->ssd) {
         NVMEV_ERROR("[mark_page_valid] Invalid parameters.\n");
         return;
     }
     
     struct ssdparams *spp = &conv_ftl->ssd->sp;
+	/* 2. 验证PPA有效性 */
+    if (!valid_ppa(conv_ftl, ppa)) {
+        NVMEV_ERROR("[mark_page_valid] Invalid PPA: ch=%d, lun=%d, blk=%d, pg=%d\n",
+                    ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+        return;
+    }
     struct nand_block *blk;
     struct nand_page *pg;
 
     /* 更新页和块的状态 (这部分不涉及共享数据结构，可以在锁外完成) */
     pg = get_pg(conv_ftl->ssd, ppa);
-    NVMEV_ASSERT(pg->status == PG_FREE);
+	if (!pg) {
+        NVMEV_ERROR("[mark_page_valid] Failed to get page structure\n");
+        return;
+    }
+    /* 4. 验证页面状态 */
+    if (pg->status != PG_FREE) {
+        NVMEV_WARN("[mark_page_valid] Page not FREE: status=%d at ch=%d,lun=%d,blk=%d,pg=%d\n",
+                   pg->status, ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+        /* 根据实际需求决定是否继续 */
+    }
     pg->status = PG_VALID;
 
     blk = get_blk(conv_ftl->ssd, ppa);
+	if (!blk) {
+        NVMEV_ERROR("[mark_page_valid] Failed to get block structure\n");
+        return;
+    }
     NVMEV_ASSERT(blk->vpc >= 0 && blk->vpc < spp->pgs_per_blk);
     blk->vpc++;
     if (blk->vpc > spp->pgs_per_blk) {
@@ -1878,46 +1872,75 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
 /* 获取 QLC 的新页面 - 使用多区域并发*/
 static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct ppa ppa;
-	struct write_pointer *wp = &conv_ftl->qlc_wp[region_id];
-	
-	/* 如果 QLC 写指针未初始化，初始化它 */
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct ppa ppa;
+    struct write_pointer *wp = &conv_ftl->qlc_wp[region_id];
+    struct nand_page *pg;
+    
+    /* 参数验证 */
+    if (!conv_ftl || region_id >= QLC_REGIONS) {
+        NVMEV_ERROR("Invalid parameters: conv_ftl=%p, region_id=%u\n", 
+                    conv_ftl, region_id);
+        return (struct ppa){ .ppa = UNMAPPED_PPA };
+    }
+    
+    /* 如果 QLC 写指针未初始化，初始化它 */
     if (!wp->curline) {
-        /* Protect QLC free list and counters */
         spin_lock(&conv_ftl->qlc_lock);
-		struct line_mgmt *lm = &conv_ftl->qlc_lm;
-		struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-		
+        struct line_mgmt *lm = &conv_ftl->qlc_lm;
+        struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+        
         if (!curline) {
             NVMEV_ERROR("No free QLC line available in region %d!\n", region_id);
             spin_unlock(&conv_ftl->qlc_lock);
             return (struct ppa){ .ppa = UNMAPPED_PPA };
         }
-		
-		list_del_init(&curline->entry);
-		lm->free_line_cnt--;
-		
-		*wp = (struct write_pointer) {
-			.curline = curline,
-			.ch = 0,
-			.lun = 0,
-			.pg = 0,
-			.blk = curline->id,
-			.pl = 0,
-		};
+        
+        list_del_init(&curline->entry);
+        lm->free_line_cnt--;
+        
+        /* 初始化写指针 - 为每个区域分配不同的起始位置 */
+        *wp = (struct write_pointer) {
+            .curline = curline,
+            .ch = region_id % spp->nchs,
+            .lun = (region_id / spp->nchs) % spp->nluns,
+            .pg = 0,
+            .blk = curline->id,
+            .pl = 0,
+        };
         spin_unlock(&conv_ftl->qlc_lock);
-	}
-	
-	/* 获取当前页 */
-	ppa.ppa = 0;
-	ppa.g.ch = wp->ch;
-	ppa.g.lun = wp->lun;
-	ppa.g.pg = wp->pg;
-	ppa.g.blk = wp->blk;
-	ppa.g.pl = wp->pl;
-	
-	return ppa;
+    }
+    
+retry_get_page:
+    /* 获取当前页 */
+    ppa.ppa = 0;
+    ppa.g.ch = wp->ch;
+    ppa.g.lun = wp->lun;
+    ppa.g.pg = wp->pg;
+    ppa.g.blk = wp->blk;
+    ppa.g.pl = wp->pl;
+    
+    /* 验证页面状态 */
+    pg = get_pg(conv_ftl->ssd, &ppa);
+    if (!pg) {
+        NVMEV_ERROR("Failed to get page structure for ppa\n");
+        return (struct ppa){ .ppa = UNMAPPED_PPA };
+    }
+    
+    if (pg->status != PG_FREE) {
+        NVMEV_WARN("QLC page not FREE: status=%d at ch=%d,lun=%d,blk=%d,pg=%d\n", 
+                   pg->status, ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
+        
+        /* 推进写指针并重试 */
+        if (advance_qlc_write_pointer(conv_ftl, region_id) == 0) {
+            goto retry_get_page;
+        } else {
+            NVMEV_ERROR("Cannot advance write pointer\n");
+            return (struct ppa){ .ppa = UNMAPPED_PPA };
+        }
+    }
+    
+    return ppa;
 }
 
 /* 推进 QLC 写指针 - 使用多区域并发 */
@@ -2008,66 +2031,77 @@ static bool should_migrate_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn)
 	return false;
 }
 
-/* 执行从 SLC 到 QLC 的迁移 */
-static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *old_ppa)
+/* 单页迁移函数 - 从 SLC 迁移一页到 QLC */
+static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *slc_ppa)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct ppa new_ppa;
-	struct nand_cmd srd, swr;
-	uint64_t nsecs_completed;
-	
-	/* 选择 QLC 区域（轮询） */
-	uint32_t region = conv_ftl->current_qlc_region;
-	conv_ftl->current_qlc_region = (conv_ftl->current_qlc_region + 1) % QLC_REGIONS;
-	
-	/* 获取 QLC 新页面 */
-	new_ppa = get_new_qlc_page(conv_ftl, region);
-	if (!mapped_ppa(&new_ppa)) {
-		NVMEV_ERROR("Failed to get QLC page for migration\n");
-		return;
-	}
-	
-	/* 读取 SLC 页面 */
-	srd.type = USER_IO;
-	srd.cmd = NAND_READ;
-	srd.stime = __get_ioclock(conv_ftl->ssd);
-	srd.interleave_pci_dma = false;
-	srd.xfer_size = spp->pgsz;
-	srd.ppa = old_ppa;
-	
-	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
-	
-	/* 写入 QLC 页面 */
-	swr.type = USER_IO;
-	swr.cmd = NAND_WRITE;
-	swr.stime = nsecs_completed;
-	swr.interleave_pci_dma = false;
-	swr.xfer_size = spp->pgsz;
-	swr.ppa = &new_ppa;
-	
-	ssd_advance_nand(conv_ftl->ssd, &swr);
-	
-	/* 更新映射表 */
-	set_maptbl_ent(conv_ftl, lpn, &new_ppa);
-	set_rmap_ent(conv_ftl, lpn, &new_ppa);
-	
-	/* 标记旧页面无效 */
-	mark_page_invalid(conv_ftl, old_ppa);
-	set_rmap_ent(conv_ftl, INVALID_LPN, old_ppa);
-	
-	/* 更新元数据 */
-	conv_ftl->page_in_slc[lpn] = false;
-	mark_page_valid(conv_ftl, &new_ppa);
-	
-	/* 推进 QLC 写指针 */
-	advance_qlc_write_pointer(conv_ftl, region);
-	
-	/* 更新统计 */
-	conv_ftl->migration_cnt++;
-	
-	NVMEV_DEBUG("Migrated LPN %lld from SLC to QLC region %d\n", lpn, region);
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct ppa new_ppa;
+    struct nand_cmd srd, swr;
+    uint64_t nsecs_completed;
+    
+    /* 参数验证 */
+    if (!conv_ftl || !slc_ppa || !mapped_ppa(slc_ppa)) {
+        NVMEV_ERROR("Invalid parameters for page migration\n");
+        return;
+    }
+    
+    /* 验证页面确实在 SLC 中 */
+    if (!is_slc_block(conv_ftl, slc_ppa->g.blk)) {
+        NVMEV_ERROR("Page not in SLC, cannot migrate\n");
+        return;
+    }
+    
+    /* 选择 QLC 区域（轮询） */
+    uint32_t region = conv_ftl->current_qlc_region;
+    conv_ftl->current_qlc_region = (conv_ftl->current_qlc_region + 1) % QLC_REGIONS;
+    
+    /* 获取 QLC 新页面 */
+    new_ppa = get_new_qlc_page(conv_ftl, region);
+    if (!mapped_ppa(&new_ppa)) {
+        NVMEV_ERROR("Failed to get QLC page for migration\n");
+        return;
+    }
+    
+    /* 读取 SLC 页面 */
+    srd.type = USER_IO;
+    srd.cmd = NAND_READ;
+    srd.stime = __get_ioclock(conv_ftl->ssd);
+    srd.interleave_pci_dma = false;
+    srd.xfer_size = spp->pgsz;
+    srd.ppa = slc_ppa;
+    
+    nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
+    
+    /* 写入 QLC 页面 */
+    swr.type = USER_IO;
+    swr.cmd = NAND_WRITE;
+    swr.stime = nsecs_completed;
+    swr.interleave_pci_dma = false;
+    swr.xfer_size = spp->pgsz;
+    swr.ppa = &new_ppa;
+    
+    ssd_advance_nand(conv_ftl->ssd, &swr);
+    
+    /* 更新映射表 */
+    set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+    set_rmap_ent(conv_ftl, lpn, &new_ppa);
+    
+    /* 标记旧页面无效 */
+    mark_page_invalid(conv_ftl, slc_ppa);
+    set_rmap_ent(conv_ftl, INVALID_LPN, slc_ppa);
+    
+    /* 更新元数据 */
+    conv_ftl->page_in_slc[lpn] = false;
+    mark_page_valid(conv_ftl, &new_ppa);
+    
+    /* 推进 QLC 写指针 */
+    advance_qlc_write_pointer(conv_ftl, region);
+    
+    /* 更新统计 */
+    conv_ftl->migration_cnt++;
+    
+    NVMEV_DEBUG("Migrated LPN %llu from SLC to QLC region %d\n", lpn, region);
 }
-
 static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
@@ -2567,108 +2601,6 @@ static void *safe_kmalloc(size_t size, gfp_t flags, const char *desc)
 	return ptr;
 }
 
-/* 批量迁移函数 - 充分利用4个写指针的并发性 */
-static void migrate_batch_to_qlc(struct conv_ftl *conv_ftl, struct ppa *slc_ppas, 
-                                 uint64_t *lpns, uint32_t count)
-{
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-    struct ppa *new_ppas;
-    struct nand_cmd *srds, *swrs;
-	uint64_t nsecs_completed;
-	uint32_t i;
-	
-	NVMEV_DEBUG("Starting batch migration of %d pages\n", count);
-	
-    new_ppas = kmalloc(sizeof(*new_ppas) * count, GFP_KERNEL);
-    if (!new_ppas) {
-        NVMEV_ERROR("Failed to allocate new_ppas for batch migration\n");
-        return;
-    }
-    srds = kmalloc(sizeof(*srds) * count, GFP_KERNEL);
-    if (!srds) {
-        NVMEV_ERROR("Failed to allocate srds for batch migration\n");
-        kfree(new_ppas);
-        return;
-    }
-    swrs = kmalloc(sizeof(*swrs) * count, GFP_KERNEL);
-    if (!swrs) {
-        NVMEV_ERROR("Failed to allocate swrs for batch migration\n");
-        kfree(srds);
-        kfree(new_ppas);
-        return;
-    }
-
-	/* 阶段1：并发获取QLC页面 - 轮询使用4个区域 */
-	for (i = 0; i < count; i++) {
-		uint32_t region = i % QLC_REGIONS;  /* 均匀分配到4个区域 */
-		new_ppas[i] = get_new_qlc_page(conv_ftl, region);
-		
-        if (!mapped_ppa(&new_ppas[i])) {
-			NVMEV_ERROR("Failed to get QLC page for batch migration\n");
-            kfree(swrs);
-            kfree(srds);
-            kfree(new_ppas);
-            return;
-		}
-	}
-	
-	/* 阶段2：批量读取SLC页面 */
-	nsecs_completed = __get_ioclock(conv_ftl->ssd);
-	for (i = 0; i < count; i++) {
-		srds[i].type = USER_IO;
-		srds[i].cmd = NAND_READ;
-		srds[i].stime = nsecs_completed;
-		srds[i].interleave_pci_dma = false;
-		srds[i].xfer_size = spp->pgsz;
-		srds[i].ppa = &slc_ppas[i];
-		
-		/* 并发读取 - 利用多channel */
-		nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srds[i]);
-	}
-	
-	/* 阶段3：批量写入QLC页面 - 4个区域并发 */
-	for (i = 0; i < count; i++) {
-		swrs[i].type = USER_IO;
-		swrs[i].cmd = NAND_WRITE;
-		swrs[i].stime = nsecs_completed;
-		swrs[i].interleave_pci_dma = false;
-		swrs[i].xfer_size = spp->pgsz;
-		swrs[i].ppa = &new_ppas[i];
-		
-		/* 并发写入 - 4个区域同时写入 */
-		ssd_advance_nand(conv_ftl->ssd, &swrs[i]);
-	}
-	
-	/* 阶段4：批量更新映射表和推进写指针 */
-	for (i = 0; i < count; i++) {
-		uint32_t region = i % QLC_REGIONS;
-		
-		/* 更新映射表 */
-		set_maptbl_ent(conv_ftl, lpns[i], &new_ppas[i]);
-		set_rmap_ent(conv_ftl, lpns[i], &new_ppas[i]);
-		
-		/* 标记旧页面无效 */
-		mark_page_invalid(conv_ftl, &slc_ppas[i]);
-		set_rmap_ent(conv_ftl, INVALID_LPN, &slc_ppas[i]);
-		
-		/* 更新元数据 */
-		conv_ftl->page_in_slc[lpns[i]] = false;
-		mark_page_valid(conv_ftl, &new_ppas[i]);
-		
-		/* 推进对应区域的写指针 */
-		advance_qlc_write_pointer(conv_ftl, region);
-	}
-	
-	/* 更新统计 */
-	conv_ftl->migration_cnt += count;
-	
-	NVMEV_INFO("Batch migrated %d pages using %d QLC regions concurrently\n", 
-		   count, QLC_REGIONS);
-
-    kfree(swrs);
-    kfree(srds);
-    kfree(new_ppas);
-}
 
 /* 智能区域选择 - 根据负载选择最佳QLC区域 */
 static uint32_t select_best_qlc_region(struct conv_ftl *conv_ftl)
