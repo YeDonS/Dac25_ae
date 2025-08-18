@@ -1344,111 +1344,90 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         spin_unlock(&conv_ftl->qlc_lock);
 }
 
+// ... existing code ...
+
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-    // 参数验证
-    if (!conv_ftl || !ppa) {
-        NVMEV_ERROR("[mark_page_valid] Invalid parameters: conv_ftl=%p, ppa=%p\n", conv_ftl, ppa);
+    /* 1. 增加全局参数验证 */
+    if (!conv_ftl || !ppa || !conv_ftl->ssd) {
+        NVMEV_ERROR("[mark_page_valid] Invalid parameters.\n");
         return;
     }
-
-    if (!conv_ftl->ssd || !conv_ftl->ssd->sp) {
-        NVMEV_ERROR("[mark_page_valid] Invalid SSD structure\n");
-        return;
-    }
-
-    struct ssdparams *spp = &conv_ftl->ssd->sp;
-    struct nand_block *blk = NULL;
-    struct nand_page *pg = NULL;
-    /* 分层记账：按介质选择账本 */
-    bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
-    struct line_mgmt *lm = in_slc ? &conv_ftl->slc_lm : &conv_ftl->qlc_lm;
-    struct line *line;
-
-    // 添加调试信息
-    NVMEV_DEBUG("[mark_page_valid] PPA: ch=%d, lun=%d, pl=%d, blk=%d, pg=%d, in_slc=%d\n",
-                ppa->g.ch, ppa->g.lun, ppa->g.pl, ppa->g.blk, ppa->g.pg, in_slc);
     
-    if (in_slc) {
-        NVMEV_DEBUG("[mark_page_valid] SLC: tt_lines=%d, blk_id=%d\n", 
-                    lm->tt_lines, ppa->g.blk);
-    } else {
-        uint32_t start_blk = conv_ftl->slc_blks_per_pl;
-        uint32_t idx = ppa->g.blk - start_blk;
-        NVMEV_DEBUG("[mark_page_valid] QLC: tt_lines=%d, start_blk=%d, blk_id=%d, idx=%d\n", 
-                    lm->tt_lines, start_blk, ppa->g.blk, idx);
-    }
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct nand_block *blk;
+    struct nand_page *pg;
 
-    /* 安全检查：确保line_mgmt已初始化 */
-    if (!lm || !lm->lines) {
-        NVMEV_ERROR("Line management not initialized for %s\n", 
-                    in_slc ? "SLC" : "QLC");
-        return;
-    }
-
-    /* update page status */
+    /* 更新页和块的状态 (这部分不涉及共享数据结构，可以在锁外完成) */
     pg = get_pg(conv_ftl->ssd, ppa);
     NVMEV_ASSERT(pg->status == PG_FREE);
     pg->status = PG_VALID;
 
-    /* update corresponding block status */
     blk = get_blk(conv_ftl->ssd, ppa);
     NVMEV_ASSERT(blk->vpc >= 0 && blk->vpc < spp->pgs_per_blk);
     blk->vpc++;
-    if (blk->vpc > spp->pgs_per_blk) blk->vpc = spp->pgs_per_blk;
+    if (blk->vpc > spp->pgs_per_blk) {
+        blk->vpc = spp->pgs_per_blk;
+    }
 
-    /* update corresponding line status with boundary checks */
-    uint32_t start_blk, idx;
+    /* 2. 根据介质类型，进入完全独立的原子操作块 */
+    bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
     if (in_slc) {
-        // SLC边界检查
-        if (ppa->g.blk >= lm->tt_lines) {
-            NVMEV_ERROR("[mark_page_valid] SLC block index out of range: %d >= %d\n", 
+        struct line_mgmt *lm = &conv_ftl->slc_lm;
+        struct line *line;
+
+        /* SLC 边界检查 (在加锁前) */
+        if (!lm || !lm->lines || ppa->g.blk >= lm->tt_lines) {
+            NVMEV_ERROR("[mark_page_valid] SLC block index out of range: %u >= %u\n", 
                         ppa->g.blk, lm->tt_lines);
             return;
         }
-        spin_lock(&conv_ftl->slc_lock);
-        line = &lm->lines[ppa->g.blk];
-    } else {
-        // QLC边界检查
-        spin_lock(&conv_ftl->qlc_lock);
-        start_blk = conv_ftl->slc_blks_per_pl;
-        
-        if (ppa->g.blk < start_blk) {
-            NVMEV_ERROR("[mark_page_valid] QLC block ID %d is less than start block %d\n", 
-                        ppa->g.blk, start_blk);
-            spin_unlock(&conv_ftl->qlc_lock);
-            return;
-        }
-        
-        idx = ppa->g.blk - start_blk;
-        if (idx >= lm->tt_lines) {
-            NVMEV_ERROR("[mark_page_valid] QLC block index out of range: %d >= %d\n", 
-                        idx, lm->tt_lines);
-            spin_unlock(&conv_ftl->qlc_lock);
-            return;
-        }
-        line = &lm->lines[idx];
-    }
 
-    /* 更新line状态 */
-    if (in_slc) {
+        spin_lock(&conv_ftl->slc_lock); // --- SLC 加锁 ---
+        line = &lm->lines[ppa->g.blk];
         NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_lun_line);
         line->vpc++;
-        if (line->vpc > spp->pgs_per_lun_line)
+        if (line->vpc > spp->pgs_per_lun_line) {
             line->vpc = spp->pgs_per_lun_line;
-    } else {
+        }
+        spin_unlock(&conv_ftl->slc_lock); // --- SLC 解锁 ---
+
+    } else { // QLC 路径
+        struct line_mgmt *lm = &conv_ftl->qlc_lm;
+        struct line *line;
+        uint32_t start_blk = conv_ftl->slc_blks_per_pl;
+        uint32_t idx;
+
+        /* QLC 边界检查 (在加锁前) */
+        if (!lm || !lm->lines) {
+            NVMEV_ERROR("[mark_page_valid] QLC line management not initialized\n");
+            return;
+        }
+        
+        if (ppa->g.blk < start_blk) {
+            NVMEV_ERROR("[mark_page_valid] QLC block ID %u is less than start block %u\n", 
+                        ppa->g.blk, start_blk);
+            return;
+        }
+        idx = ppa->g.blk - start_blk;
+        if (idx >= lm->tt_lines) {
+            NVMEV_ERROR("[mark_page_valid] QLC index out of range: %u >= %u\n", 
+                        idx, lm->tt_lines);
+            return;
+        }
+
+        spin_lock(&conv_ftl->qlc_lock); // --- QLC 加锁 ---
+        line = &lm->lines[idx];
         NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
         line->vpc++;
-        if (line->vpc > spp->pgs_per_line)
+        if (line->vpc > spp->pgs_per_line) {
             line->vpc = spp->pgs_per_line;
+        }
+        spin_unlock(&conv_ftl->qlc_lock); // --- QLC 解锁 ---
     }
-
-    /* 释放锁 */
-    if (in_slc)
-        spin_unlock(&conv_ftl->slc_lock);
-    else
-        spin_unlock(&conv_ftl->qlc_lock);
 }
+
+// ... existing code ...
 
 static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
