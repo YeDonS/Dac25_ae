@@ -24,6 +24,7 @@ static inline bool mapped_ppa(struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *slc_ppa);
 static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id);
+static void advance_slc_write_pointer(struct conv_ftl *conv_ftl);
 
 /* 后台线程函数声明 */
 static int background_migration_thread(void *data);
@@ -269,106 +270,16 @@ static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
 
 static void init_lines(struct conv_ftl *conv_ftl)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct line_mgmt *lm = &conv_ftl->lm;
-	struct line *line;
-	int i;
-
-	lm->tt_lines = spp->tt_lines;
-	NVMEV_ASSERT(lm->tt_lines == spp->tt_lines);
-	lm->lines = vmalloc(sizeof(struct line) * lm->tt_lines);
-	if (!lm->lines) {
-		NVMEV_ERROR("Failed to allocate SLC lines memory\n");
-		return;
-	}
-
-	INIT_LIST_HEAD(&lm->free_line_list);
-	INIT_LIST_HEAD(&lm->full_line_list);
-
-	lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri, victim_line_get_pri,
-					 victim_line_set_pri, victim_line_get_pos,
-					 victim_line_set_pos);
-	if (!lm->victim_line_pq) {
-		NVMEV_ERROR("Failed to initialize SLC victim line priority queue\n");
-		vfree(lm->lines);
-		lm->lines = NULL;
-		return;
-	}
-
-	lm->free_line_cnt = 0;
-	for (i = 0; i < lm->tt_lines; i++) {
-		lm->lines[i] = (struct line) {
-			.id = i,
-			.ipc = 0,
-			.vpc = 0,
-			.pos = 0,
-			.entry = LIST_HEAD_INIT(lm->lines[i].entry),
-		};
-
-		/* initialize all the lines as free lines */
-		list_add_tail(&lm->lines[i].entry, &lm->free_line_list);
-		lm->free_line_cnt++;
-	}
-
-	NVMEV_ASSERT(lm->free_line_cnt == lm->tt_lines);
-	lm->victim_line_cnt = 0;
-	lm->full_line_cnt = 0;
+	/* 旧的 init_lines 函数已废弃 - 现在使用 init_slc_lines 和 init_qlc_lines */
+	/* 保留空实现以避免编译错误 */
+	NVMEV_DEBUG("init_lines called - function deprecated, using SLC/QLC initialization instead\n");
 }
 
 //66f1
 static void init_lines_DA(struct conv_ftl *conv_ftl)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-
-	uint32_t luncount = conv_ftl->ssd->sp.luns_per_ch * conv_ftl->ssd->sp.nchs;
-	uint32_t lun=0;
-	for( lun=0; lun < luncount; lun++ )
-	{
-		struct line_mgmt *lm = (conv_ftl->lunlm+lun);
-		struct line *line;
-		int i;
-
-		lm->tt_lines = spp->blks_per_pl;
-		NVMEV_ASSERT(lm->tt_lines == spp->tt_lines);
-		lm->lines = vmalloc(sizeof(struct line) * lm->tt_lines);
-		if (!lm->lines) {
-			NVMEV_ERROR("Failed to allocate LUN lines memory for lun %d\n", lun);
-			continue;
-		}
-
-		INIT_LIST_HEAD(&lm->free_line_list);
-		INIT_LIST_HEAD(&lm->full_line_list);
-
-		lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri, victim_line_get_pri,
-						victim_line_set_pri, victim_line_get_pos,
-						victim_line_set_pos);
-		if (!lm->victim_line_pq) {
-			NVMEV_ERROR("Failed to initialize LUN victim line priority queue for lun %d\n", lun);
-			vfree(lm->lines);
-			lm->lines = NULL;
-			continue;
-		}
-
-		lm->free_line_cnt = 0;
-		for (i = 0; i < lm->tt_lines; i++) {
-			lm->lines[i] = (struct line) {
-				.id = i,
-				.ipc = 0,
-				.vpc = 0,
-				.pos = 0,
-				.entry = LIST_HEAD_INIT(lm->lines[i].entry),
-			};
-
-			/* initialize all the lines as free lines */
-			list_add_tail(&lm->lines[i].entry, &lm->free_line_list);
-			lm->free_line_cnt++;
-		}
-
-		NVMEV_ASSERT(lm->free_line_cnt == lm->tt_lines);
-		lm->victim_line_cnt = 0;
-		lm->full_line_cnt = 0;
-
-	}
+	/* Die-Affinity lines 初始化函数已废弃 - 现在使用 SLC/QLC 系统 */
+	NVMEV_DEBUG("init_lines_DA called - function deprecated, using SLC/QLC initialization instead\n");
 }
 //66f1
 
@@ -380,14 +291,8 @@ static void remove_lines(struct conv_ftl *conv_ftl)
 
 static void remove_lines_DA(struct conv_ftl *conv_ftl)
 {
-	uint32_t luncount = conv_ftl->ssd->sp.luns_per_ch * conv_ftl->ssd->sp.nchs;
-	uint32_t lun=0;
-	for( lun=0; lun < luncount; lun++ )
-	{
-		struct line_mgmt *lm = (conv_ftl->lunlm+lun);
-		pqueue_free(lm->victim_line_pq);
-		vfree(lm->lines);
-	}
+	/* Die-Affinity lines 清理函数已废弃 - 现在使用 remove_slc_lines 和 remove_qlc_lines */
+	NVMEV_DEBUG("remove_lines_DA called - function deprecated, using SLC/QLC cleanup instead\n");
 }
 
 static void init_write_flow_control(struct conv_ftl *conv_ftl)
@@ -406,35 +311,17 @@ static inline void check_addr(int a, int max)
 
 static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
 {
-	struct line_mgmt *lm = &conv_ftl->lm;
-	struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-
-	if (!curline) {
-		NVMEV_ERROR("No free line left in VIRT !!!!\n");
-		return NULL;
-	}
-
-	list_del_init(&curline->entry);
-	lm->free_line_cnt--;
-	NVMEV_DEBUG("[%s] free_line_cnt %d\n", __FUNCTION__, lm->free_line_cnt);
-	return curline;
+	/* 旧的 get_next_free_line 函数已废弃 - 现在使用 SLC/QLC 特定的分配逻辑 */
+	NVMEV_DEBUG("get_next_free_line called - function deprecated, using SLC/QLC allocation instead\n");
+	return NULL;  /* 返回 NULL 表示没有可用的 line */
 }
 
 //66f1
 static struct line *get_next_free_line_DA(struct conv_ftl *conv_ftl, uint32_t lun)
 {
-	struct line_mgmt *lm = conv_ftl->lunlm+lun;
-	struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-
-	if (!curline) {
-		NVMEV_ERROR("No free line left in VIRT !!!!\n");
-		return NULL;
-	}
-
-	list_del_init(&curline->entry);
-	lm->free_line_cnt--;
-	NVMEV_DEBUG("[%s] free_line_cnt %d\n", __FUNCTION__, lm->free_line_cnt);
-	return curline;
+	/* Die-Affinity get_next_free_line 函数已废弃 - 现在使用 SLC/QLC 特定的分配逻辑 */
+	NVMEV_DEBUG("get_next_free_line_DA called - function deprecated, using SLC/QLC allocation instead\n");
+	return NULL;  /* 返回 NULL 表示没有可用的 line */
 }
 //66f1
 
@@ -452,14 +339,12 @@ static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 //66f1
 static struct write_pointer *__get_wp_DA(struct conv_ftl *ftl, uint32_t io_type, uint32_t lun)
 {
-	if (io_type == USER_IO) {
-		return (ftl->lunwp+lun);
-	} else if (io_type == GC_IO) {
-		return &ftl->gc_wp;
+	/* Die-Affinity 写指针获取函数已废弃 - 现在使用 SLC/QLC 特定的写指针 */
+	NVMEV_DEBUG("__get_wp_DA called - function deprecated, using SLC/QLC write pointers instead\n");
+	if (io_type == GC_IO) {
+		return &ftl->gc_wp;  /* GC 仍然使用全局写指针 */
 	}
-
-	NVMEV_ASSERT(0);
-	return NULL;
+	return NULL;  /* 其他情况返回 NULL */
 }
 //66f1
 
