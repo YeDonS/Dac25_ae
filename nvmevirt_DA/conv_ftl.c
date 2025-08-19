@@ -1420,29 +1420,30 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
     struct line *qlc_victim = NULL;
     struct line_mgmt *slc_lm = &conv_ftl->slc_lm;
     struct line_mgmt *qlc_lm = &conv_ftl->qlc_lm;
-    bool slc_suitable, qlc_suitable;
+    bool slc_suitable = false, qlc_suitable = false;
     
-    /* 首先检查SLC是否有受害者 */
+    /* === 修复竞争条件：使用统一的锁顺序和原子操作 === */
+    
+    /* 步骤1: 按固定顺序(SLC先, QLC后)获取候选者，避免死锁 */
+    spin_lock(&conv_ftl->slc_lock);
     if (slc_lm->victim_line_cnt > 0) {
         slc_victim = pqueue_peek(slc_lm->victim_line_pq);
+        /* 在持锁期间就判断是否合适，避免TOCTOU */
+        slc_suitable = slc_victim && (force || slc_victim->vpc <= (spp->pgs_per_line / 8));
     }
-    
-    /* 然后检查QLC是否有受害者 */
+    spin_unlock(&conv_ftl->slc_lock);
+
+    spin_lock(&conv_ftl->qlc_lock);
     if (qlc_lm->victim_line_cnt > 0) {
         qlc_victim = pqueue_peek(qlc_lm->victim_line_pq);
+        /* 在持锁期间就判断是否合适，避免TOCTOU */
+        qlc_suitable = qlc_victim && (force || qlc_victim->vpc <= (spp->pgs_per_line / 8));
     }
+    spin_unlock(&conv_ftl->qlc_lock);
     
-    /* 选择策略：
-     * 1. 如果force=true，选择任何可用的受害者
-     * 2. 否则只选择无效页比例足够高的受害者
-     * 3. 优先选择SLC受害者（擦写速度更快）
-     * 4. 如果SLC和QLC都有合适的受害者，选择无效页更多的
-     */
-    slc_suitable = slc_victim && (force || slc_victim->vpc <= (spp->pgs_per_line / 8));
-    qlc_suitable = qlc_victim && (force || qlc_victim->vpc <= (spp->pgs_per_line / 8));
-    
+    /* 步骤2: 选择策略 - 优先SLC，然后比较无效页数量 */
     if (slc_suitable && qlc_suitable) {
-        /* 两者都合适，选择无效页更多的（vpc更小意味着有效页更少，即无效页更多） */
+        /* 两者都合适，选择无效页更多的 */
         victim_line = (slc_victim->vpc <= qlc_victim->vpc) ? slc_victim : qlc_victim;
     } else if (slc_suitable) {
         victim_line = slc_victim;
@@ -1452,20 +1453,40 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
         return NULL;  /* 没有合适的受害者 */
     }
     
-    /* 从相应的队列中移除选中的受害者 */
+    /* 步骤3: 原子地从选中队列移除 - 重新验证并移除 */
     if (victim_line == slc_victim) {
-        pqueue_pop(slc_lm->victim_line_pq);
-        victim_line->pos = 0;
-        slc_lm->victim_line_cnt--;
-        NVMEV_DEBUG("Selected SLC victim line %d (vpc=%d)\n", victim_line->id, victim_line->vpc);
-    } else {
-        pqueue_pop(qlc_lm->victim_line_pq);
-        victim_line->pos = 0;
-        qlc_lm->victim_line_cnt--;
-        NVMEV_DEBUG("Selected QLC victim line %d (vpc=%d)\n", victim_line->id, victim_line->vpc);
+        spin_lock(&conv_ftl->slc_lock);
+        /* 重新验证队列状态，防止在无锁期间被修改 */
+        if (slc_lm->victim_line_cnt > 0 && pqueue_peek(slc_lm->victim_line_pq) == slc_victim) {
+            pqueue_pop(slc_lm->victim_line_pq);
+            victim_line->pos = 0;
+            slc_lm->victim_line_cnt--;
+            spin_unlock(&conv_ftl->slc_lock);
+            NVMEV_DEBUG("Selected SLC victim line %d (vpc=%d)\n", victim_line->id, victim_line->vpc);
+            return victim_line;
+        } else {
+            /* 队列状态已改变，重新尝试 */
+            spin_unlock(&conv_ftl->slc_lock);
+            NVMEV_DEBUG("SLC victim queue changed, retrying...\n");
+            return select_victim_line(conv_ftl, force); /* 递归重试 */
+        }
+    } else { /* victim_line == qlc_victim */
+        spin_lock(&conv_ftl->qlc_lock);
+        /* 重新验证队列状态 */
+        if (qlc_lm->victim_line_cnt > 0 && pqueue_peek(qlc_lm->victim_line_pq) == qlc_victim) {
+            pqueue_pop(qlc_lm->victim_line_pq);
+            victim_line->pos = 0;
+            qlc_lm->victim_line_cnt--;
+            spin_unlock(&conv_ftl->qlc_lock);
+            NVMEV_DEBUG("Selected QLC victim line %d (vpc=%d)\n", victim_line->id, victim_line->vpc);
+            return victim_line;
+        } else {
+            /* 队列状态已改变，重新尝试 */
+            spin_unlock(&conv_ftl->qlc_lock);
+            NVMEV_DEBUG("QLC victim queue changed, retrying...\n");
+            return select_victim_line(conv_ftl, force); /* 递归重试 */
+        }
     }
-
-    return victim_line;
 }
 
 /* here ppa identifies the block we want to clean */
@@ -1545,28 +1566,45 @@ static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
     bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
-    struct line_mgmt *lm = in_slc ? &conv_ftl->slc_lm : &conv_ftl->qlc_lm;
-    struct line *line;
+
     if (in_slc) {
+        struct line_mgmt *lm = &conv_ftl->slc_lm;
+        struct line *line;
+        
+        spin_lock(&conv_ftl->slc_lock); // --- 对SLC加锁 ---
+        
         line = &lm->lines[ppa->g.blk];
+        line->ipc = 0;
+        line->vpc = 0;
+        list_add_tail(&line->entry, &lm->free_line_list);
+        lm->free_line_cnt++;
+        
+        spin_unlock(&conv_ftl->slc_lock); // --- 解锁 ---
     } else {
+        struct line_mgmt *lm = &conv_ftl->qlc_lm;
+        struct line *line;
         uint32_t start_blk = conv_ftl->slc_blks_per_pl;
         uint32_t idx = ppa->g.blk - start_blk;
+
+        spin_lock(&conv_ftl->qlc_lock); // --- 对QLC加锁 ---
+        
         NVMEV_ASSERT(idx < lm->tt_lines);
         line = &lm->lines[idx];
         
         /* 确保QLC line的内部ID保持为数组索引，不被物理block ID污染 */
         if (line->id != idx) {
-            NVMEV_ERROR("QLC line ID corruption detected: line->id=%u, expected=%u\n", 
+            NVMEV_ERROR("QLC line ID corruption detected: line->id=%u, expected=%u, fixing...\n", 
                        line->id, idx);
             line->id = idx;  /* 修复损坏的ID */
         }
+        
+        line->ipc = 0;
+        line->vpc = 0;
+        list_add_tail(&line->entry, &lm->free_line_list);
+        lm->free_line_cnt++;
+
+        spin_unlock(&conv_ftl->qlc_lock); // --- 解锁 ---
     }
-	line->ipc = 0;
-	line->vpc = 0;
-	/* move this line to free line list */
-	list_add_tail(&line->entry, &lm->free_line_list);
-	lm->free_line_cnt++;
 }
 
 static int do_gc(struct conv_ftl *conv_ftl, bool force)
@@ -1878,6 +1916,13 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
         list_del_init(&curline->entry);
         lm->free_line_cnt--;
         
+        /* 验证QLC line ID的合法性 */
+        if (curline->id >= lm->tt_lines) {
+            NVMEV_ERROR("QLC line ID %u exceeds range [0, %u), fixing to array index...\n", 
+                       curline->id, lm->tt_lines);
+            curline->id = curline - lm->lines;  /* 使用指针差值作为正确的索引 */
+        }
+        
         /* 初始化写指针 - 为每个区域分配不同的起始位置 */
         *wp = (struct write_pointer) {
             .curline = curline,
@@ -1977,6 +2022,14 @@ static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_
 	
 	list_del_init(&wp->curline->entry);
 	lm->free_line_cnt--;
+	
+	/* 验证QLC line ID的合法性 */
+	if (wp->curline->id >= lm->tt_lines) {
+		NVMEV_ERROR("advance_qlc_write_pointer: QLC line ID %u exceeds range [0, %u), fixing...\n", 
+			   wp->curline->id, lm->tt_lines);
+		wp->curline->id = wp->curline - lm->lines;  /* 使用指针差值作为正确的索引 */
+	}
+	
 	wp->blk = conv_ftl->slc_blks_per_pl + wp->curline->id;  /* QLC物理block ID = SLC数量 + QLC索引 */
     spin_unlock(&conv_ftl->qlc_lock);
 	
