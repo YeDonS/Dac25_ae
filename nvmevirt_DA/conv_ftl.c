@@ -2005,7 +2005,7 @@ static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region
     spin_unlock(&conv_ftl->qlc_lock);
 	
 out:
-	return;
+	return 0;
 }
 
 /* 更新热数据信息 */
@@ -2323,7 +2323,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint64_t nsecs_completed = 0;
     uint64_t write_lat;
     struct ppa ppa;
-    struct ppa old_ppa = { .ppa = UNMAPPED_PPA };  /* 用于迁移检查 */
+    //struct ppa old_ppa = { .ppa = UNMAPPED_PPA };  /* 用于迁移检查 */
     
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
 		/* 低水位则尝试搬一小批冷页，最小化改动且不影响写入主路径 */
@@ -2340,11 +2340,6 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			set_rmap_ent(conv_ftl, INVALID_LPN, &ppa);
 			NVMEV_DEBUG("conv_write: %lld is invalid, ", ppa2pgidx(conv_ftl, &ppa));
 			
-			/* 如果页面在 SLC 中且是冷数据，考虑迁移到 QLC */
-			if (conv_ftl->page_in_slc[local_lpn] && 
-			    should_migrate_to_qlc(conv_ftl, local_lpn)) {
-				old_ppa = ppa;  /* 保存用于后续迁移 */
-			}
 		}
 
 //66f1
@@ -2471,13 +2466,6 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		update_heat_info(conv_ftl, local_lpn, false);
 		conv_ftl->heat_track.last_access_time[local_lpn] = __get_ioclock(conv_ftl->ssd);
 		
-		/* 如果之前标记了需要迁移，现在执行迁移 */
-        if (mapped_ppa(&old_ppa) && conv_ftl->page_in_slc[local_lpn]) {
-			if (should_migrate_to_qlc(conv_ftl, local_lpn)) {
-				/* 异步迁移到 QLC */
-				migrate_page_to_qlc(conv_ftl, local_lpn, &old_ppa);
-			}
-		}
 		
 		/* 检查是否需要触发后台迁移 */
 		if (conv_ftl->slc_lm.free_line_cnt < 2) {
