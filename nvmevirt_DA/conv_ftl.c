@@ -521,148 +521,24 @@ static void prepare_write_pointer_DA(struct conv_ftl *conv_ftl, uint32_t io_type
 
 static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct line_mgmt *lm = &conv_ftl->lm;
-	struct write_pointer *wpp = __get_wp(conv_ftl, io_type);
-
-	NVMEV_DEBUG("current wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n", wpp->ch, wpp->lun,
-		    wpp->pl, wpp->blk, wpp->pg);
-
-	check_addr(wpp->pg, spp->pgs_per_blk);
-	wpp->pg++;
-	if ((wpp->pg % spp->pgs_per_oneshotpg) != 0)
-		goto out;
-
-	wpp->pg -= spp->pgs_per_oneshotpg;
-	check_addr(wpp->ch, spp->nchs);
-	wpp->ch++;
-	if (wpp->ch != spp->nchs)
-		goto out;
-
-	wpp->ch = 0;
-	check_addr(wpp->lun, spp->luns_per_ch);
-	wpp->lun++;
-	/* in this case, we should go to next lun */
-	if (wpp->lun != spp->luns_per_ch)
-		goto out;
-
-	wpp->lun = 0;
-	/* go to next wordline in the block */
-	wpp->pg += spp->pgs_per_oneshotpg;
-	if (wpp->pg != spp->pgs_per_blk)
-		goto out;
-
-	wpp->pg = 0;
-	/* move current line to {victim,full} line list */
-	if (wpp->curline->vpc == spp->pgs_per_line) {
-		/* all pgs are still valid, move to full line list */
-		NVMEV_ASSERT(wpp->curline->ipc == 0);
-		list_add_tail(&wpp->curline->entry, &lm->full_line_list);
-		lm->full_line_cnt++;
-		NVMEV_DEBUG("wpp: move line to full_line_list\n");
+	/* 旧的写指针推进逻辑已废弃 - 现在使用 SLC/QLC 特定的推进逻辑 */
+	/* 这个函数主要被 GC 调用，我们需要根据 io_type 选择合适的推进方式 */
+	
+	/* 对于 GC，我们暂时使用 SLC 推进逻辑 */
+	if (io_type == GC_IO) {
+		advance_slc_write_pointer(conv_ftl);
 	} else {
-		NVMEV_DEBUG("wpp: line is moved to victim list\n");
-		NVMEV_ASSERT(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
-		/* there must be some invalid pages in this line */
-		NVMEV_ASSERT(wpp->curline->ipc > 0);
-		pqueue_insert(lm->victim_line_pq, wpp->curline);
-		lm->victim_line_cnt++;
+		/* 对于用户 IO，应该通过 conv_write 中的逻辑来处理 */
+		NVMEV_DEBUG("advance_write_pointer called with USER_IO - should use SLC/QLC specific logic\n");
 	}
-	/* current line is used up, pick another empty line */
-	check_addr(wpp->blk, spp->blks_per_pl);
-	wpp->curline = get_next_free_line(conv_ftl);
-	NVMEV_DEBUG("wpp: got new clean line %d\n", wpp->curline->id);
-
-	wpp->blk = wpp->curline->id;
-	check_addr(wpp->blk, spp->blks_per_pl);
-
-	/* make sure we are starting from page 0 in the super block */
-	NVMEV_ASSERT(wpp->pg == 0);
-	NVMEV_ASSERT(wpp->lun == 0);
-	NVMEV_ASSERT(wpp->ch == 0);
-	/* TODO: assume # of pl_per_lun is 1, fix later */
-	NVMEV_ASSERT(wpp->pl == 0);
-out:
-	NVMEV_DEBUG("advanced wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d (curline %d)\n", wpp->ch,
-		    wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
 }
 
 //66f1
 static void advance_write_pointer_DA(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
-	uint32_t glun=conv_ftl->lunpointer;	
-	struct ssdparams *spp = &conv_ftl->ssd->sp;	
-	struct line_mgmt *lm = NULL;
-	struct write_pointer *wpp = NULL;
-
-	lm = conv_ftl->lunlm+conv_ftl->lunpointer;
-	wpp = __get_wp_DA(conv_ftl, io_type, conv_ftl->lunpointer);
-
-	NVMEV_DEBUG("current wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d, glun:%d\n", wpp->ch, wpp->lun,
-		    wpp->pl, wpp->blk, wpp->pg, conv_ftl->lunpointer);
-
-	
-	check_addr(wpp->pg, spp->pgs_per_blk);
-	wpp->pg++; //map page 4k
-	if ((wpp->pg % spp->pgs_per_oneshotpg) != 0)
-	{
-		goto out;
-	}
-	NVMEV_DEBUG("page : %u, oneshotpg limit %d\n", spp->pgsz, spp->pgs_per_oneshotpg);
-
-	if (wpp->pg == spp->pgs_per_blk)
-	{//move to next blk
-		NVMEV_DEBUG("block limit, pgs_per_blk = %d\n", spp->pgs_per_blk);
-
-		if (wpp->curline->vpc == spp->pgs_per_lun_line) {
-			/* all pgs are still valid, move to full line list */
-			NVMEV_ASSERT(wpp->curline->ipc == 0);
-			list_add_tail(&wpp->curline->entry, &lm->full_line_list);
-			lm->full_line_cnt++;
-			NVMEV_DEBUG("wpp: move line to full_line_list\n");
-			//NVMEV_ERROR("wpp: move line to full_line_list\n");
-		} else {
-			NVMEV_DEBUG("wpp: line is moved to victim list\n");
-			//NVMEV_ERROR("wpp: line is moved to victim list\n");
-			NVMEV_ASSERT(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_lun_line);
-			/* there must be some invalid pages in this line */
-			//NVMEV_ERROR("wpp: curline ipc= %d\n", wpp->curline->ipc);
-			NVMEV_ASSERT(wpp->curline->ipc > 0);
-			pqueue_insert(lm->victim_line_pq, wpp->curline);
-			lm->victim_line_cnt++;
-		}
-		/* current line is used up, pick another empty line */
-		check_addr(wpp->blk, spp->blks_per_pl);
-		wpp->curline = get_next_free_line_DA(conv_ftl, conv_ftl->lunpointer);
-		NVMEV_DEBUG("wpp: got new clean line %d\n", wpp->curline->id);
-		//NVMEV_ERROR("wpp: got new clean line %d\n", wpp->curline->id);
-
-		wpp->blk = wpp->curline->id;
-		check_addr(wpp->blk, spp->blks_per_pl);
-		wpp->pg =0;
-	}
-
-	//ch die interleaving
-	glun++;
-	if (glun != conv_ftl->ssd->sp.nchs * conv_ftl->ssd->sp.luns_per_ch)
-	{
-		conv_ftl->lunpointer = glun; //next write lun 
-		lm = conv_ftl->lunlm+conv_ftl->lunpointer;
-		wpp = __get_wp_DA(conv_ftl, io_type, conv_ftl->lunpointer);
-		
-		//NVMEV_ERROR("wpp ch : %u, lun %d\n", wpp->ch, wpp->lun);
-		goto out;
-	}
-
-	//NVMEV_ERROR("lun limit\n");
-	glun=0;	
-	conv_ftl->lunpointer = glun; //next write lun 
-	lm = conv_ftl->lunlm+conv_ftl->lunpointer;
-	wpp = __get_wp_DA(conv_ftl, io_type, conv_ftl->lunpointer);
-	
-out:
-	NVMEV_DEBUG("advanced wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d (curline %d)\n", wpp->ch,
-		    wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
+	/* Die-Affinity 写指针推进函数已废弃 - 现在使用 SLC/QLC 特定的推进逻辑 */
+	/* 这个函数不再被使用，保留为空以避免编译错误 */
+	NVMEV_DEBUG("advance_write_pointer_DA called - function deprecated, using SLC/QLC logic instead\n");
 }
 //66f1
 
@@ -1283,10 +1159,8 @@ static inline struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
 static inline struct line *get_line_DA(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-	uint32_t glun = get_glun(conv_ftl, ppa);
-	struct line_mgmt *lm = conv_ftl->lunlm+glun;
-
-	return &(lm->lines[ppa->g.blk]);
+	/* Die-Affinity get_line 函数已废弃 - 现在使用统一的 get_line 函数 */
+	return get_line(conv_ftl, ppa);
 }
 
 /* update SSD status about one page from PG_VALID -> PG_VALID */
