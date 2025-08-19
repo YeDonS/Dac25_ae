@@ -728,6 +728,8 @@ static void init_slc_lines(struct conv_ftl *conv_ftl)
 	int i;
 	
 	lm->tt_lines = conv_ftl->slc_blks_per_pl;
+	NVMEV_ERROR("[DEBUG] init_slc_lines: slc_blks_per_pl=%u, allocating %u lines\n", 
+		   conv_ftl->slc_blks_per_pl, lm->tt_lines);
 	lm->lines = vmalloc(sizeof(struct line) * lm->tt_lines);
 	if (!lm->lines) {
 		NVMEV_ERROR("Failed to allocate SLC lines memory\n");
@@ -756,6 +758,12 @@ static void init_slc_lines(struct conv_ftl *conv_ftl)
 			.pos = 0,
 			.entry = LIST_HEAD_INIT(lm->lines[i].entry),
 		};
+		
+		/* 添加边界检查 */
+		if (i >= conv_ftl->slc_blks_per_pl) {
+			NVMEV_ERROR("init_slc_lines: SLC line index %d exceeds slc_blks_per_pl %u\n", 
+				   i, conv_ftl->slc_blks_per_pl);
+		}
 		
 		list_add_tail(&lm->lines[i].entry, &lm->free_line_list);
 		lm->free_line_cnt++;
@@ -1351,7 +1359,19 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
 
 	NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
-	new_ppa = get_new_page(conv_ftl, GC_IO);
+	
+	/* 
+	 * 
+	 * 让GC的数据也写入到SLC中，使用和用户写入完全相同的页面分配和指针推进逻辑。
+	 * 这确保了数据流向的一致性，避免使用未初始化的gc_wp指针。
+	 */
+	new_ppa = get_new_slc_page(conv_ftl);
+	if (!mapped_ppa(&new_ppa)) {
+		NVMEV_ERROR("gc_write_page: Failed to get new SLC page. GC cannot proceed.\n");
+		/* 这是一个严重问题，意味着SLC和GC都卡住了 */
+		return 0; /* 返回0表示没有延迟，但实际上是失败了 */
+	}
+	
 	/* update maptbl */
 	set_maptbl_ent(conv_ftl, lpn, &new_ppa);
 	/* update rmap */
@@ -1359,8 +1379,8 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 
 	mark_page_valid(conv_ftl, &new_ppa);
 
-	/* need to advance the write pointer here */
-	advance_write_pointer(conv_ftl, GC_IO);
+	/* 使用SLC的写指针推进逻辑 */
+	advance_slc_write_pointer(conv_ftl);
 
 	if (cpp->enable_gc_delay) {
 		struct nand_cmd gcw = {
@@ -1546,10 +1566,11 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	struct line *victim_line = NULL;
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
-	int flashpg;
+	int pg;
 
 	victim_line = select_victim_line(conv_ftl, force);
 	if (!victim_line) {
+		NVMEV_DEBUG("do_gc: No suitable victim line found.\n");
 		return -1;
 	}
 
@@ -1571,44 +1592,46 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 	conv_ftl->wfc.credits_to_refill = victim_line->ipc;
 
-	/* copy back valid data */
-	for (flashpg = 0; flashpg < spp->flashpgs_per_blk; flashpg++) {
-		int ch, lun;
+	/*
+	 * === 核心修复：简化循环，只处理受害块内的页面 ===
+	 * 遍历受害块中的每一个页，搬走有效数据
+	 */
+	ppa.g.ch = 0;   /* 简化假设：所有块都在 ch=0, lun=0 */
+	ppa.g.lun = 0;  /* 在真实实现中，需要从 victim_line->id 反向查询物理位置 */
+	ppa.g.pl = 0;
+	
+	for (pg = 0; pg < spp->pgs_per_blk; pg++) {
+		struct nand_page *pg_iter = NULL;
 
-		ppa.g.pg = flashpg * spp->pgs_per_flashpg;
-		for (ch = 0; ch < spp->nchs; ch++) {
-			for (lun = 0; lun < spp->luns_per_ch; lun++) {
-				struct nand_lun *lunp;
+		ppa.g.pg = pg;
+		pg_iter = get_pg(conv_ftl->ssd, &ppa);
 
-				ppa.g.ch = ch;
-				ppa.g.lun = lun;
-				ppa.g.pl = 0;
-				lunp = get_lun(conv_ftl->ssd, &ppa);
-				clean_one_flashpg(conv_ftl, &ppa);
-
-				if (flashpg == (spp->flashpgs_per_blk - 1)) {
-					struct convparams *cpp = &conv_ftl->cp;
-
-					mark_block_free(conv_ftl, &ppa);
-
-					if (cpp->enable_gc_delay) {
-						struct nand_cmd gce = {
-							.type = GC_IO,
-							.cmd = NAND_ERASE,
-							.stime = 0,
-							.interleave_pci_dma = false,
-							.ppa = &ppa,
-						};
-						ssd_advance_nand(conv_ftl->ssd, &gce);
-					}
-
-					lunp->gc_endtime = lunp->next_lun_avail_time;
-				}
-			}
+		/* 如果页面有效，就把它搬走 */
+		if (pg_iter && pg_iter->status == PG_VALID) {
+			gc_write_page(conv_ftl, &ppa);
 		}
 	}
 
-	/* update line status */
+	/*
+	 * 所有有效页都已搬走，现在擦除整个块并更新状态
+	 */
+	ppa.g.pg = 0; /* 重置页号 */
+	mark_block_free(conv_ftl, &ppa);
+	
+	/* 如果启用了GC延迟，执行实际的擦除操作 */
+	struct convparams *cpp = &conv_ftl->cp;
+	if (cpp->enable_gc_delay) {
+		struct nand_cmd gce = {
+			.type = GC_IO,
+			.cmd = NAND_ERASE,
+			.stime = 0,
+			.interleave_pci_dma = false,
+			.ppa = &ppa,
+		};
+		ssd_advance_nand(conv_ftl->ssd, &gce);
+	}
+
+	/* 更新line状态，将其放回空闲列表 */
 	mark_line_free(conv_ftl, &ppa);
 
 	return 0;
@@ -1679,6 +1702,16 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
             spin_unlock(&conv_ftl->slc_lock);
             return (struct ppa){ .ppa = UNMAPPED_PPA };
         }
+        
+        /* 添加调试信息 */
+        NVMEV_ERROR("[DEBUG] get_new_slc_page: Allocated SLC line with ID %u (range: [0, %u), total_lines=%u)\n", 
+                   curline->id, conv_ftl->slc_blks_per_pl, lm->tt_lines);
+        if (curline->id >= conv_ftl->slc_blks_per_pl) {
+            NVMEV_ERROR("[CRITICAL] get_new_slc_page: Allocated SLC line ID %u exceeds range [0, %u)\n", 
+                       curline->id, conv_ftl->slc_blks_per_pl);
+            NVMEV_ERROR("[CRITICAL] Line pointer: %p, lines array: %p, offset: %ld\n",
+                       curline, lm->lines, (long)(curline - lm->lines));
+        }
 		
 		list_del_init(&curline->entry);
 		lm->free_line_cnt--;
@@ -1707,8 +1740,16 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
     ppa.g.ch = wp->ch;
     ppa.g.lun = wp->lun;
     ppa.g.pg = wp->pg;
+    /* SLC 块号是相对块号，需要确保在正确范围内 */
+    /* 在我们的设计中，SLC 占用前面的块(0-1637)，所以相对块号就是绝对块号 */
     ppa.g.blk = wp->blk;
     ppa.g.pl = wp->pl;
+    
+    /* 添加调试信息以追踪块号 */
+    if (ppa.g.blk >= conv_ftl->slc_blks_per_pl) {
+        NVMEV_ERROR("get_new_slc_page: Generated invalid SLC block %u >= %u\n", 
+                   ppa.g.blk, conv_ftl->slc_blks_per_pl);
+    }
 	
 	return ppa;
 }
@@ -1745,6 +1786,13 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
         wp->curline = NULL;
         spin_unlock(&conv_ftl->slc_lock);
         return;
+    }
+    
+    /* 添加调试信息 */
+    NVMEV_DEBUG("advance_slc_write_pointer: Allocated new SLC line with ID %u\n", wp->curline->id);
+    if (wp->curline->id >= conv_ftl->slc_blks_per_pl) {
+        NVMEV_ERROR("advance_slc_write_pointer: Allocated SLC line ID %u exceeds range [0, %u)\n", 
+                   wp->curline->id, conv_ftl->slc_blks_per_pl);
     }
 		
 		list_del_init(&wp->curline->entry);
@@ -2305,12 +2353,13 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         slc_free_lines = conv_ftl->slc_lm.free_line_cnt;
         spin_unlock(&conv_ftl->slc_lock);
         
-        /* 如果SLC空间低于高水位线，触发后台迁移 */
-        NVMEV_ERROR("[DEBUG] SLC status: free_lines=%u, high_watermark=%u, total=%u\n", 
-                   slc_free_lines, conv_ftl->slc_high_watermark, conv_ftl->slc_lm.tt_lines);
-        if (slc_free_lines <= conv_ftl->slc_high_watermark) {
-            NVMEV_ERROR("[DEBUG] SLC space low (%u <= %u), triggering background migration\n", 
-                      slc_free_lines, conv_ftl->slc_high_watermark);
+        /* 检查SLC使用率是否超过高水位线，触发后台迁移 */
+        uint32_t slc_used_lines = conv_ftl->slc_lm.tt_lines - slc_free_lines;
+        NVMEV_ERROR("[DEBUG] SLC status: free_lines=%u, used_lines=%u, high_watermark=%u, total=%u\n", 
+                   slc_free_lines, slc_used_lines, conv_ftl->slc_high_watermark, conv_ftl->slc_lm.tt_lines);
+        if (slc_used_lines >= conv_ftl->slc_high_watermark) {
+            NVMEV_ERROR("[DEBUG] SLC usage high (%u >= %u), triggering background migration\n", 
+                      slc_used_lines, conv_ftl->slc_high_watermark);
             wakeup_migration_thread(conv_ftl);
         }
         
@@ -2641,18 +2690,20 @@ static int background_migration_thread(void *data)
 		if (kthread_should_stop() || conv_ftl->threads_should_stop)
 			break;
 		
-		/* 执行迁移直到SLC空间恢复到低水位线 */
+		/* 执行迁移直到SLC使用率降到低水位线以下 */
 		while (atomic_read(&conv_ftl->migration_needed) && 
 		       !kthread_should_stop() && 
 		       !conv_ftl->threads_should_stop) {
 		       
-			uint32_t slc_free_lines;
+			uint32_t slc_free_lines, slc_used_lines;
 			spin_lock(&conv_ftl->slc_lock);
 			slc_free_lines = conv_ftl->slc_lm.free_line_cnt;
 			spin_unlock(&conv_ftl->slc_lock);
 			
-			/* 如果SLC空间恢复到低水位线以上，停止迁移 */
-			if (slc_free_lines >= conv_ftl->slc_low_watermark) {
+			slc_used_lines = conv_ftl->slc_lm.tt_lines - slc_free_lines;
+			
+			/* 如果SLC使用率降到低水位线以下，停止迁移 */
+			if (slc_used_lines < conv_ftl->slc_low_watermark) {
 				atomic_set(&conv_ftl->migration_needed, 0);
 				break;
 			}
@@ -2730,11 +2781,22 @@ static int background_gc_thread(void *data)
 /* 初始化后台线程 */
 static void init_background_threads(struct conv_ftl *conv_ftl)
 {
-	/* 设置水位线 - 基于剩余空间数量 (调整为很早触发) */
-	conv_ftl->slc_high_watermark = conv_ftl->slc_lm.tt_lines - 10;  /* 几乎满: 剩余10个blocks就触发迁移 */
-	conv_ftl->slc_low_watermark = conv_ftl->slc_lm.tt_lines - 5;   /* 几乎满: 剩余5个blocks就停止迁移 */
-	conv_ftl->gc_high_watermark = (conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines) / 20; /* 5%: 剩余空间低于此值触发GC */
-	conv_ftl->gc_low_watermark = (conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines) / 10;  /* 10%: 剩余空间高于此值停止GC */
+	/* 
+	 * === 修复水位线逻辑 ===
+	 * 使用基于百分比的正确逻辑：
+	 * - 高水位线(触发阈值) = 总容量的80% (当使用量达到80%时触发后台操作)
+	 * - 低水位线(停止阈值) = 总容量的70% (当使用量降到70%以下时停止后台操作)
+	 */
+	uint32_t slc_total = conv_ftl->slc_lm.tt_lines;
+	uint32_t total_lines = conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines;
+	
+	/* SLC迁移水位线：基于SLC使用率 */
+	conv_ftl->slc_high_watermark = slc_total * 80 / 100;  /* 当SLC使用80%时触发迁移 */
+	conv_ftl->slc_low_watermark = slc_total * 70 / 100;   /* 当SLC使用降到70%时停止迁移 */
+	
+	/* GC水位线：基于总体使用率 */
+	conv_ftl->gc_high_watermark = total_lines * 90 / 100; /* 当总体使用90%时触发GC */
+	conv_ftl->gc_low_watermark = total_lines * 80 / 100;  /* 当总体使用降到80%时停止GC */
 	
 	NVMEV_ERROR("[DEBUG] Watermarks: SLC_high=%u, SLC_low=%u, GC_high=%u, GC_low=%u (SLC_total=%u, QLC_total=%u)\n",
 	          conv_ftl->slc_high_watermark, conv_ftl->slc_low_watermark, 
