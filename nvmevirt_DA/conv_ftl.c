@@ -190,13 +190,15 @@ static inline bool should_gc_high(struct conv_ftl *conv_ftl)
 
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
-	return conv_ftl->maptbl[lpn];
+	/* 使用READ_ONCE保证内存可见性，防止编译器优化 */
+	return READ_ONCE(conv_ftl->maptbl[lpn]);
 }
 
 static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
 {
 	NVMEV_ASSERT(lpn < conv_ftl->ssd->sp.tt_pgs);
-	conv_ftl->maptbl[lpn] = *ppa;
+	/* 使用WRITE_ONCE保证原子写入，防止编译器重排 */
+	WRITE_ONCE(conv_ftl->maptbl[lpn], *ppa);
 }
 
 static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -219,7 +221,8 @@ static inline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	uint64_t pgidx = ppa2pgidx(conv_ftl, ppa);
 
-	return conv_ftl->rmap[pgidx];
+	/* 使用READ_ONCE保证内存可见性 */
+	return READ_ONCE(conv_ftl->rmap[pgidx]);
 }
 
 /* set rmap[page_no(ppa)] -> lpn */
@@ -227,7 +230,8 @@ static inline void set_rmap_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 {
 	uint64_t pgidx = ppa2pgidx(conv_ftl, ppa);
 
-	conv_ftl->rmap[pgidx] = lpn;
+	/* 使用WRITE_ONCE保证原子写入 */
+	WRITE_ONCE(conv_ftl->rmap[pgidx], lpn);
 }
 
 static inline int victim_line_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
@@ -804,15 +808,25 @@ static void init_qlc_lines(struct conv_ftl *conv_ftl)
 		return;
 	}
 	
+	NVMEV_ERROR("[DEBUG] init_qlc_lines: start_blk=%u, total_lines=%u, allocating lines with physical block IDs\n", 
+		   start_blk, total_qlc_lines);
+	
 	lm->free_line_cnt = 0;
 	for (i = 0; i < lm->tt_lines; i++) {
+		/* 关键修复：line->id 始终保持为物理block ID，永不更改 */
 		lm->lines[i] = (struct line) {
-			.id = i,  /* QLC使用数组索引作为内部ID，避免与SLC混淆 */
+			.id = start_blk + i,  /* 物理block ID: 1638, 1639, 1640, ... */
 			.ipc = 0,
 			.vpc = 0,
 			.pos = 0,
 			.entry = LIST_HEAD_INIT(lm->lines[i].entry),
 		};
+		
+		/* 验证物理block ID不超过硬件限制 */
+		if (lm->lines[i].id >= spp->blks_per_pl) {
+			NVMEV_ERROR("QLC line %d: physical block ID %u exceeds blks_per_pl %u!\n", 
+				   i, lm->lines[i].id, spp->blks_per_pl);
+		}
 		
 		list_add_tail(&lm->lines[i].entry, &lm->free_line_list);
 		lm->free_line_cnt++;
@@ -821,6 +835,9 @@ static void init_qlc_lines(struct conv_ftl *conv_ftl)
 	lm->victim_line_cnt = 0;
 	lm->full_line_cnt = 0;
 	conv_ftl->current_qlc_region = 0;
+	
+	NVMEV_ERROR("[DEBUG] QLC lines initialized: %u lines with block IDs %u-%u\n", 
+		   lm->tt_lines, start_blk, start_blk + lm->tt_lines - 1);
 }
 
 /* 清理函数 */
@@ -1022,8 +1039,16 @@ static inline bool valid_ppa(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		return false;
 	if (pl < 0 || pl >= spp->pls_per_lun)
 		return false;
-	if (blk < 0 || blk >= spp->blks_per_pl)
+	
+	/* 关键修复：对于混合存储，block ID可以超过传统blks_per_pl限制 */
+	/* SLC blocks: 0 - (slc_blks_per_pl-1) */
+	/* QLC blocks: slc_blks_per_pl - (slc_blks_per_pl + qlc_total - 1) */
+	uint32_t max_blk_id = conv_ftl->slc_blks_per_pl + (conv_ftl->qlc_region_size * QLC_REGIONS) - 1;
+	if (blk < 0 || blk > max_blk_id) {
+		NVMEV_ERROR("valid_ppa: block ID %d out of hybrid range [0, %u]\n", blk, max_blk_id);
 		return false;
+	}
+	
 	if (pg < 0 || pg >= spp->pgs_per_blk)
 		return false;
 
@@ -1591,11 +1616,12 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
         NVMEV_ASSERT(idx < lm->tt_lines);
         line = &lm->lines[idx];
         
-        /* 确保QLC line的内部ID保持为数组索引，不被物理block ID污染 */
-        if (line->id != idx) {
-            NVMEV_ERROR("QLC line ID corruption detected: line->id=%u, expected=%u, fixing...\n", 
-                       line->id, idx);
-            line->id = idx;  /* 修复损坏的ID */
+        /* QLC line ID应该始终是物理block ID，不需要修复 */
+        uint32_t expected_physical_id = start_blk + idx;
+        if (line->id != expected_physical_id) {
+            NVMEV_ERROR("QLC line ID corruption detected: line->id=%u, expected_physical_id=%u, array_idx=%u\n", 
+                       line->id, expected_physical_id, idx);
+            /* 不修复！保持原有的物理block ID，问题在别处 */
         }
         
         line->ipc = 0;
@@ -1916,11 +1942,16 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
         list_del_init(&curline->entry);
         lm->free_line_cnt--;
         
-        /* 验证QLC line ID的合法性 */
-        if (curline->id >= lm->tt_lines) {
-            NVMEV_ERROR("QLC line ID %u exceeds range [0, %u), fixing to array index...\n", 
-                       curline->id, lm->tt_lines);
-            curline->id = curline - lm->lines;  /* 使用指针差值作为正确的索引 */
+        /* 验证QLC line ID是否为合法的物理block ID */
+        uint32_t start_blk = conv_ftl->slc_blks_per_pl;
+        if (curline->id < start_blk || curline->id >= (start_blk + lm->tt_lines)) {
+            NVMEV_ERROR("QLC line physical block ID %u out of valid range [%u, %u)\n", 
+                       curline->id, start_blk, start_blk + lm->tt_lines);
+            /* 紧急修复：使用数组索引计算正确的物理block ID */
+            uint32_t array_idx = curline - lm->lines;
+            curline->id = start_blk + array_idx;
+            NVMEV_ERROR("Emergency fix: corrected to physical block ID %u (array_idx=%u)\n", 
+                       curline->id, array_idx);
         }
         
         /* 初始化写指针 - 为每个区域分配不同的起始位置 */
@@ -1929,9 +1960,12 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
             .ch = region_id % spp->nchs,
             .lun = (region_id / spp->nchs) % spp->luns_per_ch,
             .pg = 0,
-            .blk = conv_ftl->slc_blks_per_pl + curline->id,  /* QLC物理block ID = SLC数量 + QLC索引 */
+            .blk = curline->id,  /* 使用物理block ID */
             .pl = 0,
         };
+        
+        NVMEV_ERROR("[DEBUG] QLC region %u initialized: curline=%p, physical_blk=%u\n", 
+                   region_id, curline, curline->id);
         spin_unlock(&conv_ftl->qlc_lock);
     }
     
@@ -2023,14 +2057,23 @@ static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_
 	list_del_init(&wp->curline->entry);
 	lm->free_line_cnt--;
 	
-	/* 验证QLC line ID的合法性 */
-	if (wp->curline->id >= lm->tt_lines) {
-		NVMEV_ERROR("advance_qlc_write_pointer: QLC line ID %u exceeds range [0, %u), fixing...\n", 
-			   wp->curline->id, lm->tt_lines);
-		wp->curline->id = wp->curline - lm->lines;  /* 使用指针差值作为正确的索引 */
+	/* 验证QLC line ID是合法的物理block ID */
+	uint32_t start_blk = conv_ftl->slc_blks_per_pl;
+	if (wp->curline->id < start_blk || wp->curline->id >= (start_blk + lm->tt_lines)) {
+		NVMEV_ERROR("advance_qlc_write_pointer: QLC line physical block ID %u out of range [%u, %u)\n", 
+			   wp->curline->id, start_blk, start_blk + lm->tt_lines);
+		/* 紧急修复：使用数组索引计算正确的物理block ID */
+		uint32_t array_idx = wp->curline - lm->lines;
+		wp->curline->id = start_blk + array_idx;
+		NVMEV_ERROR("Emergency fix: corrected to physical block ID %u (array_idx=%u)\n", 
+			   wp->curline->id, array_idx);
 	}
 	
-	wp->blk = conv_ftl->slc_blks_per_pl + wp->curline->id;  /* QLC物理block ID = SLC数量 + QLC索引 */
+	/* 直接使用物理block ID，不需要再次计算 */
+	wp->blk = wp->curline->id;
+	
+	NVMEV_ERROR("[DEBUG] advance_qlc_write_pointer: region=%u, new_physical_blk=%u\n", 
+		   region_id, wp->blk);
     spin_unlock(&conv_ftl->qlc_lock);
 	
 out:
