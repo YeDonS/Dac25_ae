@@ -25,6 +25,7 @@ static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *slc_ppa);
 static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id);
 static void advance_slc_write_pointer(struct conv_ftl *conv_ftl);
+static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
 
 /* 后台线程函数声明 */
 static int background_migration_thread(void *data);
@@ -806,7 +807,7 @@ static void init_qlc_lines(struct conv_ftl *conv_ftl)
 	lm->free_line_cnt = 0;
 	for (i = 0; i < lm->tt_lines; i++) {
 		lm->lines[i] = (struct line) {
-			.id = start_blk + i,  /* QLC block IDs */
+			.id = i,  /* QLC使用数组索引作为内部ID，避免与SLC混淆 */
 			.ipc = 0,
 			.vpc = 0,
 			.pos = 0,
@@ -1417,15 +1418,16 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
     struct line *victim_line = NULL;
     struct line *slc_victim = NULL;
     struct line *qlc_victim = NULL;
+    struct line_mgmt *slc_lm = &conv_ftl->slc_lm;
+    struct line_mgmt *qlc_lm = &conv_ftl->qlc_lm;
+    bool slc_suitable, qlc_suitable;
     
     /* 首先检查SLC是否有受害者 */
-    struct line_mgmt *slc_lm = &conv_ftl->slc_lm;
     if (slc_lm->victim_line_cnt > 0) {
         slc_victim = pqueue_peek(slc_lm->victim_line_pq);
     }
     
     /* 然后检查QLC是否有受害者 */
-    struct line_mgmt *qlc_lm = &conv_ftl->qlc_lm;
     if (qlc_lm->victim_line_cnt > 0) {
         qlc_victim = pqueue_peek(qlc_lm->victim_line_pq);
     }
@@ -1436,9 +1438,8 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
      * 3. 优先选择SLC受害者（擦写速度更快）
      * 4. 如果SLC和QLC都有合适的受害者，选择无效页更多的
      */
-    
-    bool slc_suitable = slc_victim && (force || slc_victim->vpc <= (spp->pgs_per_line / 8));
-    bool qlc_suitable = qlc_victim && (force || qlc_victim->vpc <= (spp->pgs_per_line / 8));
+    slc_suitable = slc_victim && (force || slc_victim->vpc <= (spp->pgs_per_line / 8));
+    qlc_suitable = qlc_victim && (force || qlc_victim->vpc <= (spp->pgs_per_line / 8));
     
     if (slc_suitable && qlc_suitable) {
         /* 两者都合适，选择无效页更多的（vpc更小意味着有效页更少，即无效页更多） */
@@ -1553,6 +1554,13 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
         uint32_t idx = ppa->g.blk - start_blk;
         NVMEV_ASSERT(idx < lm->tt_lines);
         line = &lm->lines[idx];
+        
+        /* 确保QLC line的内部ID保持为数组索引，不被物理block ID污染 */
+        if (line->id != idx) {
+            NVMEV_ERROR("QLC line ID corruption detected: line->id=%u, expected=%u\n", 
+                       line->id, idx);
+            line->id = idx;  /* 修复损坏的ID */
+        }
     }
 	line->ipc = 0;
 	line->vpc = 0;
@@ -1567,6 +1575,8 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	int pg;
+	bool in_slc;
+	struct convparams *cpp;
 
 	victim_line = select_victim_line(conv_ftl, force);
 	if (!victim_line) {
@@ -1574,10 +1584,18 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 		return -1;
 	}
 
-	ppa.g.blk = victim_line->id;
+	/* 根据victim line类型计算正确的物理block ID */
+	if (victim_line >= conv_ftl->slc_lm.lines && 
+	    victim_line < conv_ftl->slc_lm.lines + conv_ftl->slc_lm.tt_lines) {
+		/* SLC victim: 直接使用line ID */
+		ppa.g.blk = victim_line->id;
+	} else {
+		/* QLC victim: line ID是数组索引，需要加上SLC偏移 */
+		ppa.g.blk = conv_ftl->slc_blks_per_pl + victim_line->id;
+	}
 	
 	/* 确定是SLC还是QLC并显示相应的统计信息 */
-	bool in_slc = is_slc_block(conv_ftl, ppa.g.blk);
+	in_slc = is_slc_block(conv_ftl, ppa.g.blk);
 	if (in_slc) {
 	    struct line_mgmt *slc_lm = &conv_ftl->slc_lm;
 	    NVMEV_DEBUG("GC-ing SLC line:%d,ipc=%d,vpc=%d,victim=%d,full=%d,free=%d\n", 
@@ -1619,7 +1637,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	mark_block_free(conv_ftl, &ppa);
 	
 	/* 如果启用了GC延迟，执行实际的擦除操作 */
-	struct convparams *cpp = &conv_ftl->cp;
+	cpp = &conv_ftl->cp;
 	if (cpp->enable_gc_delay) {
 		struct nand_cmd gce = {
 			.type = GC_IO,
@@ -1665,15 +1683,17 @@ static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id)
 		return false;  /* 默认返回false，避免误判 */
 	}
 	
-	/* 检查数组边界 */
-	if (blk_id >= conv_ftl->slc_blks_per_pl + conv_ftl->qlc_blks_per_pl) {
-		NVMEV_ERROR("[DEBUG] Block ID %u out of range (max: %u, SLC: %u, QLC: %u)\n", 
-			   blk_id, conv_ftl->slc_blks_per_pl + conv_ftl->qlc_blks_per_pl,
-			   conv_ftl->slc_blks_per_pl, conv_ftl->qlc_blks_per_pl);
+	/* 在多通道配置下，每个通道/LUN都有独立的block ID空间 (0-8191)
+	 * SLC占用每个plane的前slc_blks_per_pl个block
+	 */
+	if (blk_id >= BLKS_PER_PLN) {
+		NVMEV_ERROR("Block ID out of range: %u >= %u (max per plane)\n", 
+		           blk_id, BLKS_PER_PLN);
 		return false;
 	}
 	
-	return conv_ftl->is_slc_block[blk_id];
+	/* SLC块是每个plane中ID < slc_blks_per_pl的块 */
+	return (blk_id < conv_ftl->slc_blks_per_pl);
 }
 
 /* 获取 SLC 的新页面 - 使用 Die Affinity */
@@ -1864,7 +1884,7 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
             .ch = region_id % spp->nchs,
             .lun = (region_id / spp->nchs) % spp->luns_per_ch,
             .pg = 0,
-            .blk = curline->id,
+            .blk = conv_ftl->slc_blks_per_pl + curline->id,  /* QLC物理block ID = SLC数量 + QLC索引 */
             .pl = 0,
         };
         spin_unlock(&conv_ftl->qlc_lock);
@@ -1957,7 +1977,7 @@ static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_
 	
 	list_del_init(&wp->curline->entry);
 	lm->free_line_cnt--;
-	wp->blk = wp->curline->id;
+	wp->blk = conv_ftl->slc_blks_per_pl + wp->curline->id;  /* QLC物理block ID = SLC数量 + QLC索引 */
     spin_unlock(&conv_ftl->qlc_lock);
 	
 out:
