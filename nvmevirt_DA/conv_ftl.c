@@ -155,15 +155,35 @@ static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *pp
 
 static bool should_gc(struct conv_ftl *conv_ftl)
 {
-	/* 使用 SLC + QLC 的总空闲空间来判断是否需要 GC */
-	uint32_t total_free_lines = conv_ftl->slc_lm.free_line_cnt + conv_ftl->qlc_lm.free_line_cnt;
+	/* 使用 SLC + QLC 的总空闲空间来判断是否需要 GC - 分步读取避免锁竞争 */
+	uint32_t slc_free, qlc_free, total_free_lines;
+	
+	spin_lock(&conv_ftl->slc_lock);
+	slc_free = conv_ftl->slc_lm.free_line_cnt;
+	spin_unlock(&conv_ftl->slc_lock);
+	
+	spin_lock(&conv_ftl->qlc_lock);
+	qlc_free = conv_ftl->qlc_lm.free_line_cnt;
+	spin_unlock(&conv_ftl->qlc_lock);
+	
+	total_free_lines = slc_free + qlc_free;
 	return (total_free_lines <= conv_ftl->cp.gc_thres_lines);
 }
 
 static inline bool should_gc_high(struct conv_ftl *conv_ftl)
 {
-	/* 使用 SLC + QLC 的总空闲空间来判断是否需要 GC */
-	uint32_t total_free_lines = conv_ftl->slc_lm.free_line_cnt + conv_ftl->qlc_lm.free_line_cnt;
+	/* 使用 SLC + QLC 的总空闲空间来判断是否需要 GC - 分步读取避免锁竞争 */
+	uint32_t slc_free, qlc_free, total_free_lines;
+	
+	spin_lock(&conv_ftl->slc_lock);
+	slc_free = conv_ftl->slc_lm.free_line_cnt;
+	spin_unlock(&conv_ftl->slc_lock);
+	
+	spin_lock(&conv_ftl->qlc_lock);
+	qlc_free = conv_ftl->qlc_lm.free_line_cnt;
+	spin_unlock(&conv_ftl->qlc_lock);
+	
+	total_free_lines = slc_free + qlc_free;
 	return total_free_lines <= conv_ftl->cp.gc_thres_lines_high;
 }
 
@@ -863,8 +883,8 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 	/* initialize write pointer, this is how we allocate new pages for writes */
 	NVMEV_INFO("initialize write pointer\n");
-	prepare_write_pointer(conv_ftl, USER_IO);
-	prepare_write_pointer(conv_ftl, GC_IO);
+	/* DEPRECATED: prepare_write_pointer calls removed - using dynamic SLC/QLC allocation */
+	/* SLC/QLC write pointers will be initialized on first write operation */
 
     /* SLC Die-Affinity uses per-instance lunpointer */
     conv_ftl->lunpointer = 0;
