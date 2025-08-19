@@ -23,7 +23,7 @@ static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
 static inline bool mapped_ppa(struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *slc_ppa);
-static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id);
+static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id);
 
 /* 后台线程函数声明 */
 static int background_migration_thread(void *data);
@@ -2046,8 +2046,9 @@ retry_get_page:
     return ppa;
 }
 
-/* 推进 QLC 写指针 - 使用多区域并发 */
-static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id)
+/* 推进 QLC 写指针 - 使用多区域并发 
+ * 返回值: 0=成功, -1=失败 */
+static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct line_mgmt *lm = &conv_ftl->qlc_lm;
@@ -2095,7 +2096,7 @@ static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region
         /* 标记为未就绪，等待后续重新获取 */
         wp->curline = NULL;
         spin_unlock(&conv_ftl->qlc_lock);
-        return;
+        return -1;
     }
 	
 	list_del_init(&wp->curline->entry);
