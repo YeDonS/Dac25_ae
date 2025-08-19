@@ -2354,6 +2354,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
+	NVMEV_ERROR("[DEBUG] conv_write: Function entry\n");
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
 	struct conv_ftl *conv_ftl = &conv_ftls[0];
 
@@ -2401,10 +2402,10 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	}
 //66f1
 
-	NVMEV_DEBUG("conv_write: start_lpn=%lld, len=%lld, end_lpn=%lld", start_lpn, nr_lba, end_lpn);
-	//NVMEV_ERROR("conv_write: start_lpn=%lld, len=%lld, end_lpn=%lld", start_lpn, nr_lba, end_lpn);
+	NVMEV_ERROR("[DEBUG] conv_write: start_lpn=%lld, len=%lld, end_lpn=%lld, nr_parts=%u, tt_pgs=%ld\n", 
+	           start_lpn, nr_lba, end_lpn, nr_parts, spp->tt_pgs);
     if ((end_lpn / nr_parts) >= spp->tt_pgs) {
-        NVMEV_ERROR("conv_write: lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
+        NVMEV_ERROR("[DEBUG] conv_write: LPN RANGE CHECK FAILED - lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
                     start_lpn, spp->tt_pgs);
         ret->status = NVME_SC_LBA_RANGE;
         ret->nsecs_target = req->nsecs_start;
@@ -2412,9 +2413,9 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
     }
 
     allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
-	//NVMEV_ERROR("conv_write: buffer alloc size = %u\n", allocated_buf_size);
+	NVMEV_ERROR("[DEBUG] conv_write: buffer alloc size = %u, needed = %llu\n", allocated_buf_size, LBA_TO_BYTE(nr_lba));
     if (allocated_buf_size < LBA_TO_BYTE(nr_lba)) {
-        NVMEV_ERROR("conv_write: insufficient write buffer (%u < %llu)\n",
+        NVMEV_ERROR("[DEBUG] conv_write: BUFFER ALLOCATION FAILED - insufficient write buffer (%u < %llu)\n",
                     allocated_buf_size, LBA_TO_BYTE(nr_lba));
         ret->status = NVME_SC_WRITE_FAULT;
         ret->nsecs_target = req->nsecs_start;
@@ -2434,9 +2435,9 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
     //struct ppa old_ppa = { .ppa = UNMAPPED_PPA };  /* 用于迁移检查 */
     
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-		/* 调试：检查是否进入了写入循环 */
+		        /* 调试：检查是否进入了写入循环 */
 		if (lpn == start_lpn) {
-			NVMEV_INFO("conv_write: Starting write loop, lpn=%llu to %llu\n", start_lpn, end_lpn);
+			NVMEV_ERROR("[DEBUG] conv_write: Starting write loop, lpn=%llu to %llu\n", start_lpn, end_lpn);
 		}
 		
 		/* 注释掉旧的同步迁移逻辑，现在使用后台异步迁移 */
@@ -2497,10 +2498,10 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         spin_unlock(&conv_ftl->slc_lock);
         
         /* 如果SLC空间低于高水位线，触发后台迁移 */
-        NVMEV_INFO("SLC status: free_lines=%u, high_watermark=%u, total=%u\n", 
+        NVMEV_ERROR("[DEBUG] SLC status: free_lines=%u, high_watermark=%u, total=%u\n", 
                    slc_free_lines, conv_ftl->slc_high_watermark, conv_ftl->slc_lm.tt_lines);
         if (slc_free_lines <= conv_ftl->slc_high_watermark) {
-            NVMEV_INFO("SLC space low (%u <= %u), triggering background migration\n", 
+            NVMEV_ERROR("[DEBUG] SLC space low (%u <= %u), triggering background migration\n", 
                       slc_free_lines, conv_ftl->slc_high_watermark);
             wakeup_migration_thread(conv_ftl);
         }
@@ -2811,7 +2812,7 @@ static int background_migration_thread(void *data)
 {
 	struct conv_ftl *conv_ftl = (struct conv_ftl *)data;
 	
-	NVMEV_INFO("Background migration thread started\n");
+	NVMEV_ERROR("[DEBUG] Background migration thread started\n");
 	
 	while (!kthread_should_stop() && !conv_ftl->threads_should_stop) {
 		/* 等待迁移信号 */
@@ -2840,7 +2841,7 @@ static int background_migration_thread(void *data)
 			}
 			
 			/* 执行一批迁移操作 */
-			NVMEV_INFO("Background migration working: free_lines=%u, target=%u\n", 
+			NVMEV_ERROR("[DEBUG] Background migration working: free_lines=%u, target=%u\n", 
 			          slc_free_lines, conv_ftl->slc_low_watermark);
 			migrate_some_cold_from_slc(conv_ftl, 16);
 			
@@ -2918,7 +2919,7 @@ static void init_background_threads(struct conv_ftl *conv_ftl)
 	conv_ftl->gc_high_watermark = (conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines) / 20; /* 5%: 剩余空间低于此值触发GC */
 	conv_ftl->gc_low_watermark = (conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines) / 10;  /* 10%: 剩余空间高于此值停止GC */
 	
-	NVMEV_INFO("Watermarks: SLC_high=%u, SLC_low=%u, GC_high=%u, GC_low=%u (SLC_total=%u, QLC_total=%u)\n",
+	NVMEV_ERROR("[DEBUG] Watermarks: SLC_high=%u, SLC_low=%u, GC_high=%u, GC_low=%u (SLC_total=%u, QLC_total=%u)\n",
 	          conv_ftl->slc_high_watermark, conv_ftl->slc_low_watermark, 
 	          conv_ftl->gc_high_watermark, conv_ftl->gc_low_watermark,
 	          conv_ftl->slc_lm.tt_lines, conv_ftl->qlc_lm.tt_lines);
@@ -2973,7 +2974,7 @@ static void stop_background_threads(struct conv_ftl *conv_ftl)
 /* 唤醒迁移线程 */
 static void wakeup_migration_thread(struct conv_ftl *conv_ftl)
 {
-	NVMEV_INFO("Waking up migration thread\n");
+	NVMEV_ERROR("[DEBUG] Waking up migration thread\n");
 	atomic_set(&conv_ftl->migration_needed, 1);
 	wake_up_interruptible(&conv_ftl->migration_wq);
 }
