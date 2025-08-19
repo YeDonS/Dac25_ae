@@ -2434,10 +2434,15 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
     //struct ppa old_ppa = { .ppa = UNMAPPED_PPA };  /* 用于迁移检查 */
     
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-		/* 低水位则尝试搬一小批冷页，最小化改动且不影响写入主路径 */
-		if ((lpn & 0x3FF) == 0) { /* 每 1024 页尝试一次，避免频繁开销 */
-			trigger_slc_migration_if_low(conv_ftl);
+		/* 调试：检查是否进入了写入循环 */
+		if (lpn == start_lpn) {
+			NVMEV_INFO("conv_write: Starting write loop, lpn=%llu to %llu\n", start_lpn, end_lpn);
 		}
+		
+		/* 注释掉旧的同步迁移逻辑，现在使用后台异步迁移 */
+		/* if ((lpn & 0x3FF) == 0) {
+			trigger_slc_migration_if_low(conv_ftl);
+		} */
 
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
@@ -2485,31 +2490,29 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		}
 
         /* 修改：所有新写入都先写到 SLC（不直接写 QLC） */
-        /* 若 SLC 暂无可用页，触发后台迁移并检查是否有紧急空间可用 */
-        {
-            uint32_t slc_free_lines;
-            spin_lock(&conv_ftl->slc_lock);
-            slc_free_lines = conv_ftl->slc_lm.free_line_cnt;
-            spin_unlock(&conv_ftl->slc_lock);
-            
-            /* 如果SLC空间低于高水位线，触发后台迁移 */
-            NVMEV_DEBUG("SLC status: free_lines=%u, high_watermark=%u, total=%u\n", 
-                       slc_free_lines, conv_ftl->slc_high_watermark, conv_ftl->slc_lm.tt_lines);
-            if (slc_free_lines <= conv_ftl->slc_high_watermark) {
-                NVMEV_INFO("SLC space low (%u <= %u), triggering background migration\n", 
-                          slc_free_lines, conv_ftl->slc_high_watermark);
-                wakeup_migration_thread(conv_ftl);
-            }
-            
-            /* 尝试获取SLC页面 */
-            ppa = get_new_slc_page(conv_ftl);
-            if (!mapped_ppa(&ppa)) {
-                /* SLC空间不足，立即返回写入失败 */
-                NVMEV_ERROR("SLC exhausted, write failed for LPN %lld - background migration needed\n", local_lpn);
-                ret->status = NVME_SC_WRITE_FAULT;
-                ret->nsecs_target = nsecs_latest;
-                return true;
-            }
+        /* 每次写入都检查SLC状态并触发迁移 */
+        uint32_t slc_free_lines;
+        spin_lock(&conv_ftl->slc_lock);
+        slc_free_lines = conv_ftl->slc_lm.free_line_cnt;
+        spin_unlock(&conv_ftl->slc_lock);
+        
+        /* 如果SLC空间低于高水位线，触发后台迁移 */
+        NVMEV_INFO("SLC status: free_lines=%u, high_watermark=%u, total=%u\n", 
+                   slc_free_lines, conv_ftl->slc_high_watermark, conv_ftl->slc_lm.tt_lines);
+        if (slc_free_lines <= conv_ftl->slc_high_watermark) {
+            NVMEV_INFO("SLC space low (%u <= %u), triggering background migration\n", 
+                      slc_free_lines, conv_ftl->slc_high_watermark);
+            wakeup_migration_thread(conv_ftl);
+        }
+        
+        /* 尝试获取SLC页面 */
+        ppa = get_new_slc_page(conv_ftl);
+        if (!mapped_ppa(&ppa)) {
+            /* SLC空间不足，立即返回写入失败 */
+            NVMEV_ERROR("SLC exhausted, write failed for LPN %lld - background migration needed\n", local_lpn);
+            ret->status = NVME_SC_WRITE_FAULT;
+            ret->nsecs_target = nsecs_latest;
+            return true;
         }
 
         /* 记录页面在 SLC 中 */
