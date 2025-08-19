@@ -2493,7 +2493,11 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
             spin_unlock(&conv_ftl->slc_lock);
             
             /* 如果SLC空间低于高水位线，触发后台迁移 */
+            NVMEV_DEBUG("SLC status: free_lines=%u, high_watermark=%u, total=%u\n", 
+                       slc_free_lines, conv_ftl->slc_high_watermark, conv_ftl->slc_lm.tt_lines);
             if (slc_free_lines <= conv_ftl->slc_high_watermark) {
+                NVMEV_INFO("SLC space low (%u <= %u), triggering background migration\n", 
+                          slc_free_lines, conv_ftl->slc_high_watermark);
                 wakeup_migration_thread(conv_ftl);
             }
             
@@ -2833,6 +2837,8 @@ static int background_migration_thread(void *data)
 			}
 			
 			/* 执行一批迁移操作 */
+			NVMEV_INFO("Background migration working: free_lines=%u, target=%u\n", 
+			          slc_free_lines, conv_ftl->slc_low_watermark);
 			migrate_some_cold_from_slc(conv_ftl, 16);
 			
 			/* 让出CPU，避免独占 */
@@ -2903,11 +2909,16 @@ static int background_gc_thread(void *data)
 /* 初始化后台线程 */
 static void init_background_threads(struct conv_ftl *conv_ftl)
 {
-	/* 设置水位线 - 基于剩余空间数量 */
-	conv_ftl->slc_high_watermark = conv_ftl->slc_lm.tt_lines / 8;  /* 12.5%: 剩余空间低于此值触发迁移 */
-	conv_ftl->slc_low_watermark = conv_ftl->slc_lm.tt_lines / 4;   /* 25%: 剩余空间高于此值停止迁移 */
+	/* 设置水位线 - 基于剩余空间数量 (调整为很早触发) */
+	conv_ftl->slc_high_watermark = conv_ftl->slc_lm.tt_lines - 10;  /* 几乎满: 剩余10个blocks就触发迁移 */
+	conv_ftl->slc_low_watermark = conv_ftl->slc_lm.tt_lines - 5;   /* 几乎满: 剩余5个blocks就停止迁移 */
 	conv_ftl->gc_high_watermark = (conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines) / 20; /* 5%: 剩余空间低于此值触发GC */
 	conv_ftl->gc_low_watermark = (conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines) / 10;  /* 10%: 剩余空间高于此值停止GC */
+	
+	NVMEV_INFO("Watermarks: SLC_high=%u, SLC_low=%u, GC_high=%u, GC_low=%u (SLC_total=%u, QLC_total=%u)\n",
+	          conv_ftl->slc_high_watermark, conv_ftl->slc_low_watermark, 
+	          conv_ftl->gc_high_watermark, conv_ftl->gc_low_watermark,
+	          conv_ftl->slc_lm.tt_lines, conv_ftl->qlc_lm.tt_lines);
 	
 	/* 初始化等待队列和原子变量 */
 	init_waitqueue_head(&conv_ftl->migration_wq);
@@ -2959,6 +2970,7 @@ static void stop_background_threads(struct conv_ftl *conv_ftl)
 /* 唤醒迁移线程 */
 static void wakeup_migration_thread(struct conv_ftl *conv_ftl)
 {
+	NVMEV_INFO("Waking up migration thread\n");
 	atomic_set(&conv_ftl->migration_needed, 1);
 	wake_up_interruptible(&conv_ftl->migration_wq);
 }
