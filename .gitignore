@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.d
+.tmp_versions/
+modules.order
+Module.symvers
+
+# Editor files
+*~
+.*.swp
+.*.swo
+
+# Logs and temporary files
+*.log
+/tmp/
