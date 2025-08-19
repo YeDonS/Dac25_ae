@@ -154,12 +154,16 @@ static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *pp
 
 static bool should_gc(struct conv_ftl *conv_ftl)
 {
-	return (conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines);
+	/* 使用 SLC + QLC 的总空闲空间来判断是否需要 GC */
+	uint32_t total_free_lines = conv_ftl->slc_lm.free_line_cnt + conv_ftl->qlc_lm.free_line_cnt;
+	return (total_free_lines <= conv_ftl->cp.gc_thres_lines);
 }
 
 static inline bool should_gc_high(struct conv_ftl *conv_ftl)
 {
-	return conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines_high;
+	/* 使用 SLC + QLC 的总空闲空间来判断是否需要 GC */
+	uint32_t total_free_lines = conv_ftl->slc_lm.free_line_cnt + conv_ftl->qlc_lm.free_line_cnt;
+	return total_free_lines <= conv_ftl->cp.gc_thres_lines_high;
 }
 
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
@@ -370,8 +374,8 @@ static void init_lines_DA(struct conv_ftl *conv_ftl)
 
 static void remove_lines(struct conv_ftl *conv_ftl)
 {
-	pqueue_free(conv_ftl->lm.victim_line_pq);
-	vfree(conv_ftl->lm.lines);
+	/* 旧的 remove_lines 函数已废弃 - 现在使用 remove_slc_lines 和 remove_qlc_lines */
+	/* 这个函数保留为空，避免编译错误，但实际清理工作由新函数完成 */
 }
 
 static void remove_lines_DA(struct conv_ftl *conv_ftl)
@@ -974,7 +978,7 @@ static void init_slc_lines(struct conv_ftl *conv_ftl)
 	lm->free_line_cnt = 0;
 	for (i = 0; i < lm->tt_lines; i++) {
 		lm->lines[i] = (struct line) {
-			.id = i,  /* SLC block IDs start from 0 */
+			.id = i,  /* SLC 使用从 0 开始的连续块ID，这是正确的 */
 			.ipc = 0,
 			.vpc = 0,
 			.pos = 0,
@@ -1078,9 +1082,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	NVMEV_INFO("initialize rmap\n");
 	init_rmap(conv_ftl); // reverse mapping table (?)
 
-	/* initialize all the lines */
-    NVMEV_INFO("initialize lines\n");
-    init_lines(conv_ftl);
+	/* 删除旧的 init_lines 调用 - 使用新的 SLC/QLC 系统 */
 
 	/* 初始化 SLC/QLC 混合存储 */
 	NVMEV_INFO("initialize SLC/QLC blocks\n");
@@ -1264,7 +1266,19 @@ static inline uint32_t get_glun(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
 static inline struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-	return &(conv_ftl->lm.lines[ppa->g.blk]);
+	/* 根据块类型选择正确的 line_mgmt */
+	if (is_slc_block(conv_ftl, ppa->g.blk)) {
+		/* SLC 块：直接使用块ID作为索引 */
+		return &(conv_ftl->slc_lm.lines[ppa->g.blk]);
+	} else {
+		/* QLC 块：需要减去 SLC 块数量来获得 QLC 索引 */
+		uint32_t qlc_idx = ppa->g.blk - conv_ftl->slc_blks_per_pl;
+		if (qlc_idx >= conv_ftl->qlc_lm.tt_lines) {
+			NVMEV_ERROR("QLC block index out of range: %u >= %u\n", qlc_idx, conv_ftl->qlc_lm.tt_lines);
+			return NULL;
+		}
+		return &(conv_ftl->qlc_lm.lines[qlc_idx]);
+	}
 }
 
 static inline struct line *get_line_DA(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -1860,8 +1874,9 @@ static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id)
 	
 	/* 检查数组边界 */
 	if (blk_id >= conv_ftl->slc_blks_per_pl + conv_ftl->qlc_blks_per_pl) {
-		NVMEV_ERROR("Block ID %u out of range (max: %u)\n", 
-			   blk_id, conv_ftl->slc_blks_per_pl + conv_ftl->qlc_blks_per_pl);
+		NVMEV_ERROR("[DEBUG] Block ID %u out of range (max: %u, SLC: %u, QLC: %u)\n", 
+			   blk_id, conv_ftl->slc_blks_per_pl + conv_ftl->qlc_blks_per_pl,
+			   conv_ftl->slc_blks_per_pl, conv_ftl->qlc_blks_per_pl);
 		return false;
 	}
 	
@@ -2624,7 +2639,10 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
     /* C90: declarations must precede statements */
     struct nvme_command *cmd;
     
+    NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Function entry\n");
+    
     if (!ns || !ns->ftls || !req || !ret || !req->cmd) {
+        NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: NULL parameter check failed\n");
         if (ret) {
             ret->status = NVME_SC_INTERNAL;
             ret->nsecs_target = req ? req->nsecs_start : local_clock();
@@ -2636,20 +2654,26 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
     cmd = req->cmd;
 	NVMEV_ASSERT(ns->csi == NVME_CSI_NVM);
 
+	NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Processing opcode %d (%s)\n", 
+	           cmd->common.opcode, nvme_opcode_string(cmd->common.opcode));
+	
 	switch (cmd->common.opcode) {
 	case nvme_cmd_write:
+		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_write\n");
         if (!conv_write(ns, req, ret))
             return true; /* 出错也返回完成，状态在 ret 内 */
 		break;
 	case nvme_cmd_read:
+		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_read\n");
         if (!conv_read(ns, req, ret))
             return true; /* 出错也返回完成，状态在 ret 内 */
 		break;
 	case nvme_cmd_flush:
+		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_flush\n");
 		conv_flush(ns, req, ret);
 		break;
 	default:
-		NVMEV_ERROR("%s: unimplemented command: %s(%d)\n", __func__,
+		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Unimplemented command: %s(%d)\n", 
 			   nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
 		break;
 	}

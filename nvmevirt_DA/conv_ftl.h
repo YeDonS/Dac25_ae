@@ -4,6 +4,7 @@
 #define _NVMEVIRT_CONV_FTL_H
 
 #include <linux/types.h>
+#include <linux/spinlock.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "ssd.h"
@@ -77,13 +78,9 @@ struct conv_ftl {
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
 	struct write_pointer wp;
 	struct write_pointer gc_wp;
-	struct line_mgmt lm;
 	struct write_flow_control wfc;
-	//66f1
-	struct line_mgmt *lunlm;
-	struct write_pointer *lunwp;
+	//66f1 - 删除了冲突的旧 line_mgmt 结构
 	uint32_t lunpointer;
-	//66f1
 
 	/* SLC/QLC 混合存储相关字段 */
 	bool *is_slc_block;          /* 标记块是否为 SLC */
@@ -95,9 +92,9 @@ struct conv_ftl {
 	struct write_pointer slc_wp;
 	struct line_mgmt slc_lm;
 	
-	/* QLC 写指针 - 使用顺序写入 */
+	/* QLC 写指针 - 使用多区域并发 */
 	struct write_pointer qlc_wp[QLC_REGIONS]; /* QLC 区域写指针 */
-	struct line_mgmt qlc_lm[QLC_REGIONS];     /* QLC 区域的 line 管理 */
+	struct line_mgmt qlc_lm;                  /* QLC 共享的 line 管理 */
 	uint32_t current_qlc_region;              /* 当前写入的 QLC 区域 */
 	
 	/* 热数据跟踪和迁移管理 */
@@ -111,6 +108,31 @@ struct conv_ftl {
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
 	uint64_t migration_cnt;      /* 迁移计数 */
+	
+	/* 初始化状态标记 */
+	bool maptbl_initialized;     /* 映射表是否初始化成功 */
+	bool rmap_initialized;       /* 反向映射表是否初始化成功 */
+	bool slc_initialized;        /* SLC 是否初始化成功 */
+	bool qlc_initialized;        /* QLC 是否初始化成功 */
+	bool heat_track_initialized; /* 热跟踪是否初始化成功 */
+	/* 账本并发保护（最小范围：仅行/队列/写指针） */
+	spinlock_t slc_lock; /* 保护 SLC 的 line_mgmt/free/full/victim、SLC 写指针 */
+	spinlock_t qlc_lock; /* 保护 QLC 的 line_mgmt/free/full/victim、QLC 写指针 */
+	
+	/* 后台线程管理 */
+	struct task_struct *migration_thread;    /* 后台迁移线程 */
+	struct task_struct *gc_thread;           /* 后台GC线程 */
+	wait_queue_head_t migration_wq;          /* 迁移线程等待队列 */
+	wait_queue_head_t gc_wq;                 /* GC线程等待队列 */
+	atomic_t migration_needed;               /* 是否需要迁移 */
+	atomic_t gc_needed;                      /* 是否需要GC */
+	bool threads_should_stop;                /* 线程停止标志 */
+	
+	/* 水位线控制 - 基于剩余空间数量 */
+	uint32_t slc_high_watermark;             /* SLC 高水位线: 剩余空间低于此值时触发迁移 */
+	uint32_t slc_low_watermark;              /* SLC 低水位线: 剩余空间高于此值时停止迁移 */
+	uint32_t gc_high_watermark;              /* GC 高水位线: 总剩余空间低于此值时触发GC */
+	uint32_t gc_low_watermark;               /* GC 低水位线: 总剩余空间高于此值时停止GC */
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
