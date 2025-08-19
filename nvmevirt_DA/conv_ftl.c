@@ -3,6 +3,8 @@
 
 #include <linux/sched/clock.h>
 #include <linux/delay.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -22,6 +24,14 @@ static inline bool mapped_ppa(struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *slc_ppa);
 static void advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id);
+
+/* 后台线程函数声明 */
+static int background_migration_thread(void *data);
+static int background_gc_thread(void *data);
+static void init_background_threads(struct conv_ftl *conv_ftl);
+static void stop_background_threads(struct conv_ftl *conv_ftl);
+static void wakeup_migration_thread(struct conv_ftl *conv_ftl);
+static void wakeup_gc_thread(struct conv_ftl *conv_ftl);
 
 /* 当 SLC 空闲低于阈值时，挑选一小批"冷数据"从 SLC 迁移到 QLC。
  * 最小改动：线性扫描有限数量 LPN，命中条件：page_in_slc && 冷（时间 >1s 且访问计数 < 阈值）。
@@ -230,9 +240,26 @@ static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
 {
 	struct write_flow_control *wfc = &(conv_ftl->wfc);
 	if (wfc->write_credits <= 0) {
-		forground_gc(conv_ftl);
-
-		wfc->write_credits += wfc->credits_to_refill;
+		/* 触发后台GC而不是前台阻塞GC */
+		uint32_t slc_free, qlc_free, total_free_lines;
+		
+		/* 分步读取避免同时持有两个锁 */
+		spin_lock(&conv_ftl->slc_lock);
+		slc_free = conv_ftl->slc_lm.free_line_cnt;
+		spin_unlock(&conv_ftl->slc_lock);
+		
+		spin_lock(&conv_ftl->qlc_lock);
+		qlc_free = conv_ftl->qlc_lm.free_line_cnt;
+		spin_unlock(&conv_ftl->qlc_lock);
+		
+		total_free_lines = slc_free + qlc_free;
+		
+		if (total_free_lines <= conv_ftl->gc_high_watermark) {
+			wakeup_gc_thread(conv_ftl);
+		}
+		
+		/* 临时增加少量credit以避免完全阻塞，后台GC会逐步释放更多空间 */
+		wfc->write_credits += 10;  /* 允许少量写入继续进行 */
 	}
 }
 
@@ -1084,6 +1111,10 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 	init_write_flow_control(conv_ftl);
 
+	/* 初始化后台线程 */
+	NVMEV_INFO("initialize background threads\n");
+	init_background_threads(conv_ftl);
+
 	NVMEV_INFO("Init FTL Instance with %d channels(%ld pages)\n", conv_ftl->ssd->sp.nchs,
 		   conv_ftl->ssd->sp.tt_pgs);
 	NVMEV_INFO("SLC/QLC Hybrid Mode: SLC %d blks, QLC %d blks (4 regions)\n", 
@@ -1094,6 +1125,9 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
+	/* 首先停止后台线程 */
+	stop_background_threads(conv_ftl);
+	
     remove_lines(conv_ftl);
 	
 	/* 清理 SLC/QLC 相关资源 */
@@ -1256,16 +1290,37 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
     /* 更新页和块的状态 (这部分不涉及共享数据结构，可以在锁外完成) */
     pg = get_pg(conv_ftl->ssd, ppa);
-    NVMEV_ASSERT(pg->status == PG_VALID);
+    
+    /* 检查页面状态，如果已经无效则直接返回 */
+    if (pg->status == PG_INVALID) {
+        NVMEV_DEBUG("[mark_page_invalid] Page already invalid at ch=%d,lun=%d,blk=%d,pg=%d\n",
+                   ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+        return;
+    }
+    
+    /* 只有有效页面才能被标记为无效 */
+    if (pg->status != PG_VALID) {
+        NVMEV_ERROR("[mark_page_invalid] Invalid page status %d, expected PG_VALID at ch=%d,lun=%d,blk=%d,pg=%d\n",
+                   pg->status, ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+        return;
+    }
+    
     pg->status = PG_INVALID;
 
     blk = get_blk(conv_ftl->ssd, ppa);
+    if (!blk) {
+        NVMEV_ERROR("[mark_page_invalid] Failed to get block for ppa ch=%d,lun=%d,blk=%d,pg=%d\n",
+                   ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+        return;
+    }
+    
     NVMEV_ASSERT(blk->ipc >= 0 && blk->ipc < spp->pgs_per_blk);
     blk->ipc++;
     if (blk->vpc > 0) {
         blk->vpc--;
     } else {
         NVMEV_ERROR("blk->vpc already 0 before decrement, blk=%d\n", ppa->g.blk);
+        /* Don't return here, continue with line management updates */
     }
 
     /* 2. 根据介质类型，进入完全独立的原子操作块 */
@@ -1551,28 +1606,61 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	return 0;
 }
 
+/* 选择最佳的受害者line，优先选择SLC中无效页最多的line */
 static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
 {
     struct ssdparams *spp = &conv_ftl->ssd->sp;
-    /* GC仅针对QLC账本选择受害者 */
-    struct line_mgmt *lm = &conv_ftl->qlc_lm;
-	struct line *victim_line = NULL;
+    struct line *victim_line = NULL;
+    struct line *slc_victim = NULL;
+    struct line *qlc_victim = NULL;
+    
+    /* 首先检查SLC是否有受害者 */
+    struct line_mgmt *slc_lm = &conv_ftl->slc_lm;
+    if (slc_lm->victim_line_cnt > 0) {
+        slc_victim = pqueue_peek(slc_lm->victim_line_pq);
+    }
+    
+    /* 然后检查QLC是否有受害者 */
+    struct line_mgmt *qlc_lm = &conv_ftl->qlc_lm;
+    if (qlc_lm->victim_line_cnt > 0) {
+        qlc_victim = pqueue_peek(qlc_lm->victim_line_pq);
+    }
+    
+    /* 选择策略：
+     * 1. 如果force=true，选择任何可用的受害者
+     * 2. 否则只选择无效页比例足够高的受害者
+     * 3. 优先选择SLC受害者（擦写速度更快）
+     * 4. 如果SLC和QLC都有合适的受害者，选择无效页更多的
+     */
+    
+    bool slc_suitable = slc_victim && (force || slc_victim->vpc <= (spp->pgs_per_line / 8));
+    bool qlc_suitable = qlc_victim && (force || qlc_victim->vpc <= (spp->pgs_per_line / 8));
+    
+    if (slc_suitable && qlc_suitable) {
+        /* 两者都合适，选择无效页更多的（vpc更小意味着有效页更少，即无效页更多） */
+        victim_line = (slc_victim->vpc <= qlc_victim->vpc) ? slc_victim : qlc_victim;
+    } else if (slc_suitable) {
+        victim_line = slc_victim;
+    } else if (qlc_suitable) {
+        victim_line = qlc_victim;
+    } else {
+        return NULL;  /* 没有合适的受害者 */
+    }
+    
+    /* 从相应的队列中移除选中的受害者 */
+    if (victim_line == slc_victim) {
+        pqueue_pop(slc_lm->victim_line_pq);
+        victim_line->pos = 0;
+        slc_lm->victim_line_cnt--;
+        NVMEV_DEBUG("Selected SLC victim line %d (vpc=%d)\n", victim_line->id, victim_line->vpc);
+    } else {
+        pqueue_pop(qlc_lm->victim_line_pq);
+        victim_line->pos = 0;
+        qlc_lm->victim_line_cnt--;
+        NVMEV_DEBUG("Selected QLC victim line %d (vpc=%d)\n", victim_line->id, victim_line->vpc);
+    }
 
-	victim_line = pqueue_peek(lm->victim_line_pq);
-	if (!victim_line) {
-		return NULL;
-	}
-
-	if (!force && (victim_line->vpc > (spp->pgs_per_line / 8))) {
-		return NULL;
-	}
-
-	pqueue_pop(lm->victim_line_pq);
-	victim_line->pos = 0;
-	lm->victim_line_cnt--;
-
-	/* victim_line is a danggling node now */
-	return victim_line;
+    return victim_line;
 }
 
 /* here ppa identifies the block we want to clean */
@@ -1682,9 +1770,20 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	}
 
 	ppa.g.blk = victim_line->id;
-	NVMEV_DEBUG("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
-		    victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
-		    conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
+	
+	/* 确定是SLC还是QLC并显示相应的统计信息 */
+	bool in_slc = is_slc_block(conv_ftl, ppa.g.blk);
+	if (in_slc) {
+	    struct line_mgmt *slc_lm = &conv_ftl->slc_lm;
+	    NVMEV_DEBUG("GC-ing SLC line:%d,ipc=%d,vpc=%d,victim=%d,full=%d,free=%d\n", 
+	               ppa.g.blk, victim_line->ipc, victim_line->vpc, 
+	               slc_lm->victim_line_cnt, slc_lm->full_line_cnt, slc_lm->free_line_cnt);
+	} else {
+	    struct line_mgmt *qlc_lm = &conv_ftl->qlc_lm;
+	    NVMEV_DEBUG("GC-ing QLC line:%d,ipc=%d,vpc=%d,victim=%d,full=%d,free=%d\n", 
+	               ppa.g.blk, victim_line->ipc, victim_line->vpc,
+	               qlc_lm->victim_line_cnt, qlc_lm->full_line_cnt, qlc_lm->free_line_cnt);
+	}
 
 	conv_ftl->wfc.credits_to_refill = victim_line->ipc;
 
@@ -2055,6 +2154,14 @@ static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
         return;
     }
     
+    /* 验证页面状态是有效的 */
+    struct nand_page *pg = get_pg(conv_ftl->ssd, slc_ppa);
+    if (!pg || pg->status != PG_VALID) {
+        NVMEV_DEBUG("Page not valid for migration: status=%d at ch=%d,lun=%d,blk=%d,pg=%d\n",
+                   pg ? pg->status : -1, slc_ppa->g.ch, slc_ppa->g.lun, slc_ppa->g.blk, slc_ppa->g.pg);
+        return;
+    }
+    
     /* 选择 QLC 区域（轮询） */
     uint32_t region = conv_ftl->current_qlc_region;
     conv_ftl->current_qlc_region = (conv_ftl->current_qlc_region + 1) % QLC_REGIONS;
@@ -2377,36 +2484,23 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		}
 
         /* 修改：所有新写入都先写到 SLC（不直接写 QLC） */
-        /* 若 SLC 暂无可用页，先迁移少量更冷页面到 QLC 腾空，再重试取 SLC 页 */
+        /* 若 SLC 暂无可用页，触发后台迁移并检查是否有紧急空间可用 */
         {
-            int tries;
-            bool qlc_has_space = true;
+            uint32_t slc_free_lines;
+            spin_lock(&conv_ftl->slc_lock);
+            slc_free_lines = conv_ftl->slc_lm.free_line_cnt;
+            spin_unlock(&conv_ftl->slc_lock);
             
-            for (tries = 0; tries < 4; tries++) {
-                ppa = get_new_slc_page(conv_ftl);
-                if (mapped_ppa(&ppa)) break;
-                
-                /* 检查 QLC 是否有空间进行迁移 */
-                if (qlc_has_space) {
-                    /* 每次迁移最多 32 页，避免占用太多缓冲 */
-                    migrate_some_cold_from_slc(conv_ftl, 32);
-                    
-                    /* 检查迁移后 QLC 是否还有空间 */
-                    struct ppa test_ppa;
-                    test_ppa = get_new_qlc_page(conv_ftl, 0);
-                    if (!mapped_ppa(&test_ppa)) {
-                        qlc_has_space = false;
-                        NVMEV_ERROR("QLC is full, cannot migrate from SLC\n");
-                    }
-                }
+            /* 如果SLC空间低于高水位线，触发后台迁移 */
+            if (slc_free_lines <= conv_ftl->slc_high_watermark) {
+                wakeup_migration_thread(conv_ftl);
             }
             
+            /* 尝试获取SLC页面 */
+            ppa = get_new_slc_page(conv_ftl);
             if (!mapped_ppa(&ppa)) {
-                if (!qlc_has_space) {
-                    NVMEV_ERROR("SLC no space and QLC is full - system exhausted\n");
-                } else {
-                    NVMEV_ERROR("SLC no space after migrations\n");
-                }
+                /* SLC空间不足，立即返回写入失败 */
+                NVMEV_ERROR("SLC exhausted, write failed for LPN %lld - background migration needed\n", local_lpn);
                 ret->status = NVME_SC_WRITE_FAULT;
                 ret->nsecs_target = nsecs_latest;
                 return true;
@@ -2700,4 +2794,177 @@ static void cleanup_on_alloc_failure(struct conv_ftl *conv_ftl)
 	conv_ftl->rmap_initialized = false;
 	conv_ftl->slc_initialized = false;
 	conv_ftl->heat_track_initialized = false;
+}
+
+/* ======================== 后台线程实现 ======================== */
+
+/* 后台迁移线程 */
+static int background_migration_thread(void *data)
+{
+	struct conv_ftl *conv_ftl = (struct conv_ftl *)data;
+	
+	NVMEV_INFO("Background migration thread started\n");
+	
+	while (!kthread_should_stop() && !conv_ftl->threads_should_stop) {
+		/* 等待迁移信号 */
+		wait_event_interruptible(conv_ftl->migration_wq,
+			atomic_read(&conv_ftl->migration_needed) || 
+			kthread_should_stop() || 
+			conv_ftl->threads_should_stop);
+		
+		if (kthread_should_stop() || conv_ftl->threads_should_stop)
+			break;
+		
+		/* 执行迁移直到SLC空间恢复到低水位线 */
+		while (atomic_read(&conv_ftl->migration_needed) && 
+		       !kthread_should_stop() && 
+		       !conv_ftl->threads_should_stop) {
+		       
+			uint32_t slc_free_lines;
+			spin_lock(&conv_ftl->slc_lock);
+			slc_free_lines = conv_ftl->slc_lm.free_line_cnt;
+			spin_unlock(&conv_ftl->slc_lock);
+			
+			/* 如果SLC空间恢复到低水位线以上，停止迁移 */
+			if (slc_free_lines >= conv_ftl->slc_low_watermark) {
+				atomic_set(&conv_ftl->migration_needed, 0);
+				break;
+			}
+			
+			/* 执行一批迁移操作 */
+			migrate_some_cold_from_slc(conv_ftl, 16);
+			
+			/* 让出CPU，避免独占 */
+			cond_resched();
+		}
+	}
+	
+	NVMEV_INFO("Background migration thread stopped\n");
+	return 0;
+}
+
+/* 后台GC线程 */
+static int background_gc_thread(void *data)
+{
+	struct conv_ftl *conv_ftl = (struct conv_ftl *)data;
+	
+	NVMEV_INFO("Background GC thread started\n");
+	
+	while (!kthread_should_stop() && !conv_ftl->threads_should_stop) {
+		/* 等待GC信号 */
+		wait_event_interruptible(conv_ftl->gc_wq,
+			atomic_read(&conv_ftl->gc_needed) || 
+			kthread_should_stop() || 
+			conv_ftl->threads_should_stop);
+		
+		if (kthread_should_stop() || conv_ftl->threads_should_stop)
+			break;
+		
+		/* 执行GC直到空间恢复到低水位线 */
+		while (atomic_read(&conv_ftl->gc_needed) && 
+		       !kthread_should_stop() && 
+		       !conv_ftl->threads_should_stop) {
+		       
+			uint32_t slc_free, qlc_free, total_free_lines;
+			
+			/* 分步读取避免同时持有两个锁 */
+			spin_lock(&conv_ftl->slc_lock);
+			slc_free = conv_ftl->slc_lm.free_line_cnt;
+			spin_unlock(&conv_ftl->slc_lock);
+			
+			spin_lock(&conv_ftl->qlc_lock);
+			qlc_free = conv_ftl->qlc_lm.free_line_cnt;
+			spin_unlock(&conv_ftl->qlc_lock);
+			
+			total_free_lines = slc_free + qlc_free;
+			
+			/* 如果总空间恢复到低水位线以上，停止GC */
+			if (total_free_lines >= conv_ftl->gc_low_watermark) {
+				atomic_set(&conv_ftl->gc_needed, 0);
+				break;
+			}
+			
+			/* 执行一次GC */
+			if (do_gc(conv_ftl, false) < 0) {
+				/* 没有合适的受害者，稍作等待 */
+				msleep(10);
+			}
+			
+			/* 让出CPU，避免独占 */
+			cond_resched();
+		}
+	}
+	
+	NVMEV_INFO("Background GC thread stopped\n");
+	return 0;
+}
+
+/* 初始化后台线程 */
+static void init_background_threads(struct conv_ftl *conv_ftl)
+{
+	/* 设置水位线 - 基于剩余空间数量 */
+	conv_ftl->slc_high_watermark = conv_ftl->slc_lm.tt_lines / 8;  /* 12.5%: 剩余空间低于此值触发迁移 */
+	conv_ftl->slc_low_watermark = conv_ftl->slc_lm.tt_lines / 4;   /* 25%: 剩余空间高于此值停止迁移 */
+	conv_ftl->gc_high_watermark = (conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines) / 20; /* 5%: 剩余空间低于此值触发GC */
+	conv_ftl->gc_low_watermark = (conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines) / 10;  /* 10%: 剩余空间高于此值停止GC */
+	
+	/* 初始化等待队列和原子变量 */
+	init_waitqueue_head(&conv_ftl->migration_wq);
+	init_waitqueue_head(&conv_ftl->gc_wq);
+	atomic_set(&conv_ftl->migration_needed, 0);
+	atomic_set(&conv_ftl->gc_needed, 0);
+	conv_ftl->threads_should_stop = false;
+	
+	/* 创建后台线程 */
+	conv_ftl->migration_thread = kthread_run(background_migration_thread, conv_ftl, "nvmev_migration");
+	if (IS_ERR(conv_ftl->migration_thread)) {
+		NVMEV_ERROR("Failed to create migration thread\n");
+		conv_ftl->migration_thread = NULL;
+	}
+	
+	conv_ftl->gc_thread = kthread_run(background_gc_thread, conv_ftl, "nvmev_gc");
+	if (IS_ERR(conv_ftl->gc_thread)) {
+		NVMEV_ERROR("Failed to create GC thread\n");
+		conv_ftl->gc_thread = NULL;
+	}
+	
+	NVMEV_INFO("Background threads initialized: migration=%p, gc=%p\n", 
+		   conv_ftl->migration_thread, conv_ftl->gc_thread);
+}
+
+/* 停止后台线程 */
+static void stop_background_threads(struct conv_ftl *conv_ftl)
+{
+	conv_ftl->threads_should_stop = true;
+	
+	/* 唤醒线程以便它们能检查停止标志 */
+	wake_up_interruptible(&conv_ftl->migration_wq);
+	wake_up_interruptible(&conv_ftl->gc_wq);
+	
+	/* 等待线程结束 */
+	if (conv_ftl->migration_thread) {
+		kthread_stop(conv_ftl->migration_thread);
+		conv_ftl->migration_thread = NULL;
+	}
+	
+	if (conv_ftl->gc_thread) {
+		kthread_stop(conv_ftl->gc_thread);
+		conv_ftl->gc_thread = NULL;
+	}
+	
+	NVMEV_INFO("Background threads stopped\n");
+}
+
+/* 唤醒迁移线程 */
+static void wakeup_migration_thread(struct conv_ftl *conv_ftl)
+{
+	atomic_set(&conv_ftl->migration_needed, 1);
+	wake_up_interruptible(&conv_ftl->migration_wq);
+}
+
+/* 唤醒GC线程 */
+static void wakeup_gc_thread(struct conv_ftl *conv_ftl)
+{
+	atomic_set(&conv_ftl->gc_needed, 1);
+	wake_up_interruptible(&conv_ftl->gc_wq);
 }
