@@ -370,21 +370,12 @@ static struct write_pointer *__get_wp_DA(struct conv_ftl *ftl, uint32_t io_type,
 
 static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
-	struct write_pointer *wp = __get_wp(conv_ftl, io_type);
-	struct line *curline = get_next_free_line(conv_ftl);
-
-	NVMEV_ASSERT(wp);
-	NVMEV_ASSERT(curline);
-
-	/* wp->curline is always our next-to-write super-block */
-	*wp = (struct write_pointer) {
-		.curline = curline,
-		.ch = 0,
-		.lun = 0,
-		.pg = 0,
-		.blk = curline->id,
-		.pl = 0,
-	};
+	/* DEPRECATED: prepare_write_pointer function is deprecated in SLC/QLC architecture */
+	NVMEV_DEBUG("prepare_write_pointer called - function deprecated, no operation performed\n");
+	
+	/* 在新的 SLC/QLC 架构中，写指针动态分配，不需要预先准备 */
+	/* Write pointers are now dynamically allocated in SLC/QLC architecture */
+	return;
 }
 
 //66f1
@@ -1692,12 +1683,20 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 		list_del_init(&curline->entry);
 		lm->free_line_cnt--;
 		
+		/* 确保line ID在SLC范围内 */
+		uint32_t blk_id = curline->id;
+		if (blk_id >= conv_ftl->slc_blks_per_pl) {
+			NVMEV_ERROR("get_new_slc_page: SLC line ID %u exceeds range [0, %u), line may be corrupted\n", 
+				   blk_id, conv_ftl->slc_blks_per_pl);
+			blk_id = blk_id % conv_ftl->slc_blks_per_pl;  /* 取模确保在范围内 */
+		}
+		
 		*wp = (struct write_pointer) {
 			.curline = curline,
 			.ch = conv_ftl->lunpointer % spp->nchs,
 			.lun = conv_ftl->lunpointer / spp->nchs,
 			.pg = 0,
-			.blk = curline->id,
+			.blk = blk_id,
 			.pl = 0,
 		};
         spin_unlock(&conv_ftl->slc_lock);
@@ -1752,6 +1751,14 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
 		lm->free_line_cnt--;
 		
 		wp->blk = wp->curline->id;
+		
+		/* 确保块号在SLC范围内 */
+		if (wp->blk >= conv_ftl->slc_blks_per_pl) {
+			NVMEV_ERROR("advance_slc_write_pointer: SLC block ID %u exceeds range [0, %u), line ID may be corrupted\n", 
+				   wp->blk, conv_ftl->slc_blks_per_pl);
+			wp->blk = wp->blk % conv_ftl->slc_blks_per_pl;  /* 取模确保在范围内 */
+		}
+		
 		wp->pg = 0;
         spin_unlock(&conv_ftl->slc_lock);
 	}
@@ -1764,6 +1771,13 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
 	
 	wp->ch = conv_ftl->lunpointer % spp->nchs;
 	wp->lun = conv_ftl->lunpointer / spp->nchs;
+	
+	/* 确保块号始终在SLC范围内 */
+	if (wp->blk >= conv_ftl->slc_blks_per_pl) {
+		NVMEV_ERROR("SLC block ID %u exceeds range [0, %u), resetting to 0\n", 
+			   wp->blk, conv_ftl->slc_blks_per_pl);
+		wp->blk = 0;
+	}
 }
 
 /* 获取 QLC 的新页面 - 使用多区域并发*/
