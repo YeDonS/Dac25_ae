@@ -1323,11 +1323,11 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         return;
     }
     /* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-    if (blk->vpc < 0 || blk->vpc >= spp->pgs_per_blk) {
-        NVMEV_ERROR("[WARNING] Block vpc out of range: vpc=%d, range=[0,%d)\n", 
+    if (blk->vpc < 0 || blk->vpc > spp->pgs_per_blk) {
+        NVMEV_ERROR("[WARNING] Block vpc out of range: vpc=%d, valid_range=[0,%d]\n", 
                    blk->vpc, spp->pgs_per_blk);
         if (blk->vpc < 0) blk->vpc = 0;
-        if (blk->vpc >= spp->pgs_per_blk) blk->vpc = spp->pgs_per_blk - 1;
+        if (blk->vpc > spp->pgs_per_blk) blk->vpc = spp->pgs_per_blk;
     }
     blk->vpc++;
     if (blk->vpc > spp->pgs_per_blk) {
@@ -1351,12 +1351,12 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         line = &lm->lines[ppa->g.blk];
         
         /* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-        if (line->vpc < 0 || line->vpc >= spp->pgs_per_lun_line) {
-            NVMEV_ERROR("[WARNING] SLC line vpc out of range: vpc=%d, range=[0,%d)\n", 
+        if (line->vpc < 0 || line->vpc > spp->pgs_per_lun_line) {
+            NVMEV_ERROR("[WARNING] SLC line vpc out of range: vpc=%d, valid_range=[0,%d]\n", 
                        line->vpc, spp->pgs_per_lun_line);
             /* 容错处理：复位为合理值 */
             if (line->vpc < 0) line->vpc = 0;
-            if (line->vpc >= spp->pgs_per_lun_line) line->vpc = spp->pgs_per_lun_line - 1;
+            if (line->vpc > spp->pgs_per_lun_line) line->vpc = spp->pgs_per_lun_line;
         }
         line->vpc++;
         if (line->vpc > spp->pgs_per_lun_line) {
@@ -1516,7 +1516,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
 {
     struct ssdparams *spp = &conv_ftl->ssd->sp;
-    struct line *victim_line = NULL;
+	struct line *victim_line = NULL;
     struct line *slc_victim = NULL;
     struct line *qlc_victim = NULL;
     struct line_mgmt *slc_lm = &conv_ftl->slc_lm;
@@ -1564,7 +1564,7 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
             slc_lm->victim_line_cnt--;
             spin_unlock(&conv_ftl->slc_lock);
             NVMEV_DEBUG("Selected SLC victim line %d (vpc=%d)\n", victim_line->id, victim_line->vpc);
-            return victim_line;
+	return victim_line;
         } else {
             /* 队列状态已改变，重新尝试 */
             spin_unlock(&conv_ftl->slc_lock);
@@ -1706,10 +1706,10 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
             /* 不修复！保持原有的物理block ID，问题在别处 */
         }
         
-        line->ipc = 0;
-        line->vpc = 0;
-        list_add_tail(&line->entry, &lm->free_line_list);
-        lm->free_line_cnt++;
+	line->ipc = 0;
+	line->vpc = 0;
+	list_add_tail(&line->entry, &lm->free_line_list);
+	lm->free_line_cnt++;
 
         spin_unlock(&conv_ftl->qlc_lock); // --- 解锁 ---
     }
@@ -1734,7 +1734,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	if (victim_line >= conv_ftl->slc_lm.lines && 
 	    victim_line < conv_ftl->slc_lm.lines + conv_ftl->slc_lm.tt_lines) {
 		/* SLC victim: 直接使用line ID */
-		ppa.g.blk = victim_line->id;
+	ppa.g.blk = victim_line->id;
 	} else {
 		/* QLC victim: line ID是数组索引，需要加上SLC偏移 */
 		ppa.g.blk = conv_ftl->slc_blks_per_pl + victim_line->id;
@@ -1780,20 +1780,20 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	 * 所有有效页都已搬走，现在擦除整个块并更新状态
 	 */
 	ppa.g.pg = 0; /* 重置页号 */
-	mark_block_free(conv_ftl, &ppa);
-	
+					mark_block_free(conv_ftl, &ppa);
+
 	/* 如果启用了GC延迟，执行实际的擦除操作 */
 	cpp = &conv_ftl->cp;
-	if (cpp->enable_gc_delay) {
-		struct nand_cmd gce = {
-			.type = GC_IO,
-			.cmd = NAND_ERASE,
-			.stime = 0,
-			.interleave_pci_dma = false,
-			.ppa = &ppa,
-		};
-		ssd_advance_nand(conv_ftl->ssd, &gce);
-	}
+					if (cpp->enable_gc_delay) {
+						struct nand_cmd gce = {
+							.type = GC_IO,
+							.cmd = NAND_ERASE,
+							.stime = 0,
+							.interleave_pci_dma = false,
+							.ppa = &ppa,
+						};
+						ssd_advance_nand(conv_ftl->ssd, &gce);
+					}
 
 	/* 更新line状态，将其放回空闲列表 */
 	mark_line_free(conv_ftl, &ppa);
@@ -2420,7 +2420,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
-	NVMEV_ERROR("[DEBUG] conv_write: Function entry\n");
+	/* NVMEV_DEBUG removed for performance */
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
 	struct conv_ftl *conv_ftl = &conv_ftls[0];
 
@@ -2468,8 +2468,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	}
 //66f1
 
-	NVMEV_ERROR("[DEBUG] conv_write: start_lpn=%lld, len=%lld, end_lpn=%lld, nr_parts=%u, tt_pgs=%ld\n", 
-	           start_lpn, nr_lba, end_lpn, nr_parts, spp->tt_pgs);
+	/* Debug logs removed for performance */
     if ((end_lpn / nr_parts) >= spp->tt_pgs) {
         NVMEV_ERROR("[DEBUG] conv_write: LPN RANGE CHECK FAILED - lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
                     start_lpn, spp->tt_pgs);
@@ -2575,12 +2574,12 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         
         /* 尝试获取SLC页面 */
         ppa = get_new_slc_page(conv_ftl);
-        if (!mapped_ppa(&ppa)) {
+            if (!mapped_ppa(&ppa)) {
             /* SLC空间不足，立即返回写入失败 */
             NVMEV_ERROR("SLC exhausted, write failed for LPN %lld - background migration needed\n", local_lpn);
-            ret->status = NVME_SC_WRITE_FAULT;
-            ret->nsecs_target = nsecs_latest;
-            return true;
+                ret->status = NVME_SC_WRITE_FAULT;
+                ret->nsecs_target = nsecs_latest;
+                return true;
         }
 
         /* 记录页面在 SLC 中 */
@@ -2588,8 +2587,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         conv_ftl->slc_write_cnt++;
 
 		/* 关键修复：在使用PPA之前显示调试信息 */
-		NVMEV_ERROR("[DEBUG] conv_write: Got PPA from get_new_slc_page: ch=%d, lun=%d, blk=%d, pg=%d (lpn=%lld)\n", 
-		           ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg, local_lpn);
+		/* Debug log removed for performance */
 
 //66f1
 
@@ -2617,8 +2615,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			swr.ppa = &ppa;
 			
 			/* 关键修复：在调用ssd_advance_nand之前显示PPA值 */
-			NVMEV_ERROR("[DEBUG] conv_write: About to call ssd_advance_nand with PPA: ch=%d, lun=%d, blk=%d, pg=%d (lpn=%lld, xfer_size=%u)\n", 
-			           ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg, local_lpn, xfer_size);
+			/* Debug log removed for performance */
 			           
 			/* 验证PPA合法性 */
 			if (!valid_ppa(conv_ftl, &ppa)) {
@@ -2642,7 +2639,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			swr.stime = nsecs_completed;
 			
 				/* 关键修复：在NAND写入完成后才推进写指针 */
-			NVMEV_ERROR("[DEBUG] conv_write: NAND write completed, now advancing SLC write pointer\n");
+			/* Debug log removed for performance */
 			advance_slc_write_pointer(conv_ftl);
             }
         }
@@ -2708,10 +2705,8 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
     /* C90: declarations must precede statements */
     struct nvme_command *cmd;
     
-    NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Function entry\n");
-    
     if (!ns || !ns->ftls || !req || !ret || !req->cmd) {
-        NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: NULL parameter check failed\n");
+        NVMEV_ERROR("conv_proc_nvme_io_cmd: NULL parameter check failed\n");
         if (ret) {
             ret->status = NVME_SC_INTERNAL;
             ret->nsecs_target = req ? req->nsecs_start : local_clock();
@@ -2729,26 +2724,20 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 		/* 继续处理，不崩溃系统 */
 	}
 
-	NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Processing opcode %d (%s)\n", 
-	           cmd->common.opcode, nvme_opcode_string(cmd->common.opcode));
-	
 	switch (cmd->common.opcode) {
 	case nvme_cmd_write:
-		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_write\n");
         if (!conv_write(ns, req, ret))
             return true; /* 出错也返回完成，状态在 ret 内 */
 		break;
 	case nvme_cmd_read:
-		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_read\n");
         if (!conv_read(ns, req, ret))
             return true; /* 出错也返回完成，状态在 ret 内 */
 		break;
 	case nvme_cmd_flush:
-		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_flush\n");
 		conv_flush(ns, req, ret);
 		break;
 	default:
-		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Unimplemented command: %s(%d)\n", 
+		NVMEV_ERROR("conv_proc_nvme_io_cmd: Unimplemented command: %s(%d)\n", 
 			   nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
 		break;
 	}
