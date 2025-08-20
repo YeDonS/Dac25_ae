@@ -190,20 +190,13 @@ static inline bool should_gc_high(struct conv_ftl *conv_ftl)
 
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
-	/* 使用READ_ONCE保证内存可见性，防止编译器优化 */
-	return READ_ONCE(conv_ftl->maptbl[lpn]);
+	return conv_ftl->maptbl[lpn];
 }
 
 static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
 {
-	/* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-	if (lpn >= conv_ftl->ssd->sp.tt_pgs) {
-		NVMEV_ERROR("[WARNING] LPN out of range: lpn=%lld >= tt_pgs=%ld\n", 
-			   lpn, conv_ftl->ssd->sp.tt_pgs);
-		return; /* 不更新映射表 */
-	}
-	/* 使用WRITE_ONCE保证原子写入，防止编译器重排 */
-	WRITE_ONCE(conv_ftl->maptbl[lpn], *ppa);
+	NVMEV_ASSERT(lpn < conv_ftl->ssd->sp.tt_pgs);
+	conv_ftl->maptbl[lpn] = *ppa;
 }
 
 static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -217,12 +210,7 @@ static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	pgidx = ppa->g.ch * spp->pgs_per_ch + ppa->g.lun * spp->pgs_per_lun +
 		ppa->g.pl * spp->pgs_per_pl + ppa->g.blk * spp->pgs_per_blk + ppa->g.pg;
 
-	/* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-	if (pgidx >= spp->tt_pgs) {
-		NVMEV_ERROR("[WARNING] Page index out of range: pgidx=%lld >= tt_pgs=%ld\n", 
-			   pgidx, spp->tt_pgs);
-		return INVALID_PPA; /* 返回无效索引 */
-	}
+	NVMEV_ASSERT(pgidx < spp->tt_pgs);
 
 	return pgidx;
 }
@@ -231,8 +219,7 @@ static inline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	uint64_t pgidx = ppa2pgidx(conv_ftl, ppa);
 
-	/* 使用READ_ONCE保证内存可见性 */
-	return READ_ONCE(conv_ftl->rmap[pgidx]);
+	return conv_ftl->rmap[pgidx];
 }
 
 /* set rmap[page_no(ppa)] -> lpn */
@@ -240,8 +227,7 @@ static inline void set_rmap_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 {
 	uint64_t pgidx = ppa2pgidx(conv_ftl, ppa);
 
-	/* 使用WRITE_ONCE保证原子写入 */
-	WRITE_ONCE(conv_ftl->rmap[pgidx], lpn);
+	conv_ftl->rmap[pgidx] = lpn;
 }
 
 static inline int victim_line_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
@@ -501,9 +487,7 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	}
 
     for (i = 0; i < spp->tt_pgs; i++) {
-		/* 使用WRITE_ONCE保证初始化的原子性 */
-		struct ppa unmapped_ppa = { .ppa = UNMAPPED_PPA };
-		WRITE_ONCE(conv_ftl->maptbl[i], unmapped_ppa);
+		conv_ftl->maptbl[i].ppa = UNMAPPED_PPA;
 	}
     conv_ftl->maptbl_initialized = true;
 }
@@ -526,8 +510,7 @@ static void init_rmap(struct conv_ftl *conv_ftl)
 	}
 
     for (i = 0; i < spp->tt_pgs; i++) {
-		/* 使用WRITE_ONCE保证初始化的原子性 */
-		WRITE_ONCE(conv_ftl->rmap[i], INVALID_LPN);
+		conv_ftl->rmap[i] = INVALID_LPN;
 	}
     conv_ftl->rmap_initialized = true;
 }
@@ -548,19 +531,6 @@ static int init_slc_qlc_blocks_with_retry(struct conv_ftl *conv_ftl, int max_ret
 	uint32_t total_blks_per_pl = spp->blks_per_pl;
 	int i, retry_count = 0;
 	
-	/* 关键检查：验证运行时参数与编译期参数的一致性 */
-	NVMEV_ERROR("[BOUNDARY_CHECK] Runtime vs Compile-time parameters:\n");
-	NVMEV_ERROR("[BOUNDARY_CHECK] spp->blks_per_pl=%d, BLKS_PER_PLN=%d\n", spp->blks_per_pl, BLKS_PER_PLN);
-	NVMEV_ERROR("[BOUNDARY_CHECK] spp->nchs=%d, NAND_CHANNELS=%d\n", spp->nchs, NAND_CHANNELS);
-	NVMEV_ERROR("[BOUNDARY_CHECK] spp->luns_per_ch=%d, LUNS_PER_NAND_CH=%d\n", spp->luns_per_ch, LUNS_PER_NAND_CH);
-	NVMEV_ERROR("[BOUNDARY_CHECK] spp->pls_per_lun=%d, PLNS_PER_LUN=%d\n", spp->pls_per_lun, PLNS_PER_LUN);
-	NVMEV_ERROR("[BOUNDARY_CHECK] spp->pgs_per_blk=%d\n", spp->pgs_per_blk);
-	
-	if (spp->blks_per_pl != BLKS_PER_PLN) {
-		NVMEV_ERROR("[CRITICAL] Runtime blks_per_pl=%d != Compile-time BLKS_PER_PLN=%d! This may cause Invalid PPA errors!\n", 
-			   spp->blks_per_pl, BLKS_PER_PLN);
-	}
-	
 	/* 重试分配内存 */
 	while (retry_count < max_retries) {
 		conv_ftl->is_slc_block = vmalloc(sizeof(bool) * total_blks_per_pl);
@@ -580,14 +550,8 @@ static int init_slc_qlc_blocks_with_retry(struct conv_ftl *conv_ftl, int max_ret
 			}
 			
 			conv_ftl->slc_initialized = true;
-			NVMEV_ERROR("[BOUNDARY_CHECK] Hybrid storage initialized successfully:\n");
-			NVMEV_ERROR("[BOUNDARY_CHECK] SLC blocks: %d (range: [0, %d))\n", 
-				   conv_ftl->slc_blks_per_pl, conv_ftl->slc_blks_per_pl);
-			NVMEV_ERROR("[BOUNDARY_CHECK] QLC blocks: %d (range: [%d, %d))\n", 
-				   conv_ftl->qlc_blks_per_pl, conv_ftl->slc_blks_per_pl, 
-				   conv_ftl->slc_blks_per_pl + conv_ftl->qlc_blks_per_pl);
-			NVMEV_ERROR("[BOUNDARY_CHECK] QLC region size: %d, QLC regions: %d\n", 
-				   conv_ftl->qlc_region_size, QLC_REGIONS);
+			NVMEV_INFO("SLC blocks: %d, QLC blocks: %d, QLC region size: %d\n",
+				   conv_ftl->slc_blks_per_pl, conv_ftl->qlc_blks_per_pl, conv_ftl->qlc_region_size);
 			return 0;
 		}
 		
@@ -840,25 +804,15 @@ static void init_qlc_lines(struct conv_ftl *conv_ftl)
 		return;
 	}
 	
-	NVMEV_ERROR("[DEBUG] init_qlc_lines: start_blk=%u, total_lines=%u, allocating lines with physical block IDs\n", 
-		   start_blk, total_qlc_lines);
-	
 	lm->free_line_cnt = 0;
 	for (i = 0; i < lm->tt_lines; i++) {
-		/* 关键修复：line->id 始终保持为物理block ID，永不更改 */
 		lm->lines[i] = (struct line) {
-			.id = start_blk + i,  /* 物理block ID: 1638, 1639, 1640, ... */
+			.id = i,  /* QLC使用数组索引作为内部ID，避免与SLC混淆 */
 			.ipc = 0,
 			.vpc = 0,
 			.pos = 0,
 			.entry = LIST_HEAD_INIT(lm->lines[i].entry),
 		};
-		
-		/* 验证物理block ID不超过硬件限制 */
-		if (lm->lines[i].id >= spp->blks_per_pl) {
-			NVMEV_ERROR("QLC line %d: physical block ID %u exceeds blks_per_pl %u!\n", 
-				   i, lm->lines[i].id, spp->blks_per_pl);
-		}
 		
 		list_add_tail(&lm->lines[i].entry, &lm->free_line_list);
 		lm->free_line_cnt++;
@@ -867,9 +821,6 @@ static void init_qlc_lines(struct conv_ftl *conv_ftl)
 	lm->victim_line_cnt = 0;
 	lm->full_line_cnt = 0;
 	conv_ftl->current_qlc_region = 0;
-	
-	NVMEV_ERROR("[DEBUG] QLC lines initialized: %u lines with block IDs %u-%u\n", 
-		   lm->tt_lines, start_blk, start_blk + lm->tt_lines - 1);
 }
 
 /* 清理函数 */
@@ -1065,36 +1016,16 @@ static inline bool valid_ppa(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	int pg = ppa->g.pg;
 	//int sec = ppa->g.sec;
 
-	if (ch < 0 || ch >= spp->nchs) {
-		NVMEV_ERROR("[mark_page_valid] Invalid PPA: ch=%d out of range [0, %d), runtime_nchs=%d\n", 
-			   ch, spp->nchs, spp->nchs);
+	if (ch < 0 || ch >= spp->nchs)
 		return false;
-	}
-	if (lun < 0 || lun >= spp->luns_per_ch) {
-		NVMEV_ERROR("[mark_page_valid] Invalid PPA: lun=%d out of range [0, %d), runtime_luns_per_ch=%d\n", 
-			   lun, spp->luns_per_ch, spp->luns_per_ch);
+	if (lun < 0 || lun >= spp->luns_per_ch)
 		return false;
-	}
-	if (pl < 0 || pl >= spp->pls_per_lun) {
-		NVMEV_ERROR("[mark_page_valid] Invalid PPA: pl=%d out of range [0, %d), runtime_pls_per_lun=%d\n", 
-			   pl, spp->pls_per_lun, spp->pls_per_lun);
+	if (pl < 0 || pl >= spp->pls_per_lun)
 		return false;
-	}
-	
-	/* 关键修复：使用运行时参数检查混合存储block ID范围 */
-	/* 注意：对于混合存储，我们的虚拟block ID可能超过物理blks_per_pl */
-	uint32_t max_blk_id = conv_ftl->slc_blks_per_pl + (conv_ftl->qlc_region_size * QLC_REGIONS) - 1;
-	if (blk < 0 || blk > max_blk_id) {
-		NVMEV_ERROR("[mark_page_valid] Invalid PPA: blk=%d out of hybrid_range [0, %u], runtime_blks_per_pl=%d, slc_blks=%u, qlc_regions=%u*%u\n", 
-			   blk, max_blk_id, spp->blks_per_pl, conv_ftl->slc_blks_per_pl, QLC_REGIONS, conv_ftl->qlc_region_size);
+	if (blk < 0 || blk >= spp->blks_per_pl)
 		return false;
-	}
-	
-	if (pg < 0 || pg >= spp->pgs_per_blk) {
-		NVMEV_ERROR("[mark_page_valid] Invalid PPA: pg=%d out of range [0, %d), runtime_pgs_per_blk=%d\n", 
-			   pg, spp->pgs_per_blk, spp->pgs_per_blk);
+	if (pg < 0 || pg >= spp->pgs_per_blk)
 		return false;
-	}
 
 	return true;
 }
@@ -1176,13 +1107,7 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         return;
     }
     
-    /* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-    if (blk->ipc < 0 || blk->ipc >= spp->pgs_per_blk) {
-        NVMEV_ERROR("[WARNING] Block ipc out of range: ipc=%d, range=[0,%d)\n", 
-                   blk->ipc, spp->pgs_per_blk);
-        if (blk->ipc < 0) blk->ipc = 0;
-        if (blk->ipc >= spp->pgs_per_blk) blk->ipc = spp->pgs_per_blk - 1;
-    }
+    NVMEV_ASSERT(blk->ipc >= 0 && blk->ipc < spp->pgs_per_blk);
     blk->ipc++;
     if (blk->vpc > 0) {
         blk->vpc--;
@@ -1322,13 +1247,7 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         NVMEV_ERROR("[mark_page_valid] Failed to get block structure\n");
         return;
     }
-    /* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-    if (blk->vpc < 0 || blk->vpc > spp->pgs_per_blk) {
-        NVMEV_ERROR("[WARNING] Block vpc out of range: vpc=%d, valid_range=[0,%d]\n", 
-                   blk->vpc, spp->pgs_per_blk);
-        if (blk->vpc < 0) blk->vpc = 0;
-        if (blk->vpc > spp->pgs_per_blk) blk->vpc = spp->pgs_per_blk;
-    }
+    NVMEV_ASSERT(blk->vpc >= 0 && blk->vpc < spp->pgs_per_blk);
     blk->vpc++;
     if (blk->vpc > spp->pgs_per_blk) {
         blk->vpc = spp->pgs_per_blk;
@@ -1349,15 +1268,7 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
         spin_lock(&conv_ftl->slc_lock); // --- SLC 加锁 ---
         line = &lm->lines[ppa->g.blk];
-        
-        /* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-        if (line->vpc < 0 || line->vpc > spp->pgs_per_lun_line) {
-            NVMEV_ERROR("[WARNING] SLC line vpc out of range: vpc=%d, valid_range=[0,%d]\n", 
-                       line->vpc, spp->pgs_per_lun_line);
-            /* 容错处理：复位为合理值 */
-            if (line->vpc < 0) line->vpc = 0;
-            if (line->vpc > spp->pgs_per_lun_line) line->vpc = spp->pgs_per_lun_line;
-        }
+        NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_lun_line);
         line->vpc++;
         if (line->vpc > spp->pgs_per_lun_line) {
             line->vpc = spp->pgs_per_lun_line;
@@ -1390,15 +1301,7 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
         spin_lock(&conv_ftl->qlc_lock); // --- QLC 加锁 ---
         line = &lm->lines[idx];
-        
-        /* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-        if (line->vpc < 0 || line->vpc >= spp->pgs_per_line) {
-            NVMEV_ERROR("[WARNING] QLC line vpc out of range: vpc=%d, range=[0,%d)\n", 
-                       line->vpc, spp->pgs_per_line);
-            /* 容错处理：复位为合理值 */
-            if (line->vpc < 0) line->vpc = 0;
-            if (line->vpc >= spp->pgs_per_line) line->vpc = spp->pgs_per_line - 1;
-        }
+        NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
         line->vpc++;
         if (line->vpc > spp->pgs_per_line) {
             line->vpc = spp->pgs_per_line;
@@ -1456,11 +1359,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	struct ppa new_ppa;
 	uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
 
-	/* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-	if (!valid_lpn(conv_ftl, lpn)) {
-		NVMEV_ERROR("[WARNING] Invalid LPN in GC: lpn=%lld\n", lpn);
-		return 0; /* 跳过无效页面 */
-	}
+	NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
 	
 	/* 
 	 * 
@@ -1516,7 +1415,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
 {
     struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct line *victim_line = NULL;
+    struct line *victim_line = NULL;
     struct line *slc_victim = NULL;
     struct line *qlc_victim = NULL;
     struct line_mgmt *slc_lm = &conv_ftl->slc_lm;
@@ -1564,7 +1463,7 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
             slc_lm->victim_line_cnt--;
             spin_unlock(&conv_ftl->slc_lock);
             NVMEV_DEBUG("Selected SLC victim line %d (vpc=%d)\n", victim_line->id, victim_line->vpc);
-	return victim_line;
+            return victim_line;
         } else {
             /* 队列状态已改变，重新尝试 */
             spin_unlock(&conv_ftl->slc_lock);
@@ -1689,27 +1588,20 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
         spin_lock(&conv_ftl->qlc_lock); // --- 对QLC加锁 ---
         
-        /* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-        if (idx >= lm->tt_lines) {
-            NVMEV_ERROR("[CRITICAL] QLC index out of range: idx=%u >= tt_lines=%u\n", 
-                       idx, lm->tt_lines);
-            spin_unlock(&conv_ftl->qlc_lock);
-            return;
-        }
+        NVMEV_ASSERT(idx < lm->tt_lines);
         line = &lm->lines[idx];
         
-        /* QLC line ID应该始终是物理block ID，不需要修复 */
-        uint32_t expected_physical_id = start_blk + idx;
-        if (line->id != expected_physical_id) {
-            NVMEV_ERROR("QLC line ID corruption detected: line->id=%u, expected_physical_id=%u, array_idx=%u\n", 
-                       line->id, expected_physical_id, idx);
-            /* 不修复！保持原有的物理block ID，问题在别处 */
+        /* 确保QLC line的内部ID保持为数组索引，不被物理block ID污染 */
+        if (line->id != idx) {
+            NVMEV_ERROR("QLC line ID corruption detected: line->id=%u, expected=%u, fixing...\n", 
+                       line->id, idx);
+            line->id = idx;  /* 修复损坏的ID */
         }
         
-	line->ipc = 0;
-	line->vpc = 0;
-	list_add_tail(&line->entry, &lm->free_line_list);
-	lm->free_line_cnt++;
+        line->ipc = 0;
+        line->vpc = 0;
+        list_add_tail(&line->entry, &lm->free_line_list);
+        lm->free_line_cnt++;
 
         spin_unlock(&conv_ftl->qlc_lock); // --- 解锁 ---
     }
@@ -1734,7 +1626,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	if (victim_line >= conv_ftl->slc_lm.lines && 
 	    victim_line < conv_ftl->slc_lm.lines + conv_ftl->slc_lm.tt_lines) {
 		/* SLC victim: 直接使用line ID */
-	ppa.g.blk = victim_line->id;
+		ppa.g.blk = victim_line->id;
 	} else {
 		/* QLC victim: line ID是数组索引，需要加上SLC偏移 */
 		ppa.g.blk = conv_ftl->slc_blks_per_pl + victim_line->id;
@@ -1780,20 +1672,20 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	 * 所有有效页都已搬走，现在擦除整个块并更新状态
 	 */
 	ppa.g.pg = 0; /* 重置页号 */
-					mark_block_free(conv_ftl, &ppa);
-
+	mark_block_free(conv_ftl, &ppa);
+	
 	/* 如果启用了GC延迟，执行实际的擦除操作 */
 	cpp = &conv_ftl->cp;
-					if (cpp->enable_gc_delay) {
-						struct nand_cmd gce = {
-							.type = GC_IO,
-							.cmd = NAND_ERASE,
-							.stime = 0,
-							.interleave_pci_dma = false,
-							.ppa = &ppa,
-						};
-						ssd_advance_nand(conv_ftl->ssd, &gce);
-					}
+	if (cpp->enable_gc_delay) {
+		struct nand_cmd gce = {
+			.type = GC_IO,
+			.cmd = NAND_ERASE,
+			.stime = 0,
+			.interleave_pci_dma = false,
+			.ppa = &ppa,
+		};
+		ssd_advance_nand(conv_ftl->ssd, &gce);
+	}
 
 	/* 更新line状态，将其放回空闲列表 */
 	mark_line_free(conv_ftl, &ppa);
@@ -1820,22 +1712,21 @@ static bool is_same_flash_page(struct conv_ftl *conv_ftl, struct ppa ppa1, struc
 	return (ppa1.h.blk_in_ssd == ppa2.h.blk_in_ssd) && (ppa1_page == ppa2_page);
 }
 
-/* 检查块是否为 SLC - 使用运行时参数替换编译期宏 */
+/* 检查块是否为 SLC - 带安全检查 */
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	
 	/* 检查初始化状态 */
 	if (!conv_ftl || !conv_ftl->slc_initialized || !conv_ftl->is_slc_block) {
 		NVMEV_ERROR("SLC blocks not properly initialized\n");
 		return false;  /* 默认返回false，避免误判 */
 	}
 	
-	/* 关键修复：使用运行时参数spp->blks_per_pl而不是编译期常量BLKS_PER_PLN */
-	/* 在多通道配置下，每个通道/LUN都有独立的block ID空间 */
-	if (blk_id >= spp->blks_per_pl) {
-		NVMEV_ERROR("Block ID out of range: %u >= %u (runtime blks_per_pl)\n", 
-		           blk_id, spp->blks_per_pl);
+	/* 在多通道配置下，每个通道/LUN都有独立的block ID空间 (0-8191)
+	 * SLC占用每个plane的前slc_blks_per_pl个block
+	 */
+	if (blk_id >= BLKS_PER_PLN) {
+		NVMEV_ERROR("Block ID out of range: %u >= %u (max per plane)\n", 
+		           blk_id, BLKS_PER_PLN);
 		return false;
 	}
 	
@@ -1870,27 +1761,26 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
             return (struct ppa){ .ppa = UNMAPPED_PPA };
         }
         
-        /* 关键修复：严格验证SLC line ID的合法性 - 输出运行时边界 */
-        uint32_t array_idx = curline - lm->lines;
-        NVMEV_ERROR("[DEBUG] get_new_slc_page: curline=%p, array_idx=%u, curline->id=%u\n", 
-                   curline, array_idx, curline->id);
-        NVMEV_ERROR("[DEBUG] Runtime boundaries: nchs=%d, luns_per_ch=%d, pls_per_lun=%d, blks_per_pl=%d, pgs_per_blk=%d\n", 
-                   spp->nchs, spp->luns_per_ch, spp->pls_per_lun, spp->blks_per_pl, spp->pgs_per_blk);
-        NVMEV_ERROR("[DEBUG] SLC config: slc_blks_per_pl=%u, total_slc_lines=%u\n", 
-                   conv_ftl->slc_blks_per_pl, lm->tt_lines);
-        
-        if (curline->id != array_idx || curline->id >= conv_ftl->slc_blks_per_pl) {
-            NVMEV_ERROR("[CRITICAL] SLC line ID corruption: curline->id=%u, array_idx=%u, slc_range=[0,%u), runtime_blks_per_pl=%d\n", 
-                       curline->id, array_idx, conv_ftl->slc_blks_per_pl, spp->blks_per_pl);
-            NVMEV_ERROR("[CRITICAL] Memory corruption detected! Clamping curline->id to valid range\n");
-            curline->id = array_idx;  /* 强制修复为数组索引 */
+        /* 添加调试信息 */
+        NVMEV_ERROR("[DEBUG] get_new_slc_page: Allocated SLC line with ID %u (range: [0, %u), total_lines=%u)\n", 
+                   curline->id, conv_ftl->slc_blks_per_pl, lm->tt_lines);
+        if (curline->id >= conv_ftl->slc_blks_per_pl) {
+            NVMEV_ERROR("[CRITICAL] get_new_slc_page: Allocated SLC line ID %u exceeds range [0, %u)\n", 
+                       curline->id, conv_ftl->slc_blks_per_pl);
+            NVMEV_ERROR("[CRITICAL] Line pointer: %p, lines array: %p, offset: %ld\n",
+                       curline, lm->lines, (long)(curline - lm->lines));
         }
 		
 		list_del_init(&curline->entry);
 		lm->free_line_cnt--;
 		
-		/* 使用修复后的ID */
+		/* 确保line ID在SLC范围内 */
 		uint32_t blk_id = curline->id;
+		if (blk_id >= conv_ftl->slc_blks_per_pl) {
+			NVMEV_ERROR("get_new_slc_page: SLC line ID %u exceeds range [0, %u), line may be corrupted\n", 
+				   blk_id, conv_ftl->slc_blks_per_pl);
+			blk_id = blk_id % conv_ftl->slc_blks_per_pl;  /* 取模确保在范围内 */
+		}
 		
 		*wp = (struct write_pointer) {
 			.curline = curline,
@@ -1956,24 +1846,24 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
         return;
     }
     
-    /* 关键修复：严格验证新分配SLC line ID的合法性 - 输出运行时边界 */
-    uint32_t array_idx = wp->curline - lm->lines;
-    NVMEV_ERROR("[DEBUG] advance_slc_write_pointer: curline=%p, array_idx=%u, curline->id=%u\n", 
-               wp->curline, array_idx, wp->curline->id);
-    NVMEV_ERROR("[DEBUG] Runtime boundaries: blks_per_pl=%d, slc_blks_per_pl=%u, slc_total_lines=%u\n", 
-               spp->blks_per_pl, conv_ftl->slc_blks_per_pl, lm->tt_lines);
-    
-    if (wp->curline->id != array_idx || wp->curline->id >= conv_ftl->slc_blks_per_pl) {
-        NVMEV_ERROR("[CRITICAL] SLC line ID corruption in advance: curline->id=%u, array_idx=%u, slc_range=[0,%u), runtime_blks_per_pl=%d\n", 
-                   wp->curline->id, array_idx, conv_ftl->slc_blks_per_pl, spp->blks_per_pl);
-        NVMEV_ERROR("[CRITICAL] Memory corruption detected! Clamping curline->id to valid range\n");
-        wp->curline->id = array_idx;  /* 强制修复为数组索引 */
+    /* 添加调试信息 */
+    NVMEV_DEBUG("advance_slc_write_pointer: Allocated new SLC line with ID %u\n", wp->curline->id);
+    if (wp->curline->id >= conv_ftl->slc_blks_per_pl) {
+        NVMEV_ERROR("advance_slc_write_pointer: Allocated SLC line ID %u exceeds range [0, %u)\n", 
+                   wp->curline->id, conv_ftl->slc_blks_per_pl);
     }
 		
 		list_del_init(&wp->curline->entry);
 		lm->free_line_cnt--;
 		
-		wp->blk = wp->curline->id;  /* 使用修复后的ID */
+		wp->blk = wp->curline->id;
+		
+		/* 确保块号在SLC范围内 */
+		if (wp->blk >= conv_ftl->slc_blks_per_pl) {
+			NVMEV_ERROR("advance_slc_write_pointer: SLC block ID %u exceeds range [0, %u), line ID may be corrupted\n", 
+				   wp->blk, conv_ftl->slc_blks_per_pl);
+			wp->blk = wp->blk % conv_ftl->slc_blks_per_pl;  /* 取模确保在范围内 */
+		}
 		
 		wp->pg = 0;
         spin_unlock(&conv_ftl->slc_lock);
@@ -2026,21 +1916,11 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
         list_del_init(&curline->entry);
         lm->free_line_cnt--;
         
-        /* 验证QLC line ID是否为合法的物理block ID - 输出运行时边界 */
-        uint32_t start_blk = conv_ftl->slc_blks_per_pl;
-        uint32_t array_idx = curline - lm->lines;
-        NVMEV_ERROR("[DEBUG] get_new_qlc_page: curline=%p, array_idx=%u, curline->id=%u, expected_physical_id=%u\n", 
-                   curline, array_idx, curline->id, start_blk + array_idx);
-        NVMEV_ERROR("[DEBUG] QLC Runtime boundaries: start_blk=%u, qlc_range=[%u, %u), runtime_blks_per_pl=%d\n", 
-                   start_blk, start_blk, start_blk + lm->tt_lines, spp->blks_per_pl);
-        
-        if (curline->id < start_blk || curline->id >= (start_blk + lm->tt_lines)) {
-            NVMEV_ERROR("[CRITICAL] QLC line physical block ID %u out of valid range [%u, %u), runtime_blks_per_pl=%d\n", 
-                       curline->id, start_blk, start_blk + lm->tt_lines, spp->blks_per_pl);
-            NVMEV_ERROR("[CRITICAL] QLC Memory corruption detected! Clamping to valid physical block ID\n");
-            curline->id = start_blk + array_idx;  /* 强制修复为正确的物理block ID */
-            NVMEV_ERROR("[CRITICAL] Emergency fix: corrected to physical block ID %u (array_idx=%u)\n", 
-                       curline->id, array_idx);
+        /* 验证QLC line ID的合法性 */
+        if (curline->id >= lm->tt_lines) {
+            NVMEV_ERROR("QLC line ID %u exceeds range [0, %u), fixing to array index...\n", 
+                       curline->id, lm->tt_lines);
+            curline->id = curline - lm->lines;  /* 使用指针差值作为正确的索引 */
         }
         
         /* 初始化写指针 - 为每个区域分配不同的起始位置 */
@@ -2049,12 +1929,9 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
             .ch = region_id % spp->nchs,
             .lun = (region_id / spp->nchs) % spp->luns_per_ch,
             .pg = 0,
-            .blk = curline->id,  /* 使用物理block ID */
+            .blk = conv_ftl->slc_blks_per_pl + curline->id,  /* QLC物理block ID = SLC数量 + QLC索引 */
             .pl = 0,
         };
-        
-        NVMEV_ERROR("[DEBUG] QLC region %u initialized: curline=%p, physical_blk=%u\n", 
-                   region_id, curline, curline->id);
         spin_unlock(&conv_ftl->qlc_lock);
     }
     
@@ -2146,28 +2023,14 @@ static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_
 	list_del_init(&wp->curline->entry);
 	lm->free_line_cnt--;
 	
-	    /* 验证QLC line ID是合法的物理block ID - 输出运行时边界 */
-    uint32_t start_blk = conv_ftl->slc_blks_per_pl;
-    uint32_t array_idx = wp->curline - lm->lines;
-    NVMEV_ERROR("[DEBUG] advance_qlc_write_pointer: curline=%p, array_idx=%u, curline->id=%u, expected_physical_id=%u\n", 
-               wp->curline, array_idx, wp->curline->id, start_blk + array_idx);
-    NVMEV_ERROR("[DEBUG] QLC advance Runtime boundaries: start_blk=%u, qlc_range=[%u, %u), runtime_blks_per_pl=%d\n", 
-               start_blk, start_blk, start_blk + lm->tt_lines, spp->blks_per_pl);
-    
-    if (wp->curline->id < start_blk || wp->curline->id >= (start_blk + lm->tt_lines)) {
-        NVMEV_ERROR("[CRITICAL] advance_qlc_write_pointer: QLC line physical block ID %u out of range [%u, %u), runtime_blks_per_pl=%d\n",
-                   wp->curline->id, start_blk, start_blk + lm->tt_lines, spp->blks_per_pl);
-        NVMEV_ERROR("[CRITICAL] QLC advance Memory corruption detected! Clamping to valid physical block ID\n");
-        wp->curline->id = start_blk + array_idx;  /* 强制修复为正确的物理block ID */
-        NVMEV_ERROR("[CRITICAL] Emergency fix: corrected to physical block ID %u (array_idx=%u)\n",
-                   wp->curline->id, array_idx);
-    }
+	/* 验证QLC line ID的合法性 */
+	if (wp->curline->id >= lm->tt_lines) {
+		NVMEV_ERROR("advance_qlc_write_pointer: QLC line ID %u exceeds range [0, %u), fixing...\n", 
+			   wp->curline->id, lm->tt_lines);
+		wp->curline->id = wp->curline - lm->lines;  /* 使用指针差值作为正确的索引 */
+	}
 	
-	/* 直接使用物理block ID，不需要再次计算 */
-	wp->blk = wp->curline->id;
-	
-	NVMEV_ERROR("[DEBUG] advance_qlc_write_pointer: region=%u, new_physical_blk=%u\n", 
-		   region_id, wp->blk);
+	wp->blk = conv_ftl->slc_blks_per_pl + wp->curline->id;  /* QLC物理block ID = SLC数量 + QLC索引 */
     spin_unlock(&conv_ftl->qlc_lock);
 	
 out:
@@ -2420,7 +2283,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
-	/* NVMEV_DEBUG removed for performance */
+	NVMEV_ERROR("[DEBUG] conv_write: Function entry\n");
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
 	struct conv_ftl *conv_ftl = &conv_ftls[0];
 
@@ -2468,7 +2331,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	}
 //66f1
 
-	/* Debug logs removed for performance */
+	NVMEV_ERROR("[DEBUG] conv_write: start_lpn=%lld, len=%lld, end_lpn=%lld, nr_parts=%u, tt_pgs=%ld\n", 
+	           start_lpn, nr_lba, end_lpn, nr_parts, spp->tt_pgs);
     if ((end_lpn / nr_parts) >= spp->tt_pgs) {
         NVMEV_ERROR("[DEBUG] conv_write: LPN RANGE CHECK FAILED - lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
                     start_lpn, spp->tt_pgs);
@@ -2574,20 +2438,19 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         
         /* 尝试获取SLC页面 */
         ppa = get_new_slc_page(conv_ftl);
-            if (!mapped_ppa(&ppa)) {
+        if (!mapped_ppa(&ppa)) {
             /* SLC空间不足，立即返回写入失败 */
             NVMEV_ERROR("SLC exhausted, write failed for LPN %lld - background migration needed\n", local_lpn);
-                ret->status = NVME_SC_WRITE_FAULT;
-                ret->nsecs_target = nsecs_latest;
-                return true;
+            ret->status = NVME_SC_WRITE_FAULT;
+            ret->nsecs_target = nsecs_latest;
+            return true;
         }
 
         /* 记录页面在 SLC 中 */
         conv_ftl->page_in_slc[local_lpn] = true;
         conv_ftl->slc_write_cnt++;
 
-		/* 关键修复：在使用PPA之前显示调试信息 */
-		/* Debug log removed for performance */
+		//NVMEV_ERROR("PPA: ch:%d, lun:%d, blk:%d, pg:%d \n", ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg );
 
 //66f1
 
@@ -2598,6 +2461,12 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		set_rmap_ent(conv_ftl, local_lpn, &ppa);
 
 		mark_page_valid(conv_ftl, &ppa);
+
+		/* need to advance the write pointer here */
+		//need branch
+//66f1
+        /* 使用 SLC 的 Die Affinity 推进写指针 */
+        advance_slc_write_pointer(conv_ftl);
 
 		nsecs_completed = ssd_advance_write_buffer(conv_ftl->ssd, nsecs_latest, conv_ftl->ssd->sp.pgsz);
 
@@ -2613,23 +2482,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 			/* 使用 SLC 写延迟 */
 			write_lat = conv_ftl->ssd->sp.pg_wr_lat;
 			swr.ppa = &ppa;
-			
-			/* 关键修复：在调用ssd_advance_nand之前显示PPA值 */
-			/* Debug log removed for performance */
-			           
-			/* 验证PPA合法性 */
-			if (!valid_ppa(conv_ftl, &ppa)) {
-			    NVMEV_ERROR("[FATAL] Invalid PPA detected before ssd_advance_nand! Aborting write.\n");
-			    ret->status = NVME_SC_WRITE_FAULT;
-			    return true;
-			}
-			           
 			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &swr);
-			
-			/* 验证NAND写入结果 */
-			if (nsecs_completed == swr.stime) {
-			    NVMEV_ERROR("[WARNING] ssd_advance_nand returned same timestamp - possible PPA validation failure\n");
-			}
 			/* 异步释放写缓冲，避免后续分配失败 */
 			enqueue_writeback_io_req(req->sq_id, nsecs_completed, wbuf, xfer_size);
 			/* schedule_internal_operation 暂时注释掉，函数不存在 */
@@ -2637,10 +2490,6 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 			//xfer_size = 0;
 			swr.stime = nsecs_completed;
-			
-				/* 关键修复：在NAND写入完成后才推进写指针 */
-			/* Debug log removed for performance */
-			advance_slc_write_pointer(conv_ftl);
             }
         }
 
@@ -2705,8 +2554,10 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
     /* C90: declarations must precede statements */
     struct nvme_command *cmd;
     
+    NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Function entry\n");
+    
     if (!ns || !ns->ftls || !req || !ret || !req->cmd) {
-        NVMEV_ERROR("conv_proc_nvme_io_cmd: NULL parameter check failed\n");
+        NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: NULL parameter check failed\n");
         if (ret) {
             ret->status = NVME_SC_INTERNAL;
             ret->nsecs_target = req ? req->nsecs_start : local_clock();
@@ -2716,28 +2567,28 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
     }
     
     cmd = req->cmd;
-	
-	/* 关键修复：避免致命的BUG_ON，改为警告和容错处理 */
-	if (ns->csi != NVME_CSI_NVM) {
-		NVMEV_ERROR("[WARNING] Unexpected namespace CSI: expected %d, got %d\n", 
-			   NVME_CSI_NVM, ns->csi);
-		/* 继续处理，不崩溃系统 */
-	}
+	NVMEV_ASSERT(ns->csi == NVME_CSI_NVM);
 
+	NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Processing opcode %d (%s)\n", 
+	           cmd->common.opcode, nvme_opcode_string(cmd->common.opcode));
+	
 	switch (cmd->common.opcode) {
 	case nvme_cmd_write:
+		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_write\n");
         if (!conv_write(ns, req, ret))
             return true; /* 出错也返回完成，状态在 ret 内 */
 		break;
 	case nvme_cmd_read:
+		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_read\n");
         if (!conv_read(ns, req, ret))
             return true; /* 出错也返回完成，状态在 ret 内 */
 		break;
 	case nvme_cmd_flush:
+		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_flush\n");
 		conv_flush(ns, req, ret);
 		break;
 	default:
-		NVMEV_ERROR("conv_proc_nvme_io_cmd: Unimplemented command: %s(%d)\n", 
+		NVMEV_ERROR("[DEBUG] conv_proc_nvme_io_cmd: Unimplemented command: %s(%d)\n", 
 			   nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
 		break;
 	}
