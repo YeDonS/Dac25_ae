@@ -108,8 +108,13 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
     static uint64_t cursor2 = 0;
     uint64_t idx;
 
-    if (!conv_ftl->page_in_slc || !ht || !ht->last_access_time || max_pages == 0)
+    NVMEV_ERROR("[MIGRATION_DEBUG] migrate_some_cold_from_slc called: max_pages=%u\n", max_pages);
+    
+    if (!conv_ftl->page_in_slc || !ht || !ht->last_access_time || max_pages == 0) {
+        NVMEV_ERROR("[MIGRATION_DEBUG] Early return: page_in_slc=%p, ht=%p, last_access_time=%p, max_pages=%u\n",
+                   conv_ftl->page_in_slc, ht, ht ? ht->last_access_time : NULL, max_pages);
         return;
+    }
 
     now = __get_ioclock(conv_ftl->ssd);
     idx = cursor2 % spp->tt_pgs;
@@ -131,9 +136,14 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
             if (is_cold) {
                 struct ppa old_ppa = get_maptbl_ent(conv_ftl, idx);
                 if (mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk)) {
+                    NVMEV_ERROR("[MIGRATION_DEBUG] Found cold page to migrate: lpn=%llu, ppa=ch%d,lun%d,blk%d,pg%d\n",
+                               idx, old_ppa.g.ch, old_ppa.g.lun, old_ppa.g.blk, old_ppa.g.pg);
                     /* 执行单页迁移 */
                     migrate_page_to_qlc(conv_ftl, idx, &old_ppa);
                     migrated++;
+                } else {
+                    NVMEV_ERROR("[MIGRATION_DEBUG] Cold page not suitable: lpn=%llu, mapped=%d, is_slc=%d\n",
+                               idx, mapped_ppa(&old_ppa), mapped_ppa(&old_ppa) ? is_slc_block(conv_ftl, old_ppa.g.blk) : 0);
                 }
             }
         }
@@ -143,6 +153,8 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
     }
     
     cursor2 = idx;
+    
+    NVMEV_ERROR("[MIGRATION_DEBUG] Migration attempt complete: scanned=%u, migrated=%u\n", scanned, migrated);
     
     if (migrated > 0) {
         NVMEV_DEBUG("Migrated %d pages from SLC to QLC\n", migrated);
@@ -785,11 +797,15 @@ static void init_qlc_lines(struct conv_ftl *conv_ftl)
 	
 	/* 初始化单个共享的 QLC line 管理器 */
 	lm->tt_lines = total_qlc_lines;
+	NVMEV_ERROR("[QLC_INIT_DEBUG] Initializing QLC lines: total_lines=%u, start_blk=%u\n", 
+		   lm->tt_lines, start_blk);
+	
 	lm->lines = vmalloc(sizeof(struct line) * lm->tt_lines);
 	if (!lm->lines) {
 		NVMEV_ERROR("Failed to allocate QLC lines memory\n");
 		return;
 	}
+	NVMEV_ERROR("[QLC_INIT_DEBUG] QLC lines memory allocated successfully: %p\n", lm->lines);
 	
 	INIT_LIST_HEAD(&lm->free_line_list);
 	INIT_LIST_HEAD(&lm->full_line_list);
@@ -816,6 +832,30 @@ static void init_qlc_lines(struct conv_ftl *conv_ftl)
 		
 		list_add_tail(&lm->lines[i].entry, &lm->free_line_list);
 		lm->free_line_cnt++;
+	}
+	
+	NVMEV_ERROR("[QLC_INIT_DEBUG] QLC lines initialized: total=%u, free_count=%u, all added to free_line_list\n", 
+		   lm->tt_lines, lm->free_line_cnt);
+	
+	/* 验证QLC页面初始状态 - 检查前几个页面 */
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	int check_pages = 10;  /* 检查前10个页面 */
+	NVMEV_ERROR("[QLC_INIT_DEBUG] Checking initial page status for first %d QLC pages:\n", check_pages);
+	
+	for (int check_i = 0; check_i < check_pages && check_i < spp->pgs_per_blk; check_i++) {
+		struct ppa check_ppa;
+		check_ppa.ppa = 0;
+		check_ppa.g.ch = 0;
+		check_ppa.g.lun = 0;
+		check_ppa.g.blk = conv_ftl->slc_blks_per_pl;  /* 第一个QLC block */
+		check_ppa.g.pg = check_i;
+		check_ppa.g.pl = 0;
+		
+		struct nand_page *check_pg = get_pg(conv_ftl->ssd, &check_ppa);
+		if (check_pg) {
+			NVMEV_ERROR("[QLC_INIT_DEBUG] QLC page %d status: %d (should be %d=PG_FREE)\n", 
+				   check_i, check_pg->status, PG_FREE);
+		}
 	}
 	
 	lm->victim_line_cnt = 0;
@@ -1908,7 +1948,9 @@ static struct ppa get_new_qlc_page(struct conv_ftl *conv_ftl, uint32_t region_id
         struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
         
         if (!curline) {
-            NVMEV_ERROR("No free QLC line available in region %d!\n", region_id);
+            NVMEV_ERROR("[QLC_DEBUG] No free QLC line available in region %d!\n", region_id);
+            NVMEV_ERROR("[QLC_DEBUG] QLC status: free_line_cnt=%u, tt_lines=%u\n", 
+                       lm->free_line_cnt, lm->tt_lines);
             spin_unlock(&conv_ftl->qlc_lock);
             return (struct ppa){ .ppa = UNMAPPED_PPA };
         }
@@ -1952,14 +1994,17 @@ retry_get_page:
     }
     
     if (pg->status != PG_FREE) {
-        NVMEV_WARN("QLC page not FREE: status=%d at ch=%d,lun=%d,blk=%d,pg=%d\n", 
+        NVMEV_ERROR("[QLC_DEBUG] QLC page not FREE: status=%d at ch=%d,lun=%d,blk=%d,pg=%d\n", 
                    pg->status, ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
+        NVMEV_ERROR("[QLC_DEBUG] Write pointer state: ch=%u, lun=%u, pg=%u, blk=%u, pl=%u\n",
+                   wp->ch, wp->lun, wp->pg, wp->blk, wp->pl);
         
         /* 推进写指针并重试 */
         if (advance_qlc_write_pointer(conv_ftl, region_id) == 0) {
+            NVMEV_ERROR("[QLC_DEBUG] Advanced write pointer, retrying...\n");
             goto retry_get_page;
         } else {
-            NVMEV_ERROR("Cannot advance write pointer\n");
+            NVMEV_ERROR("[QLC_DEBUG] Cannot advance write pointer\n");
             return (struct ppa){ .ppa = UNMAPPED_PPA };
         }
     }
@@ -2099,7 +2144,13 @@ static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
     /* 获取 QLC 新页面 */
     new_ppa = get_new_qlc_page(conv_ftl, region);
     if (!mapped_ppa(&new_ppa)) {
-        NVMEV_ERROR("Failed to get QLC page for migration\n");
+        NVMEV_ERROR("[MIGRATION_DEBUG] Failed to get QLC page for migration, region=%u\n", region);
+        /* 检查QLC状态 */
+        spin_lock(&conv_ftl->qlc_lock);
+        uint32_t qlc_free = conv_ftl->qlc_lm.free_line_cnt;
+        uint32_t qlc_total = conv_ftl->qlc_lm.tt_lines;
+        spin_unlock(&conv_ftl->qlc_lock);
+        NVMEV_ERROR("[MIGRATION_DEBUG] QLC status: free_lines=%u, total_lines=%u\n", qlc_free, qlc_total);
         return;
     }
     
@@ -2764,6 +2815,9 @@ static int background_migration_thread(void *data)
 			break;
 		
 		/* 执行迁移直到SLC使用率降到低水位线以下 */
+		int consecutive_failures = 0;
+		const int MAX_FAILURES = 10;
+		
 		while (atomic_read(&conv_ftl->migration_needed) && 
 		       !kthread_should_stop() && 
 		       !conv_ftl->threads_should_stop) {
@@ -2781,10 +2835,27 @@ static int background_migration_thread(void *data)
 				break;
 			}
 			
+			/* 记录迁移前的计数 */
+			uint32_t old_migration_cnt = conv_ftl->migration_cnt;
+			
 			/* 执行一批迁移操作 */
-			NVMEV_ERROR("[DEBUG] Background migration working: free_lines=%u, target=%u\n", 
-			          slc_free_lines, conv_ftl->slc_low_watermark);
+			NVMEV_ERROR("[DEBUG] Background migration working: free_lines=%u, target=%u, used_lines=%u, failures=%d\n", 
+			          slc_free_lines, conv_ftl->slc_low_watermark, slc_used_lines, consecutive_failures);
 			migrate_some_cold_from_slc(conv_ftl, 16);
+			
+			/* 检查是否真正迁移了数据 */
+			if (conv_ftl->migration_cnt == old_migration_cnt) {
+				consecutive_failures++;
+				NVMEV_ERROR("[DEBUG] Migration failed, consecutive failures: %d/%d\n", 
+					   consecutive_failures, MAX_FAILURES);
+				if (consecutive_failures >= MAX_FAILURES) {
+					NVMEV_ERROR("[ERROR] Migration failed %d times consecutively, stopping to prevent infinite loop\n", MAX_FAILURES);
+					atomic_set(&conv_ftl->migration_needed, 0);
+					break;
+				}
+			} else {
+				consecutive_failures = 0;  /* 重置失败计数 */
+			}
 			
 			/* 让出CPU，避免独占 */
 			cond_resched();
