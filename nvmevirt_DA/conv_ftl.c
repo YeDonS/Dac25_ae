@@ -3,8 +3,7 @@
 
 #include <linux/sched/clock.h>
 #include <linux/delay.h>
-#include <linux/kthread.h>
-#include <linux/wait.h>
+/* kthread/waitqueue no longer needed (threads removed) */
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -24,16 +23,16 @@ static inline bool mapped_ppa(struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *slc_ppa);
 static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id);
+/* QLC GC 专用薄包装：与普通 QLC 写一致，但读写 qlc_gc_wp[] */
+static struct ppa get_new_qlc_gc_page(struct conv_ftl *conv_ftl, uint32_t region_id);
+static int advance_qlc_gc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id);
 static void advance_slc_write_pointer(struct conv_ftl *conv_ftl);
 static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
+/* 新增：GC 专用 SLC 写指针函数声明（仅在本文件使用） */
+static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl);
+static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl);
 
-/* 后台线程函数声明 */
-static int background_migration_thread(void *data);
-static int background_gc_thread(void *data);
-static void init_background_threads(struct conv_ftl *conv_ftl);
-static void stop_background_threads(struct conv_ftl *conv_ftl);
-static void wakeup_migration_thread(struct conv_ftl *conv_ftl);
-static void wakeup_gc_thread(struct conv_ftl *conv_ftl);
+/* 后台线程已移除（同步模式） */
 
 /* 当 SLC 空闲低于阈值时，挑选一小批"冷数据"从 SLC 迁移到 QLC。
  * 最小改动：线性扫描有限数量 LPN，命中条件：page_in_slc && 冷（时间 >1s 且访问计数 < 阈值）。
@@ -278,26 +277,10 @@ static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
 {
 	struct write_flow_control *wfc = &(conv_ftl->wfc);
 	if (wfc->write_credits <= 0) {
-		/* 触发后台GC而不是前台阻塞GC */
-		uint32_t slc_free, qlc_free, total_free_lines;
-		
-		/* 分步读取避免同时持有两个锁 */
-		spin_lock(&conv_ftl->slc_lock);
-		slc_free = conv_ftl->slc_lm.free_line_cnt;
-		spin_unlock(&conv_ftl->slc_lock);
-		
-		spin_lock(&conv_ftl->qlc_lock);
-		qlc_free = conv_ftl->qlc_lm.free_line_cnt;
-		spin_unlock(&conv_ftl->qlc_lock);
-		
-		total_free_lines = slc_free + qlc_free;
-		
-		if (total_free_lines <= conv_ftl->gc_high_watermark) {
-			wakeup_gc_thread(conv_ftl);
-		}
-		
-		/* 临时增加少量credit以避免完全阻塞，后台GC会逐步释放更多空间 */
-		wfc->write_credits += 10;  /* 允许少量写入继续进行 */
+		/* 前台小步 GC：避免后台线程，快速释放少量行 */
+		forground_gc(conv_ftl);
+		/* 小额补充信用，允许写入继续推进 */
+		wfc->write_credits += 10;
 	}
 }
 
@@ -433,9 +416,10 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	/* 旧的写指针推进逻辑已废弃 - 现在使用 SLC/QLC 特定的推进逻辑 */
 	/* 这个函数主要被 GC 调用，我们需要根据 io_type 选择合适的推进方式 */
 	
-	/* 对于 GC，我们暂时使用 SLC 推进逻辑 */
+	/* 对于 GC，使用 GC 专用的 SLC 写指针推进逻辑 (gc_wp) */
 	if (io_type == GC_IO) {
-		advance_slc_write_pointer(conv_ftl);
+		/* DEPRECATED (old): advance_slc_write_pointer(conv_ftl); */
+		advance_gc_slc_write_pointer(conv_ftl);
 	} else {
 		/* 对于用户 IO，应该通过 conv_write 中的逻辑来处理 */
 		NVMEV_DEBUG("advance_write_pointer called with USER_IO - should use SLC/QLC specific logic\n");
@@ -731,7 +715,48 @@ static void init_migration_mgmt(struct conv_ftl *conv_ftl)
     spin_lock_init(&conv_ftl->slc_lock);
     spin_lock_init(&conv_ftl->qlc_lock);
 }
+/* 仅采样前后各2个块，用于判断是否"开机即VALID" */
+static void scan_range_stats_once(struct conv_ftl *conv_ftl,
+		                                  uint32_t start_blk, uint32_t end_blk,
+						                                    const char *tag)
+{
+	    struct ssd *ssd = conv_ftl->ssd;
+	    struct ssdparams *spp = &ssd->sp;
+            int ch, lun, blk, pg, scanned_blks = 0;
+            int free_cnt = 0, valid_cnt = 0, invalid_cnt = 0;
 
+	    if (end_blk > spp->blks_per_pl)
+				            end_blk = spp->blks_per_pl;
+
+			        /* 采样：起始2个块 + 末尾2个块（若范围足够大） */
+			        for (ch = 0; ch < (int)spp->nchs; ch++) {
+					        for (lun = 0; lun < (int)spp->luns_per_ch; lun++) {
+							            uint32_t cand[4];
+								                int n = 0;
+
+										            cand[n++] = start_blk;
+											                if (start_blk + 1 < end_blk) cand[n++] = start_blk + 1;
+													            if (end_blk > start_blk + 2) {
+															                    cand[n++] = end_blk - 1;
+																	                    if (end_blk - 2 > start_blk) cand[n++] = end_blk - 2;
+																			                }
+
+														                for ( ; n > 0; n--) {
+																	                uint32_t b = cand[n-1];
+																			                struct nand_block *blk_ptr = &ssd->ch[ch].lun[lun].pl[0].blk[b];
+																					                scanned_blks++;
+																							                for (pg = 0; pg < (int)spp->pgs_per_blk; pg++) {
+																										                    int st = blk_ptr->pg[pg].status;
+																												                        if (st == PG_FREE) free_cnt++;
+																															                    else if (st == PG_VALID) valid_cnt++;
+																																	                        else if (st == PG_INVALID) invalid_cnt++;
+																																				                }
+																									            }
+						    }
+
+				    NVMEV_ERROR("[INIT_SCAN] %s: scanned_blks=%d free=%d valid=%d invalid=%d (range [%u,%u))\n",
+						                    tag, scanned_blks, free_cnt, valid_cnt, invalid_cnt, start_blk, end_blk);
+}
 /* 初始化 SLC line 管理 */
 static void init_slc_lines(struct conv_ftl *conv_ftl)
 {
@@ -784,6 +809,8 @@ static void init_slc_lines(struct conv_ftl *conv_ftl)
 	
 	lm->victim_line_cnt = 0;
 	lm->full_line_cnt = 0;
+	scan_range_stats_once(conv_ftl, 0, conv_ftl->slc_blks_per_pl, "SLC");
+
 }
 
 /* 初始化 QLC line 管理 */
@@ -838,11 +865,11 @@ static void init_qlc_lines(struct conv_ftl *conv_ftl)
 		   lm->tt_lines, lm->free_line_cnt);
 	
 	/* 验证QLC页面初始状态 - 检查前几个页面 */
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	//struct ssdparams *spp = &conv_ftl->ssd->sp;
 	int check_pages = 10;  /* 检查前10个页面 */
 	NVMEV_ERROR("[QLC_INIT_DEBUG] Checking initial page status for first %d QLC pages:\n", check_pages);
-	
-	for (int check_i = 0; check_i < check_pages && check_i < spp->pgs_per_blk; check_i++) {
+	int check_i;
+	for (check_i = 0; check_i < check_pages && check_i < spp->pgs_per_blk; check_i++) {
 		struct ppa check_ppa;
 		check_ppa.ppa = 0;
 		check_ppa.g.ch = 0;
@@ -861,6 +888,8 @@ static void init_qlc_lines(struct conv_ftl *conv_ftl)
 	lm->victim_line_cnt = 0;
 	lm->full_line_cnt = 0;
 	conv_ftl->current_qlc_region = 0;
+	scan_range_stats_once(conv_ftl, conv_ftl->slc_blks_per_pl,
+			                      conv_ftl->ssd->sp.blks_per_pl, "QLC");
 }
 
 /* 清理函数 */
@@ -934,9 +963,27 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 	init_write_flow_control(conv_ftl);
 
-	/* 初始化后台线程 */
-	NVMEV_INFO("initialize background threads\n");
-	init_background_threads(conv_ftl);
+	/* 直接初始化水位线（无后台线程） */
+	{
+		uint32_t slc_total = conv_ftl->slc_lm.tt_lines;
+		uint32_t total_lines = conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines;
+		conv_ftl->slc_high_watermark = slc_total * 80 / 100;
+		conv_ftl->slc_low_watermark = slc_total * 70 / 100;
+		conv_ftl->gc_high_watermark = total_lines * 90 / 100;
+		conv_ftl->gc_low_watermark = total_lines * 80 / 100;
+		/* 初始化 QLC GC 写指针为 0（首用时延迟初始化） */
+		{
+			uint32_t i;
+			for (i = 0; i < QLC_REGIONS; i++) {
+				conv_ftl->qlc_gc_wp[i].curline = NULL;
+				conv_ftl->qlc_gc_wp[i].ch = 0;
+				conv_ftl->qlc_gc_wp[i].lun = 0;
+				conv_ftl->qlc_gc_wp[i].pg = 0;
+				conv_ftl->qlc_gc_wp[i].blk = 0;
+				conv_ftl->qlc_gc_wp[i].pl = 0;
+			}
+		}
+	}
 
 	NVMEV_INFO("Init FTL Instance with %d channels(%ld pages)\n", conv_ftl->ssd->sp.nchs,
 		   conv_ftl->ssd->sp.tt_pgs);
@@ -948,8 +995,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
-	/* 首先停止后台线程 */
-	stop_background_threads(conv_ftl);
+	/* 无后台线程可停止（同步模式） */
 	
     remove_lines(conv_ftl);
 	
@@ -1278,7 +1324,7 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
     if (pg->status != PG_FREE) {
         NVMEV_WARN("[mark_page_valid] Page not FREE: status=%d at ch=%d,lun=%d,blk=%d,pg=%d\n",
                    pg->status, ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
-        /* 根据实际需求决定是否继续 */
+        return;/* 根据实际需求决定是否继续 */
     }
     pg->status = PG_VALID;
 
@@ -1398,30 +1444,41 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	struct convparams *cpp = &conv_ftl->cp;
 	struct ppa new_ppa;
 	uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
+	bool old_in_slc;
 
 	NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
 	
-	/* 
-	 * 
-	 * 让GC的数据也写入到SLC中，使用和用户写入完全相同的页面分配和指针推进逻辑。
-	 * 这确保了数据流向的一致性，避免使用未初始化的gc_wp指针。
-	 */
-	new_ppa = get_new_slc_page(conv_ftl);
-	if (!mapped_ppa(&new_ppa)) {
-		NVMEV_ERROR("gc_write_page: Failed to get new SLC page. GC cannot proceed.\n");
-		/* 这是一个严重问题，意味着SLC和GC都卡住了 */
-		return 0; /* 返回0表示没有延迟，但实际上是失败了 */
+	/* 媒体自适应整理：SLC victim→SLC(gc_wp)，QLC victim→QLC(qlc_wp[region]) */
+	old_in_slc = is_slc_block(conv_ftl, old_ppa->g.blk);
+	if (old_in_slc) {
+		/* SLC → SLC via gc_wp (DEPRECATED old behavior: using slc_wp) */
+		new_ppa = get_new_gc_slc_page(conv_ftl);
+		if (!mapped_ppa(&new_ppa)) {
+			NVMEV_ERROR("gc_write_page: Failed to get new SLC page (gc_wp).\n");
+			return 0;
+		}
+		/* update maptbl/rmap */
+		set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+		set_rmap_ent(conv_ftl, lpn, &new_ppa);
+		mark_page_valid(conv_ftl, &new_ppa);
+		/* 推进 GC 专用 SLC 写指针 */
+		advance_gc_slc_write_pointer(conv_ftl);
+	} else {
+		/* QLC GC：使用独立的 qlc_gc_wp[] 序列 */
+		uint32_t region_id = conv_ftl->current_qlc_region;
+		conv_ftl->current_qlc_region = (conv_ftl->current_qlc_region + 1) % QLC_REGIONS;
+		new_ppa = get_new_qlc_gc_page(conv_ftl, region_id);
+		if (!mapped_ppa(&new_ppa)) {
+			NVMEV_ERROR("gc_write_page: Failed to get new QLC GC page (region=%u).\n", region_id);
+			return 0;
+		}
+		set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+		set_rmap_ent(conv_ftl, lpn, &new_ppa);
+		mark_page_valid(conv_ftl, &new_ppa);
+		if (advance_qlc_gc_write_pointer(conv_ftl, region_id) != 0) {
+			NVMEV_ERROR("gc_write_page: advance_qlc_gc_write_pointer failed (region=%u).\n", region_id);
+		}
 	}
-	
-	/* update maptbl */
-	set_maptbl_ent(conv_ftl, lpn, &new_ppa);
-	/* update rmap */
-	set_rmap_ent(conv_ftl, lpn, &new_ppa);
-
-	mark_page_valid(conv_ftl, &new_ppa);
-
-	/* 使用SLC的写指针推进逻辑 */
-	advance_slc_write_pointer(conv_ftl);
 
 	if (cpp->enable_gc_delay) {
 		struct nand_cmd gcw = {
@@ -1438,15 +1495,6 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 
 		ssd_advance_nand(conv_ftl->ssd, &gcw);
 	}
-
-	/* advance per-ch gc_endtime as well */
-#if 0
-	new_ch = get_ch(conv_ftl, &new_ppa);
-	new_ch->gc_endtime = new_ch->next_ch_avail_time;
-
-	new_lun = get_lun(conv_ftl, &new_ppa);
-	new_lun->gc_endtime = new_lun->next_lun_avail_time;
-#endif
 
 	return 0;
 }
@@ -1780,6 +1828,7 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	struct write_pointer *wp = &conv_ftl->slc_wp;
+	struct nand_page *pg;
 	if (!conv_ftl || !conv_ftl->slc_lm.lines) {
 	        NVMEV_ERROR("SLC lines not initialized\n");
 	        return (struct ppa){ .ppa = UNMAPPED_PPA };
@@ -1834,6 +1883,7 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 	}
 	
     /* 获取当前页 */
+retry_get_page:
     ppa.ppa = 0;
     ppa.g.ch = wp->ch;
     ppa.g.lun = wp->lun;
@@ -1842,7 +1892,13 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
     /* 在我们的设计中，SLC 占用前面的块(0-1637)，所以相对块号就是绝对块号 */
     ppa.g.blk = wp->blk;
     ppa.g.pl = wp->pl;
-    
+    pg = get_pg(conv_ftl->ssd, &ppa);
+    if (!pg) return (struct ppa){ .ppa = UNMAPPED_PPA };
+
+    if (pg->status != PG_FREE) {
+	        advance_slc_write_pointer(conv_ftl);
+		    goto retry_get_page;
+    }
     /* 添加调试信息以追踪块号 */
     if (ppa.g.blk >= conv_ftl->slc_blks_per_pl) {
         NVMEV_ERROR("get_new_slc_page: Generated invalid SLC block %u >= %u\n", 
@@ -1924,6 +1980,104 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl)
 			   wp->blk, conv_ftl->slc_blks_per_pl);
 		wp->blk = 0;
 	}
+}
+
+/* 新增：GC 专用 SLC 页面获取（使用 gc_wp 与 slc_lm） */
+static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl)
+{
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct ppa ppa;
+    struct write_pointer *wp = &conv_ftl->gc_wp;
+    struct nand_page *pg;
+    if (!conv_ftl || !conv_ftl->slc_lm.lines) {
+        NVMEV_ERROR("GC SLC lines not initialized\n");
+        return (struct ppa){ .ppa = UNMAPPED_PPA };
+    }
+    if (!wp || (!wp->curline && list_empty(&conv_ftl->slc_lm.free_line_list))) {
+        NVMEV_ERROR("GC SLC write pointer not ready and no free SLC line\n");
+        return (struct ppa){ .ppa = UNMAPPED_PPA };
+    }
+    /* 如果 GC SLC 写指针未初始化，初始化它 */
+    if (!wp->curline) {
+        spin_lock(&conv_ftl->slc_lock);
+        {
+            struct line_mgmt *lm = &conv_ftl->slc_lm;
+            struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+            if (!curline) {
+                NVMEV_ERROR("No free SLC line available for GC!\n");
+                spin_unlock(&conv_ftl->slc_lock);
+                return (struct ppa){ .ppa = UNMAPPED_PPA };
+            }
+            list_del_init(&curline->entry);
+            lm->free_line_cnt--;
+            *wp = (struct write_pointer) {
+                .curline = curline,
+                .ch = conv_ftl->lunpointer % spp->nchs,
+                .lun = conv_ftl->lunpointer / spp->nchs,
+                .pg = 0,
+                .blk = curline->id,
+                .pl = 0,
+            };
+        }
+        spin_unlock(&conv_ftl->slc_lock);
+    }
+
+retry_gc_get_page:
+    ppa.ppa = 0;
+    ppa.g.ch = wp->ch;
+    ppa.g.lun = wp->lun;
+    ppa.g.pg = wp->pg;
+    ppa.g.blk = wp->blk;
+    ppa.g.pl = wp->pl;
+    pg = get_pg(conv_ftl->ssd, &ppa);
+    if (!pg) return (struct ppa){ .ppa = UNMAPPED_PPA };
+    if (pg->status != PG_FREE) {
+        /* 页面非空，推进 GC 写指针后重试 */
+        advance_gc_slc_write_pointer(conv_ftl);
+        goto retry_gc_get_page;
+    }
+    return ppa;
+}
+
+/* 新增：GC 专用 SLC 写指针推进（使用 gc_wp 与 slc_lm） */
+static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl)
+{
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct line_mgmt *lm = &conv_ftl->slc_lm;
+    struct write_pointer *wp = &conv_ftl->gc_wp;
+    if (!wp || !wp->curline) {
+        NVMEV_ERROR("advance_gc_slc_write_pointer: GC SLC WP not initialized\n");
+        return;
+    }
+    wp->pg++;
+    if (wp->pg >= spp->pgs_per_blk) {
+        spin_lock(&conv_ftl->slc_lock);
+        if (wp->curline->vpc == spp->pgs_per_lun_line) {
+            list_add_tail(&wp->curline->entry, &lm->full_line_list);
+            lm->full_line_cnt++;
+        } else {
+            pqueue_insert(lm->victim_line_pq, wp->curline);
+            lm->victim_line_cnt++;
+        }
+        wp->curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+        if (!wp->curline) {
+            NVMEV_ERROR("No free SLC line available for GC!\n");
+            wp->curline = NULL;
+            spin_unlock(&conv_ftl->slc_lock);
+            return;
+        }
+        list_del_init(&wp->curline->entry);
+        lm->free_line_cnt--;
+        wp->blk = wp->curline->id;
+        wp->pg = 0;
+        spin_unlock(&conv_ftl->slc_lock);
+    }
+    /* GC 沿用与 SLC 写同样的 die 轮询策略 */
+    conv_ftl->lunpointer++;
+    if (conv_ftl->lunpointer >= (spp->nchs * spp->luns_per_ch))
+        conv_ftl->lunpointer = 0;
+    wp->ch = conv_ftl->lunpointer % spp->nchs;
+    wp->lun = conv_ftl->lunpointer / spp->nchs;
 }
 
 /* 获取 QLC 的新页面 - 使用多区域并发*/
@@ -2012,6 +2166,58 @@ retry_get_page:
     return ppa;
 }
 
+/* 获取 QLC GC 的新页面 - 读写 qlc_gc_wp[region]，其余与 QLC 写逻辑一致 */
+static struct ppa get_new_qlc_gc_page(struct conv_ftl *conv_ftl, uint32_t region_id)
+{
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct ppa ppa;
+    struct write_pointer *wp = &conv_ftl->qlc_gc_wp[region_id];
+    struct nand_page *pg;
+    if (!conv_ftl || region_id >= QLC_REGIONS) {
+        NVMEV_ERROR("Invalid parameters: conv_ftl=%p, region_id=%u\n", conv_ftl, region_id);
+        return (struct ppa){ .ppa = UNMAPPED_PPA };
+    }
+    if (!wp->curline) {
+        spin_lock(&conv_ftl->qlc_lock);
+        {
+            struct line_mgmt *lm = &conv_ftl->qlc_lm;
+            struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+            if (!curline) {
+                NVMEV_ERROR("[QLC_GC] No free QLC line available in region %u!\n", region_id);
+                spin_unlock(&conv_ftl->qlc_lock);
+                return (struct ppa){ .ppa = UNMAPPED_PPA };
+            }
+            list_del_init(&curline->entry);
+            lm->free_line_cnt--;
+            *wp = (struct write_pointer) {
+                .curline = curline,
+                .ch = region_id % spp->nchs,
+                .lun = (region_id / spp->nchs) % spp->luns_per_ch,
+                .pg = 0,
+                .blk = conv_ftl->slc_blks_per_pl + curline->id,
+                .pl = 0,
+            };
+        }
+        spin_unlock(&conv_ftl->qlc_lock);
+    }
+
+retry_gc_get_page:
+    ppa.ppa = 0;
+    ppa.g.ch = wp->ch;
+    ppa.g.lun = wp->lun;
+    ppa.g.pg = wp->pg;
+    ppa.g.blk = wp->blk;
+    ppa.g.pl = wp->pl;
+    pg = get_pg(conv_ftl->ssd, &ppa);
+    if (!pg) return (struct ppa){ .ppa = UNMAPPED_PPA };
+    if (pg->status != PG_FREE) {
+        if (advance_qlc_gc_write_pointer(conv_ftl, region_id) == 0)
+            goto retry_gc_get_page;
+        return (struct ppa){ .ppa = UNMAPPED_PPA };
+    }
+    return ppa;
+}
+
 /* 推进 QLC 写指针 - 使用多区域并发 
  * 返回值: 0=成功, -1=失败 */
 static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id)
@@ -2019,7 +2225,7 @@ static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct line_mgmt *lm = &conv_ftl->qlc_lm;
 	struct write_pointer *wp = &conv_ftl->qlc_wp[region_id];
-	uint32_t qlc_pgs_per_blk = spp->pgs_per_blk * 4;
+	uint32_t qlc_pgs_per_blk = spp->pgs_per_blk;
 	
 	wp->pg++;
 	
@@ -2080,6 +2286,67 @@ static int advance_qlc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_
 	
 out:
 	return 0;
+}
+
+/* 推进 QLC GC 写指针 - 与普通 QLC 写推进一致，但读写 qlc_gc_wp[] */
+static int advance_qlc_gc_write_pointer(struct conv_ftl *conv_ftl, uint32_t region_id)
+{
+    struct ssdparams *spp = &conv_ftl->ssd->sp;
+    struct line_mgmt *lm = &conv_ftl->qlc_lm;
+    struct write_pointer *wp = &conv_ftl->qlc_gc_wp[region_id];
+    uint32_t qlc_pgs_per_blk = spp->pgs_per_blk;
+
+    wp->pg++;
+    if ((wp->pg % spp->pgs_per_oneshotpg) != 0)
+        goto out;
+
+    wp->pg -= spp->pgs_per_oneshotpg;
+    wp->ch++;
+    if (wp->ch != spp->nchs)
+        goto out;
+
+    wp->ch = 0;
+    wp->lun++;
+    if (wp->lun != spp->luns_per_ch)
+        goto out;
+
+    wp->lun = 0;
+    wp->pg += spp->pgs_per_oneshotpg;
+
+    if (wp->pg != qlc_pgs_per_blk)
+        goto out;
+
+    /* block 满，换新行 */
+    wp->pg = 0;
+
+    spin_lock(&conv_ftl->qlc_lock);
+    if (wp->curline->vpc == qlc_pgs_per_blk * spp->nchs * spp->luns_per_ch) {
+        list_add_tail(&wp->curline->entry, &lm->full_line_list);
+        lm->full_line_cnt++;
+    } else {
+        pqueue_insert(lm->victim_line_pq, wp->curline);
+        lm->victim_line_cnt++;
+    }
+
+    wp->curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+    if (!wp->curline) {
+        NVMEV_ERROR("[QLC_GC] No free QLC line available in region %u!\n", region_id);
+        wp->curline = NULL;
+        spin_unlock(&conv_ftl->qlc_lock);
+        return -1;
+    }
+
+    list_del_init(&wp->curline->entry);
+    lm->free_line_cnt--;
+    if (wp->curline->id >= lm->tt_lines) {
+        NVMEV_ERROR("advance_qlc_gc_write_pointer: QLC line ID %u out of range [0,%u)\n", wp->curline->id, lm->tt_lines);
+        wp->curline->id = wp->curline - lm->lines;
+    }
+    wp->blk = conv_ftl->slc_blks_per_pl + wp->curline->id;
+    spin_unlock(&conv_ftl->qlc_lock);
+
+out:
+    return 0;
 }
 
 /* 更新热数据信息 */
@@ -2391,7 +2658,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         ret->nsecs_target = req->nsecs_start;
         return true; /* Return completion with error to avoid host timeout */
     }
-
+/*
     allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
 	NVMEV_ERROR("[DEBUG] conv_write: buffer alloc size = %u, needed = %llu\n", allocated_buf_size, LBA_TO_BYTE(nr_lba));
     if (allocated_buf_size < LBA_TO_BYTE(nr_lba)) {
@@ -2399,9 +2666,30 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
                     allocated_buf_size, LBA_TO_BYTE(nr_lba));
         ret->status = NVME_SC_WRITE_FAULT;
         ret->nsecs_target = req->nsecs_start;
-        return true; /* Complete with error */
-    }
+        return true;  Complete with error */
+    
+          
+    {		            /* 等待-重试分配写缓冲，避免缓冲区暂满即失败（C90：在块起始声明变量） */
+        uint64_t needed = LBA_TO_BYTE(nr_lba);
+        int wb_retry = 0;
+	const int WB_MAX_RETRIES = 1000; /* 约100ms */
+	const int WB_RETRY_US = 100;
 
+retry_alloc_write_buffer:
+	allocated_buf_size = buffer_allocate(wbuf, needed);
+	NVMEV_ERROR("[DEBUG] conv_write: buffer alloc size = %u, needed = %llu\n", allocated_buf_size, needed);
+	if (allocated_buf_size < needed) {
+	    if (wb_retry < WB_MAX_RETRIES) {
+		wb_retry++;
+		udelay(WB_RETRY_US);
+		goto retry_alloc_write_buffer;						   						                }
+	    NVMEV_ERROR("[DEBUG] conv_write: BUFFER ALLOCATION FAILED after retries (%u < %llu)\n",
+		                        allocated_buf_size, needed);
+	    ret->status = NVME_SC_WRITE_FAULT;
+	    ret->nsecs_target = req->nsecs_start;
+	    return true; /* Complete with error */
+      	}
+   }
 	nsecs_latest = ssd_advance_write_buffer(conv_ftl->ssd, req->nsecs_start, LBA_TO_BYTE(nr_lba));
 	nsecs_xfer_completed = nsecs_latest;
 
@@ -2482,9 +2770,10 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         NVMEV_ERROR("[DEBUG] SLC status: free_lines=%u, used_lines=%u, high_watermark=%u, total=%u\n", 
                    slc_free_lines, slc_used_lines, conv_ftl->slc_high_watermark, conv_ftl->slc_lm.tt_lines);
         if (slc_used_lines >= conv_ftl->slc_high_watermark) {
-            NVMEV_ERROR("[DEBUG] SLC usage high (%u >= %u), triggering background migration\n", 
+            NVMEV_ERROR("[DEBUG] SLC usage high (%u >= %u), migrating some cold pages synchronously\n", 
                       slc_used_lines, conv_ftl->slc_high_watermark);
-            wakeup_migration_thread(conv_ftl);
+            /* DEPRECATED: wakeup_migration_thread(conv_ftl); */
+            migrate_some_cold_from_slc(conv_ftl, 8);
         }
         
         /* 尝试获取SLC页面 */
@@ -2795,6 +3084,7 @@ static void cleanup_on_alloc_failure(struct conv_ftl *conv_ftl)
 	conv_ftl->heat_track_initialized = false;
 }
 
+#if 0
 /* ======================== 后台线程实现 ======================== */
 
 /* 后台迁移线程 */
@@ -2923,6 +3213,7 @@ static int background_gc_thread(void *data)
 }
 
 /* 初始化后台线程 */
+/* DEPRECATED: background threads are not used in synchronous GC/migration mode */
 static void init_background_threads(struct conv_ftl *conv_ftl)
 {
 	/* 
@@ -2972,6 +3263,7 @@ static void init_background_threads(struct conv_ftl *conv_ftl)
 }
 
 /* 停止后台线程 */
+/* DEPRECATED: background threads are not used in synchronous GC/migration mode */
 static void stop_background_threads(struct conv_ftl *conv_ftl)
 {
 	conv_ftl->threads_should_stop = true;
@@ -2995,6 +3287,7 @@ static void stop_background_threads(struct conv_ftl *conv_ftl)
 }
 
 /* 唤醒迁移线程 */
+/* DEPRECATED: background threads are not used in synchronous GC/migration mode */
 static void wakeup_migration_thread(struct conv_ftl *conv_ftl)
 {
 	NVMEV_ERROR("[DEBUG] Waking up migration thread\n");
@@ -3003,8 +3296,10 @@ static void wakeup_migration_thread(struct conv_ftl *conv_ftl)
 }
 
 /* 唤醒GC线程 */
+/* DEPRECATED: background threads are not used in synchronous GC/migration mode */
 static void wakeup_gc_thread(struct conv_ftl *conv_ftl)
 {
 	atomic_set(&conv_ftl->gc_needed, 1);
 	wake_up_interruptible(&conv_ftl->gc_wq);
 }
+#endif /* background threads removed */
