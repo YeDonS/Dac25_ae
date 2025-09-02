@@ -725,7 +725,7 @@ static void scan_range_stats_once(struct conv_ftl *conv_ftl,
             int ch, lun, blk, pg, scanned_blks = 0;
             int free_cnt = 0, valid_cnt = 0, invalid_cnt = 0;
 
-	    if (end_blk > spp->blks_per_pl)
+	    if (end_blk > spp->blks_per_pl){
 				            end_blk = spp->blks_per_pl;
 
 			        /* 采样：起始2个块 + 末尾2个块（若范围足够大） */
@@ -753,9 +753,11 @@ static void scan_range_stats_once(struct conv_ftl *conv_ftl,
 																																				                }
 																									            }
 						    }
-
+						}
 				    NVMEV_ERROR("[INIT_SCAN] %s: scanned_blks=%d free=%d valid=%d invalid=%d (range [%u,%u))\n",
 						                    tag, scanned_blks, free_cnt, valid_cnt, invalid_cnt, start_blk, end_blk);
+
+										}
 }
 /* 初始化 SLC line 管理 */
 static void init_slc_lines(struct conv_ftl *conv_ftl)
@@ -971,6 +973,19 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		conv_ftl->slc_low_watermark = slc_total * 70 / 100;
 		conv_ftl->gc_high_watermark = total_lines * 90 / 100;
 		conv_ftl->gc_low_watermark = total_lines * 80 / 100;
+
+		/* 新增：按池 GC 的 free 行阈值：高阈值触发，低阈值停止
+		 * 触发：15%（高），停止：20%（低）
+		 */
+		{
+			uint32_t slc_total = conv_ftl->slc_lm.tt_lines;
+			uint32_t qlc_total = conv_ftl->qlc_lm.tt_lines;
+			conv_ftl->slc_gc_free_thres_high = (slc_total * 15) / 100;
+			conv_ftl->slc_gc_free_thres_low  = (slc_total * 20) / 100;
+			conv_ftl->qlc_gc_free_thres_high = (qlc_total * 15) / 100;
+			conv_ftl->qlc_gc_free_thres_low  = (qlc_total * 20) / 100;
+		}
+
 		/* 初始化 QLC GC 写指针为 0（首用时延迟初始化） */
 		{
 			uint32_t i;
@@ -1499,8 +1514,8 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	return 0;
 }
 
-/* 选择最佳的受害者line，优先选择SLC中无效页最多的line */
-static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
+/* 选择最佳的受害者line，支持定向池选择（SLC/QLC/ANY） */
+static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force, int target_pool)
 {
     struct ssdparams *spp = &conv_ftl->ssd->sp;
     struct line *victim_line = NULL;
@@ -1529,8 +1544,16 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
     }
     spin_unlock(&conv_ftl->qlc_lock);
     
-    /* 步骤2: 选择策略 - 优先SLC，然后比较无效页数量 */
-    if (slc_suitable && qlc_suitable) {
+    /* 步骤2: 选择策略（支持定向池选择） */
+    if (target_pool == 1) { /* SLC */
+        if (!slc_suitable)
+            return NULL;
+        victim_line = slc_victim;
+    } else if (target_pool == 2) { /* QLC */
+        if (!qlc_suitable)
+            return NULL;
+        victim_line = qlc_victim;
+    } else if (slc_suitable && qlc_suitable) {
         /* 两者都合适，选择无效页更多的 */
         victim_line = (slc_victim->vpc <= qlc_victim->vpc) ? slc_victim : qlc_victim;
     } else if (slc_suitable) {
@@ -1556,7 +1579,7 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
             /* 队列状态已改变，重新尝试 */
             spin_unlock(&conv_ftl->slc_lock);
             NVMEV_DEBUG("SLC victim queue changed, retrying...\n");
-            return select_victim_line(conv_ftl, force); /* 递归重试 */
+            return select_victim_line(conv_ftl, force, target_pool); /* 递归重试 */
         }
     } else { /* victim_line == qlc_victim */
         spin_lock(&conv_ftl->qlc_lock);
@@ -1572,7 +1595,7 @@ static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
             /* 队列状态已改变，重新尝试 */
             spin_unlock(&conv_ftl->qlc_lock);
             NVMEV_DEBUG("QLC victim queue changed, retrying...\n");
-            return select_victim_line(conv_ftl, force); /* 递归重试 */
+            return select_victim_line(conv_ftl, force, target_pool); /* 递归重试 */
         }
     }
 }
@@ -1695,7 +1718,7 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
     }
 }
 
-static int do_gc(struct conv_ftl *conv_ftl, bool force)
+static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 {
 	struct line *victim_line = NULL;
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -1704,7 +1727,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	bool in_slc;
 	struct convparams *cpp;
 
-	victim_line = select_victim_line(conv_ftl, force);
+	victim_line = select_victim_line(conv_ftl, force, target_pool);
 	if (!victim_line) {
 		NVMEV_DEBUG("do_gc: No suitable victim line found.\n");
 		return -1;
@@ -1783,11 +1806,19 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 static void forground_gc(struct conv_ftl *conv_ftl)
 {
+	/* 优先保障 SLC：当 SLC free 行数过低时，仅清 SLC 受害者 */
+	if (should_gc_slc_high(conv_ftl)) {
+		do_gc(conv_ftl, true, 1);
+		return;
+	}
+	/* 其次保障 QLC：当 QLC free 行数过低时，仅清 QLC 受害者 */
+	if (should_gc_qlc_high(conv_ftl)) {
+		do_gc(conv_ftl, true, 2);
+		return;
+	}
+	/* 兜底：总剩余过低时，任意清理 */
 	if (should_gc_high(conv_ftl)) {
-		NVMEV_DEBUG("should_gc_high passed");
-		NVMEV_ERROR("should_gc_high passed, FGGC");
-		/* perform GC here until !should_gc(conv_ftl) */
-		do_gc(conv_ftl, true);
+		do_gc(conv_ftl, true, 0);
 	}
 }
 
@@ -3198,7 +3229,7 @@ static int background_gc_thread(void *data)
 			}
 			
 			/* 执行一次GC */
-			if (do_gc(conv_ftl, false) < 0) {
+			if (do_gc(conv_ftl, false, 0) < 0) {
 				/* 没有合适的受害者，稍作等待 */
 				msleep(10);
 			}
