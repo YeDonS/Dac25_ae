@@ -35,7 +35,15 @@ bool buffer_release(struct buffer *buf, size_t size)
 {
 	while (!spin_trylock(&buf->lock))
 		;
-	buf->remaining += size;
+	{
+		size_t headroom = buf->size - buf->remaining;
+		if (size > headroom) {
+			NVMEV_ERROR("buffer_release: request %zu exceeds headroom %zu\n",
+				   size, headroom);
+			size = headroom;
+		}
+		buf->remaining += size;
+	}
 	spin_unlock(&buf->lock);
 
 	return true;

@@ -502,19 +502,44 @@ int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 
 void nvmev_proc_io_cq(int cqid, int new_db, int old_db)
 {
-	struct nvmev_completion_queue *cq = nvmev_vdev->cqes[cqid];
+	struct nvmev_completion_queue *cq;
 	int i;
-	for (i = old_db; i != new_db; i++) {
-		if (i >= cq->queue_size) {
-			i = -1;
-			continue;
+
+	if (cqid < 0 || cqid > NR_MAX_IO_QUEUE)
+		return;
+
+	cq = nvmev_vdev->cqes[cqid];
+	if (unlikely(!cq))
+		return;
+
+	if (unlikely(cq->queue_size <= 0))
+		return;
+	if (unlikely(old_db < 0 || old_db >= cq->queue_size))
+		old_db = cq->cq_tail >= 0 ? (cq->cq_tail + 1) % cq->queue_size : 0;
+	if (unlikely(new_db < 0 || new_db >= cq->queue_size))
+		new_db = old_db;
+
+	i = old_db;
+	while (i != new_db) {
+		uint16_t sqid = cq_entry(i).sq_id;
+		if (sqid <= NR_MAX_IO_QUEUE) {
+			struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
+			if (likely(sq)) {
+				sq->stat.nr_in_flight--;
+			} else {
+				NVMEV_ERROR("[%s] sq null (cqid=%d idx=%d sqid=%u)\n",
+					     __FUNCTION__, cqid, i, sqid);
+				break;
+			}
+		} else {
+			NVMEV_ERROR("[%s] sqid out of range (cqid=%d idx=%d sqid=%u)\n",
+				 __FUNCTION__, cqid, i, sqid);
+			break;
 		}
-		nvmev_vdev->sqes[cq_entry(i).sq_id]->stat.nr_in_flight--;
+		i = (i + 1) % cq->queue_size;
 	}
 
-	cq->cq_tail = new_db - 1;
-	if (new_db == -1)
-		cq->cq_tail = cq->queue_size - 1;
+	cq->cq_tail = (new_db == 0) ? (cq->queue_size - 1) : (new_db - 1);
 }
 
 static void __fill_cq_result(struct nvmev_proc_table *proc_entry)

@@ -73,7 +73,7 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 	if (request_time_offs >= NR_CREDIT_ENTRIES) {
 		NVMEV_ERROR("[%s] Need to increase array size 0x%llx 0x%llx 0x%x\n", __FUNCTION__,
 			    request_time, cur_time, request_time_offs);
-		return request_time; // return minimum delay
+		return request_time + (ch->xfer_lat * units_to_xfer);
 	}
 
 	pos = (ch->head + request_time_offs) % NR_CREDIT_ENTRIES;
@@ -99,6 +99,8 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 			} else {
 				NVMEV_ERROR("[%s] No free entry 0x%llx 0x%llx 0x%x\n", __FUNCTION__,
 					    request_time, cur_time, request_time_offs);
+				/* clamp to maximum regulated delay */
+				remaining_credits = 0;
 				break;
 			}
 		} else
