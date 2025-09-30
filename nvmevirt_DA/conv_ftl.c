@@ -3,6 +3,7 @@
 
 #include <linux/sched/clock.h>
 #include <linux/delay.h>
+#include <linux/atomic.h>
 /* kthread/waitqueue no longer needed (threads removed) */
 
 #include "nvmev.h"
@@ -31,6 +32,8 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
 /* 新增：GC 专用 SLC 写指针函数声明（仅在本文件使用） */
 static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl);
+
+static atomic_t fggc_throttle = ATOMIC_INIT(0);
 
 /* 后台线程已移除（同步模式） */
 
@@ -2675,9 +2678,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 	uint64_t plba = 0;
 	uint64_t plpn = 0;
-    uint64_t requested_bytes = LBA_TO_BYTE(nr_lba);
-    uint64_t released_bytes = 0;
-    uint64_t stripe_bytes = 0;
+	uint64_t stripe_bytes = 0;
 //66f1
 
 	struct nand_cmd swr = {
@@ -2824,27 +2825,23 @@ retry_alloc_write_buffer:
             /* DEPRECATED: wakeup_migration_thread(conv_ftl); */
             migrate_some_cold_from_slc(conv_ftl, 8);
         }
-        /* 新增：SLC free 低于阈值时，立即触发前台 GC（定向 SLC） */
-       if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-           NVMEV_ERROR("FGGC: SLC free=%u <= thres_high=%u, running SLC GC now\n",
-			                 slc_free_lines, conv_ftl->slc_gc_free_thres_high);
-	   forground_gc(conv_ftl);
-       }	   
+        /* SLC free 低于阈值时尝试触发前台 GC，按固定频率节流 */
+        if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+            int ticket = atomic_inc_return(&fggc_throttle);
+
+            if ((ticket & 0x3F) == 0) {
+                NVMEV_ERROR("FGGC: SLC free=%u <= thres_high=%u, running SLC GC now\n",
+                           slc_free_lines, conv_ftl->slc_gc_free_thres_high);
+                forground_gc(conv_ftl);
+            } else if ((ticket & 0x3F) == 1) {
+                NVMEV_DEBUG("FGGC throttled (ticket=%d)\n", ticket);
+            }
+        }	   
         /* 尝试获取SLC页面 */
         ppa = get_new_slc_page(conv_ftl);
         if (!mapped_ppa(&ppa)) {
             /* SLC空间不足，立即返回写入失败 */
             NVMEV_ERROR("SLC exhausted, write failed for LPN %lld - background migration needed\n", local_lpn);
-            if (stripe_bytes > 0) {
-                buffer_release(wbuf, stripe_bytes);
-                released_bytes += stripe_bytes;
-                stripe_bytes = 0;
-            }
-            if (released_bytes < requested_bytes) {
-                uint64_t remaining = requested_bytes - released_bytes;
-                buffer_release(wbuf, remaining);
-                released_bytes += remaining;
-            }
             ret->status = NVME_SC_WRITE_FAULT;
             ret->nsecs_target = nsecs_latest;
             return true;
@@ -2893,7 +2890,6 @@ retry_alloc_write_buffer:
 			/* 异步释放写缓冲，交给 IO worker 归还 */
 			enqueue_writeback_io_req(req->sq_id, nsecs_completed, wbuf,
 				       (unsigned int)transfer_bytes);
-			released_bytes += transfer_bytes;
 			stripe_bytes = 0;
 			swr.stime = nsecs_completed;
             }
@@ -2918,15 +2914,10 @@ retry_alloc_write_buffer:
 	}
 /* 方案B：保险释放 - 确保所有分配的buffer都被释放 */
 	if (stripe_bytes > 0) {
-		buffer_release(wbuf, stripe_bytes);
-		released_bytes += stripe_bytes;
+		uint64_t flush_time = nsecs_latest;
+		enqueue_writeback_io_req(req->sq_id, flush_time, wbuf,
+			       (unsigned int)stripe_bytes);
 		stripe_bytes = 0;
-	}
-
-	if (released_bytes < requested_bytes) {
-		uint64_t remaining = requested_bytes - released_bytes;
-		buffer_release(wbuf, remaining);
-		released_bytes += remaining;
 	}
 
 	if ((cmd->rw.control & NVME_RW_FUA) || (conv_ftl->ssd->sp.write_early_completion == 0)) {
