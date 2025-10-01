@@ -6,6 +6,11 @@
 #include "nvmev.h"
 #include "ssd.h"
 
+uint64_t __get_ioclock(struct ssd *ssd)
+{
+	return cpu_clock(ssd->cpu_nr_dispatcher);
+}
+
 /* __get_ioclock 函数已移至 ssd.h */
 
 void buffer_init(struct buffer *buf, size_t size)
@@ -216,6 +221,8 @@ static void ssd_init_nand_page(struct nand_page *pg, struct ssdparams *spp)
 		pg->sec[i] = SEC_FREE;
 	}
 	pg->status = PG_FREE;
+	pg->qlc_latency_zone = 0;
+	pg->oob_prev_lpn = INVALID_LPN;
 }
 
 static void ssd_remove_nand_page(struct nand_page *pg)
@@ -503,11 +510,14 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 
 		if (is_qlc) {
 			/* QLC 读延迟 */
-			uint32_t qlc_cell = ppa->g.pg % 4;  /* QLC 有配置定义的单元类型 */
+			struct nand_page *cur_pg = get_pg(ssd, ppa);
+			uint32_t zone = cur_pg ? cur_pg->qlc_latency_zone : 0;
+			if (zone >= ARRAY_SIZE(spp->qlc_pg_rd_lat))
+				zone = ARRAY_SIZE(spp->qlc_pg_rd_lat) - 1;
 			if (ncmd->xfer_size == 4096) {
-				nand_etime = nand_stime + spp->qlc_pg_4kb_rd_lat[qlc_cell];
+				nand_etime = nand_stime + spp->qlc_pg_4kb_rd_lat[zone];
 			} else {
-				nand_etime = nand_stime + spp->qlc_pg_rd_lat[qlc_cell];
+				nand_etime = nand_stime + spp->qlc_pg_rd_lat[zone];
 			}
 		} else {
 			/* SLC 读延迟 */

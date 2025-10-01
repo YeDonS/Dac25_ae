@@ -96,14 +96,27 @@ struct conv_ftl {
 	struct write_pointer qlc_wp[QLC_REGIONS]; /* QLC 区域写指针 */
 	struct line_mgmt qlc_lm;                  /* QLC 共享的 line 管理 */
 	uint32_t current_qlc_region;              /* 当前写入的 QLC 区域 */
-	
+	struct write_pointer qlc_gc_wp[QLC_REGIONS]; /* QLC GC 写指针 */
+
+	uint32_t slc_gc_free_thres_high;
+	uint32_t slc_gc_free_thres_low;
+	uint32_t qlc_gc_free_thres_high;
+	uint32_t qlc_gc_free_thres_low;
+
 	/* 热数据跟踪和迁移管理 */
 	struct heat_tracking heat_track;
 	struct migration_mgmt migration;
-	
+
 	/* 页面元数据 - 记录页面是否在 SLC 中 */
 	bool *page_in_slc;           /* 标记页面是否在 SLC 中 */
-	
+	uint64_t *qlc_page_wcnt;     /* 每个 LPN 写入到 QLC 的次数 */
+	uint64_t qlc_total_wcnt;     /* 写入到 QLC 的总次数 */
+	uint64_t qlc_unique_pages;   /* 曾写入 QLC 的唯一 LPN 数 */
+	uint64_t qlc_threshold_q1_q2;/* Q1/Q2 分界线 */
+	uint64_t qlc_threshold_q2_q3;/* Q2/Q3 分界线 */
+	uint64_t qlc_threshold_q3_q4;/* Q3/Q4 分界线 */
+	spinlock_t qlc_zone_lock;    /* 保护 QLC 区域统计 */
+
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */

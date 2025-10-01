@@ -7,6 +7,9 @@
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "channel_model.h"
+
+struct ssd;
+uint64_t __get_ioclock(struct ssd *ssd);
 /*
     Default malloc size
     Channel = 40 * 8 = 320
@@ -86,6 +89,8 @@ struct nand_page {
 	nand_sec_status_t *sec;
 	int nsecs;
 	int status;
+	uint8_t qlc_latency_zone;
+	uint64_t oob_prev_lpn;
 };
 
 struct nand_block {
