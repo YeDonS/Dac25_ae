@@ -295,6 +295,15 @@ static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struc
 	conv_ftl->maptbl[lpn] = *ppa;
 }
 
+static inline void clear_lpn_mapping(struct conv_ftl *conv_ftl, uint64_t lpn)
+{
+	struct ppa invalid = { .ppa = UNMAPPED_PPA };
+
+	set_maptbl_ent(conv_ftl, lpn, &invalid);
+	if (conv_ftl->page_in_slc)
+		conv_ftl->page_in_slc[lpn] = false;
+}
+
 static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -1795,6 +1804,13 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 */
 	NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
 
+	if (!valid_ppa(conv_ftl, old_ppa)) {
+		NVMEV_ERROR("gc_write_page: invalid source PPA ch=%d lun=%d blk=%d pg=%d, clearing lpn=%llu\n",
+			    old_ppa->g.ch, old_ppa->g.lun, old_ppa->g.blk, old_ppa->g.pg, lpn);
+		clear_lpn_mapping(conv_ftl, lpn);
+		return 0;
+	}
+
 /*	if (stored_prev_lpn != INVALID_LPN) {
 		prev_ppa = get_maptbl_ent(conv_ftl, stored_prev_lpn);
 		if (mapped_ppa(&prev_ppa) && valid_ppa(conv_ftl, &prev_ppa)) {
@@ -2485,6 +2501,7 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl)
     conv_ftl->lunpointer++;
     if (conv_ftl->lunpointer >= (spp->nchs * spp->luns_per_ch))
         conv_ftl->lunpointer = 0;
+
 	wp->ch = conv_ftl->lunpointer % spp->nchs;
 	wp->lun = conv_ftl->lunpointer / spp->nchs;
 }
@@ -2745,6 +2762,13 @@ static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
     /* 参数验证 */
     if (!conv_ftl || !slc_ppa || !mapped_ppa(slc_ppa)) {
         NVMEV_ERROR("Invalid parameters for page migration\n");
+        return;
+    }
+
+    if (!valid_ppa(conv_ftl, slc_ppa)) {
+        NVMEV_ERROR("migrate_page_to_qlc: invalid SLC PPA ch=%d lun=%d blk=%d pg=%d for lpn=%llu, drop mapping\n",
+                    slc_ppa->g.ch, slc_ppa->g.lun, slc_ppa->g.blk, slc_ppa->g.pg, lpn);
+        clear_lpn_mapping(conv_ftl, lpn);
         return;
     }
     
