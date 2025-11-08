@@ -9,6 +9,8 @@
 #include "ssd_config.h"
 #include "ssd.h"
 
+struct dentry;
+
 #define QLC_ZONE_COUNT 4
 
 struct convparams {
@@ -134,6 +136,7 @@ struct conv_ftl {
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
 	uint64_t migration_cnt;      /* 迁移计数 */
+	struct dentry *debug_access_count; /* debugfs entry for access counter */
 	
 	/* 初始化状态标记 */
 	bool maptbl_initialized;     /* 映射表是否初始化成功 */

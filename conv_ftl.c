@@ -1193,6 +1193,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->cp = *cpp;
 
 	conv_ftl->ssd = ssd;
+	conv_ftl->debug_access_count = NULL;
 
 	/* initialize maptbl */
 	NVMEV_INFO("initialize maptbl\n");
@@ -1252,6 +1253,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	{
 		uint32_t slc_total = conv_ftl->slc_lm.tt_lines;
 		uint32_t total_lines = conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines;
+
 		conv_ftl->slc_high_watermark = slc_total * 80 / 100;
 		conv_ftl->slc_low_watermark = slc_total * 70 / 100;
 		conv_ftl->gc_high_watermark = total_lines * 90 / 100;
@@ -1261,34 +1263,36 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		 * 触发：15%（高），停止：20%（低）
 		 */
 		{
-			uint32_t slc_total = conv_ftl->slc_lm.tt_lines;
+			uint32_t slc_total_inner = conv_ftl->slc_lm.tt_lines;
 			uint32_t qlc_total = conv_ftl->qlc_lm.tt_lines;
-			conv_ftl->slc_gc_free_thres_high = (slc_total * 15) / 100;
-			conv_ftl->slc_gc_free_thres_low  = (slc_total * 20) / 100;
+
+			conv_ftl->slc_gc_free_thres_high = (slc_total_inner * 15) / 100;
+			conv_ftl->slc_gc_free_thres_low = (slc_total_inner * 20) / 100;
 			conv_ftl->qlc_gc_free_thres_high = (qlc_total * 15) / 100;
-			conv_ftl->qlc_gc_free_thres_low  = (qlc_total * 20) / 100;
+			conv_ftl->qlc_gc_free_thres_low = (qlc_total * 20) / 100;
 		}
 
 		/* 初始化 QLC GC 写指针为 0（首用时延迟初始化） */
-	{
-		uint32_t dies = total_dies(&conv_ftl->ssd->sp);
-		if (!dies)
-			dies = 1;
+		{
+			uint32_t dies = total_dies(&conv_ftl->ssd->sp);
 
-	conv_ftl->qlc_wp.curline = NULL;
-	conv_ftl->qlc_wp.ch = 0;
-	conv_ftl->qlc_wp.lun = 0;
-	conv_ftl->qlc_wp.pg = 0;
-	conv_ftl->qlc_wp.blk = 0;
-	conv_ftl->qlc_wp.pl = 0;
+			if (!dies)
+				dies = 1;
 
-	conv_ftl->qlc_gc_wp.curline = NULL;
-	conv_ftl->qlc_gc_wp.ch = 0;
-	conv_ftl->qlc_gc_wp.lun = 0;
-	conv_ftl->qlc_gc_wp.pg = 0;
-	conv_ftl->qlc_gc_wp.blk = 0;
-	conv_ftl->qlc_gc_wp.pl = 0;
+			conv_ftl->qlc_wp.curline = NULL;
+			conv_ftl->qlc_wp.ch = 0;
+			conv_ftl->qlc_wp.lun = 0;
+			conv_ftl->qlc_wp.pg = 0;
+			conv_ftl->qlc_wp.blk = 0;
+			conv_ftl->qlc_wp.pl = 0;
 
+			conv_ftl->qlc_gc_wp.curline = NULL;
+			conv_ftl->qlc_gc_wp.ch = 0;
+			conv_ftl->qlc_gc_wp.lun = 0;
+			conv_ftl->qlc_gc_wp.pg = 0;
+			conv_ftl->qlc_gc_wp.blk = 0;
+			conv_ftl->qlc_gc_wp.pl = 0;
+		}
 	}
 
 	NVMEV_INFO("Init FTL Instance with %d channels(%ld pages)\n", conv_ftl->ssd->sp.nchs,
@@ -1307,8 +1311,10 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
 	/* 无后台线程可停止（同步模式） */
 
-	debugfs_remove(conv_ftl->debug_access_count);
-	conv_ftl->debug_access_count = NULL;
+	if (conv_ftl->debug_access_count) {
+		debugfs_remove(conv_ftl->debug_access_count);
+		conv_ftl->debug_access_count = NULL;
+	}
 
     remove_lines(conv_ftl);
 	
@@ -2479,8 +2485,20 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl)
     conv_ftl->lunpointer++;
     if (conv_ftl->lunpointer >= (spp->nchs * spp->luns_per_ch))
         conv_ftl->lunpointer = 0;
-    wp->ch = conv_ftl->lunpointer % spp->nchs;
-    wp->lun = conv_ftl->lunpointer / spp->nchs;
+
+	wp->ch = conv_ftl->lunpointer % spp->nchs;
+	wp->lun = conv_ftl->lunpointer / spp->nchs;
+}
+
+static void qlc_reset_die_progress(struct write_pointer *wp)
+{
+	if (!wp)
+		return;
+
+	wp->ch = 0;
+	wp->lun = 0;
+	wp->pg = 0;
+	wp->pl = 0;
 }
 
 static void qlc_reset_line_accounting(struct line *line)
