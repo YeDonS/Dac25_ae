@@ -72,6 +72,48 @@ static inline bool qlc_page_matches_type(uint32_t pg, uint32_t type)
 	return qlc_page_type_from_index(pg) == (type % QLC_PAGE_PATTERN);
 }
 
+struct line_pool_stats {
+	uint32_t total;
+	uint32_t free;
+	uint32_t victim;
+	uint32_t full;
+};
+
+static void collect_pool_stats(struct conv_ftl *conv_ftl, bool slc,
+			       struct line_pool_stats *stats)
+{
+	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	struct line_mgmt *array = slc ? conv_ftl->slc_lunlm : conv_ftl->qlc_lunlm;
+	spinlock_t *lock = slc ? &conv_ftl->slc_lock : &conv_ftl->qlc_lock;
+	uint32_t die;
+
+	memset(stats, 0, sizeof(*stats));
+	if (!array)
+		return;
+
+	spin_lock(lock);
+	for (die = 0; die < die_count; die++) {
+		struct line_mgmt *lm = &array[die];
+		stats->total += lm->tt_lines;
+		stats->free += lm->free_line_cnt;
+		stats->victim += lm->victim_line_cnt;
+		stats->full += lm->full_line_cnt;
+	}
+	spin_unlock(lock);
+}
+
+static inline void collect_slc_stats(struct conv_ftl *conv_ftl,
+				     struct line_pool_stats *stats)
+{
+	collect_pool_stats(conv_ftl, true, stats);
+}
+
+static inline void collect_qlc_stats(struct conv_ftl *conv_ftl,
+				     struct line_pool_stats *stats)
+{
+	collect_pool_stats(conv_ftl, false, stats);
+}
+
 static inline uint32_t pick_locked_qlc_page_type(struct conv_ftl *conv_ftl, bool warm)
 {
 	uint32_t type;
@@ -532,54 +574,12 @@ static inline uint32_t pages_to_lines(uint64_t pages, uint32_t pgs_per_blk)
 	return pgs_per_blk ? (uint32_t)div_u64(pages, pgs_per_blk) : 0;
 }
 
-struct line_pool_stats {
-	uint32_t total;
-	uint32_t free;
-	uint32_t victim;
-	uint32_t full;
-};
-
 struct victim_candidate {
 	struct line *line;
 	uint32_t die;
 	bool is_slc;
 	uint32_t vpc;
 };
-
-static void collect_pool_stats(struct conv_ftl *conv_ftl, bool slc,
-			       struct line_pool_stats *stats)
-{
-	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
-	struct line_mgmt *array = slc ? conv_ftl->slc_lunlm : conv_ftl->qlc_lunlm;
-	spinlock_t *lock = slc ? &conv_ftl->slc_lock : &conv_ftl->qlc_lock;
-	uint32_t die;
-
-	memset(stats, 0, sizeof(*stats));
-	if (!array)
-		return;
-
-	spin_lock(lock);
-	for (die = 0; die < die_count; die++) {
-		struct line_mgmt *lm = &array[die];
-		stats->total += lm->tt_lines;
-		stats->free += lm->free_line_cnt;
-		stats->victim += lm->victim_line_cnt;
-		stats->full += lm->full_line_cnt;
-	}
-	spin_unlock(lock);
-}
-
-static inline void collect_slc_stats(struct conv_ftl *conv_ftl,
-				 struct line_pool_stats *stats)
-{
-	collect_pool_stats(conv_ftl, true, stats);
-}
-
-static inline void collect_qlc_stats(struct conv_ftl *conv_ftl,
-				     struct line_pool_stats *stats)
-{
-	collect_pool_stats(conv_ftl, false, stats);
-}
 
 static bool find_best_victim(struct conv_ftl *conv_ftl, bool slc_pool,
 			     bool force, struct victim_candidate *cand)
@@ -590,12 +590,13 @@ static bool find_best_victim(struct conv_ftl *conv_ftl, bool slc_pool,
 	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
 	struct line *best = NULL;
 	uint32_t best_die = 0;
+	uint32_t die;
 
 	if (!array)
 		return false;
 
 	spin_lock(lock);
-	for (uint32_t die = 0; die < die_count; die++) {
+	for (die = 0; die < die_count; die++) {
 		struct line_mgmt *lm = &array[die];
 		struct line *candidate = pqueue_peek(lm->victim_line_pq);
 
@@ -1947,7 +1948,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 			encode_die(spp, &new_ppa),
 			zone_hint);
 	}
-}
+
 	if (cpp->enable_gc_delay) {
 		struct nand_cmd gcw = {
 			.type = GC_IO,
@@ -2131,6 +2132,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 	int pg;
 	bool in_slc;
 	struct convparams *cpp;
+	uint32_t ch = 0, lun = 0;
 
 	if (!select_victim_line(conv_ftl, force, target_pool, &victim)) {
 		NVMEV_DEBUG("do_gc: No suitable victim line found.\n");
@@ -2140,7 +2142,9 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 	/* line ID 已为全局编号，可直接换算物理 block ID */
 	ppa.g.blk = blk_from_line(victim.line->id);
 	ppa.g.pl = 0;
-	decode_die(spp, victim.die, &ppa.g.ch, &ppa.g.lun);
+	decode_die(spp, victim.die, &ch, &lun);
+	ppa.g.ch = ch;
+	ppa.g.lun = lun;
 	
 	/* 确定是SLC还是QLC并显示相应的统计信息 */
 	in_slc = victim.is_slc;
