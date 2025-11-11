@@ -9,6 +9,10 @@
 #include "ssd_config.h"
 #include "ssd.h"
 
+struct dentry;
+
+#define QLC_ZONE_COUNT 4
+
 struct convparams {
 	uint32_t gc_thres_lines;
 	uint32_t gc_thres_lines_high;
@@ -25,6 +29,7 @@ struct line {
 	struct list_head entry;
 	/* position in the priority queue for victim lines */
 	size_t pos;
+	uint32_t zone_written[QLC_ZONE_COUNT];
 };
 
 /* wp: record next write addr */
@@ -35,6 +40,8 @@ struct write_pointer {
 	uint32_t pg;
 	uint32_t blk;
 	uint32_t pl;
+	uint32_t *die_pg;
+	uint32_t die_pg_size;
 };
 
 struct line_mgmt {
@@ -76,27 +83,32 @@ struct conv_ftl {
 	struct convparams cp;
 	struct ppa *maptbl; /* page level mapping table */
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
-	struct write_pointer wp;
-	struct write_pointer gc_wp;
 	struct write_flow_control wfc;
 	//66f1 - 删除了冲突的旧 line_mgmt 结构
 	uint32_t lunpointer;
+	uint32_t die_count;
 
 	/* SLC/QLC 混合存储相关字段 */
 	bool *is_slc_block;          /* 标记块是否为 SLC */
 	uint32_t slc_blks_per_pl;    /* 每个 plane 的 SLC 块数 */
 	uint32_t qlc_blks_per_pl;    /* 每个 plane 的 QLC 块数 */
-	uint32_t qlc_region_size;    /* QLC 区域大小（块数） */
+	uint32_t slc_pgs_per_blk;    /* SLC block 的页数 */
+	uint32_t qlc_pgs_per_blk;    /* QLC block 的页数（可为 SLC 的多倍） */
 	
-	/* SLC 写指针 - 使用 DA (Die Affinity) */
-	struct write_pointer slc_wp;
-	struct line_mgmt slc_lm;
+	struct line_mgmt slc_lm;              /* legacy aggregated view (unused in DA path) */
+	struct line_mgmt *slc_lunlm;          /* per-die SLC line pools */
+	struct write_pointer *slc_lunwp;
+	struct write_pointer *gc_slc_lunwp;
 	
-	/* QLC 写指针 - 使用多区域并发 */
-	struct write_pointer qlc_wp[QLC_REGIONS]; /* QLC 区域写指针 */
-	struct line_mgmt qlc_lm;                  /* QLC 共享的 line 管理 */
-	uint32_t current_qlc_region;              /* 当前写入的 QLC 区域 */
-	struct write_pointer qlc_gc_wp[QLC_REGIONS]; /* QLC GC 写指针 */
+	struct line_mgmt qlc_lm;              /* legacy aggregated view (unused in DA path) */
+	struct line_mgmt *qlc_lunlm;          /* per-die QLC line pools */
+	struct write_pointer *qlc_lunwp;
+	struct write_pointer *gc_qlc_lunwp;
+	uint32_t qlc_die_cursor;
+	uint32_t qlc_gc_die_cursor;
+	uint32_t qlc_zone_offsets[QLC_ZONE_COUNT];/* 每个zone在block中的起始页 */
+	uint32_t qlc_zone_limits[QLC_ZONE_COUNT]; /* 每个zone允许写入的页数 */
+	uint32_t qlc_zone_rr_cursor;             /* 无机制版本：线性填充所用的轮询游标 */
 
 	uint32_t slc_gc_free_thres_high;
 	uint32_t slc_gc_free_thres_low;
@@ -115,12 +127,17 @@ struct conv_ftl {
 	uint64_t qlc_threshold_q1_q2;/* Q1/Q2 分界线 */
 	uint64_t qlc_threshold_q2_q3;/* Q2/Q3 分界线 */
 	uint64_t qlc_threshold_q3_q4;/* Q3/Q4 分界线 */
+	uint64_t qlc_resident_read_sum;   /* HLFA：QLC 驻留页累计读次数 */
+	uint64_t qlc_resident_page_cnt;   /* HLFA：已统计的 QLC 驻留页数量 */
 	spinlock_t qlc_zone_lock;    /* 保护 QLC 区域统计 */
+	uint64_t qlc_migration_read_sum;   /* 迁移页累计读次数 */
+	uint64_t qlc_migration_page_cnt;   /* 迁移页数量 */
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
 	uint64_t migration_cnt;      /* 迁移计数 */
+	struct dentry *debug_access_count; /* debugfs entry for access counter */
 	
 	/* 初始化状态标记 */
 	bool maptbl_initialized;     /* 映射表是否初始化成功 */
