@@ -1199,11 +1199,15 @@ static int init_line_pool(struct conv_ftl *conv_ftl, struct line_mgmt *lm,
 static int init_per_die_line_mgmt(struct conv_ftl *conv_ftl, bool slc_pool)
 {
 	uint32_t die, die_cnt = conv_ftl->die_count ? conv_ftl->die_count : 1;
-	uint32_t line_base = slc_pool ? 0 : conv_ftl->slc_blks_per_pl;
-	uint32_t line_cnt = slc_pool ? conv_ftl->slc_blks_per_pl : conv_ftl->qlc_blks_per_pl;
-	const char *tag = slc_pool ? "SLC" : "QLC";
-	struct line_mgmt **array =
-		slc_pool ? &conv_ftl->slc_lunlm : &conv_ftl->qlc_lunlm;
+	struct line_mgmt **array = &conv_ftl->slc_lunlm;
+	uint32_t line_base = 0;
+	uint32_t line_cnt = conv_ftl->slc_blks_per_pl;
+	const char *tag = "SLC";
+
+	if (!slc_pool) {
+		NVMEV_ERROR("init_per_die_line_mgmt called for QLC, expected global allocator\n");
+		return -EINVAL;
+	}
 
 	*array = kcalloc(die_cnt, sizeof(**array), GFP_KERNEL);
 	if (!*array) {
@@ -1346,10 +1350,6 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		conv_ftl->gc_slc_lunwp = NULL;
 		return;
 	}
-	conv_ftl->qlc_lunwp = NULL;
-	conv_ftl->gc_qlc_lunwp = NULL;
-	conv_ftl->qlc_die_cursor = 0;
-	conv_ftl->qlc_gc_die_cursor = 0;
 
 	/* initialize maptbl */
 	NVMEV_INFO("initialize maptbl\n");
@@ -2592,6 +2592,22 @@ static void qlc_reset_line_accounting(struct line *line)
 	line->vpc = 0;
 }
 
+static void qlc_advance_die_cursor(struct conv_ftl *conv_ftl, struct write_pointer *wp)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+
+	if (!wp)
+		return;
+
+	wp->ch++;
+	if (wp->ch >= (uint32_t)spp->nchs) {
+		wp->ch = 0;
+		wp->lun++;
+		if (wp->lun >= (uint32_t)spp->luns_per_ch)
+			wp->lun = 0;
+	}
+}
+
 static struct line *qlc_ensure_active_line(struct conv_ftl *conv_ftl,
 				   struct write_pointer *wp,
 				   struct line_mgmt *lm)
@@ -2756,6 +2772,8 @@ static int qlc_do_allocate(struct conv_ftl *conv_ftl, struct write_pointer *wp,
 static int qlc_get_new_page(struct conv_ftl *conv_ftl, uint32_t zone_hint,
 			    struct ppa *ppa_out)
 {
+	if (!conv_ftl || !conv_ftl->qlc_lm.lines)
+		return -ENOSPC;
 	return qlc_do_allocate(conv_ftl, &conv_ftl->qlc_wp, &conv_ftl->qlc_lm,
 			       zone_hint, ppa_out);
 }
@@ -2763,6 +2781,8 @@ static int qlc_get_new_page(struct conv_ftl *conv_ftl, uint32_t zone_hint,
 static int qlc_get_new_gc_page(struct conv_ftl *conv_ftl, uint32_t zone_hint,
 			       struct ppa *ppa_out)
 {
+	if (!conv_ftl || !conv_ftl->qlc_lm.lines)
+		return -ENOSPC;
 	return qlc_do_allocate(conv_ftl, &conv_ftl->qlc_gc_wp, &conv_ftl->qlc_lm,
 			       zone_hint, ppa_out);
 }

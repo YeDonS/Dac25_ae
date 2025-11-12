@@ -99,16 +99,15 @@ struct conv_ftl {
 	struct line_mgmt *slc_lunlm;          /* per-die SLC line pools */
 	struct write_pointer *slc_lunwp;
 	struct write_pointer *gc_slc_lunwp;
+	struct write_pointer slc_wp;
+	struct write_pointer gc_wp;
 	
-	struct line_mgmt qlc_lm;              /* legacy aggregated view (unused in DA path) */
-	struct line_mgmt *qlc_lunlm;          /* per-die QLC line pools */
-	struct write_pointer *qlc_lunwp;
-	struct write_pointer *gc_qlc_lunwp;
-	uint32_t qlc_die_cursor;
-	uint32_t qlc_gc_die_cursor;
+	struct line_mgmt qlc_lm;              /* QLC 使用全局 line 池 */
 	uint32_t qlc_zone_offsets[QLC_ZONE_COUNT];/* 每个zone在block中的起始页 */
 	uint32_t qlc_zone_limits[QLC_ZONE_COUNT]; /* 每个zone允许写入的页数 */
 	uint32_t qlc_zone_rr_cursor;             /* 无机制版本：线性填充所用的轮询游标 */
+	struct write_pointer qlc_wp;
+	struct write_pointer qlc_gc_wp;
 
 	uint32_t slc_gc_free_thres_high;
 	uint32_t slc_gc_free_thres_low;
