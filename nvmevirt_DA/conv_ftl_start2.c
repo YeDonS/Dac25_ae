@@ -103,7 +103,6 @@ static void collect_pool_stats(struct conv_ftl *conv_ftl, bool slc,
 		return;
 	}
 
-	/* QLC 采用全局 line 池 */
 	spin_lock(&conv_ftl->qlc_lock);
 	if (conv_ftl->qlc_lm.lines) {
 		stats->total = conv_ftl->qlc_lm.tt_lines;
@@ -128,19 +127,12 @@ static inline void collect_qlc_stats(struct conv_ftl *conv_ftl,
 
 static inline uint32_t pick_locked_qlc_page_type(struct conv_ftl *conv_ftl, bool warm)
 {
-	uint32_t type;
-
 	if (!conv_ftl)
 		return QLC_PAGE_TYPE_L;
 
-	if (warm)
-		type = (conv_ftl->qlc_zone_rr_cursor++ & 0x1) ?
-		       QLC_PAGE_TYPE_CL : QLC_PAGE_TYPE_L;
-	else
-		type = (conv_ftl->qlc_zone_rr_cursor++ & 0x1) ?
-		       QLC_PAGE_TYPE_U : QLC_PAGE_TYPE_CU;
-
-	return type;
+	/* 顺序写入，不再根据冷热区分 L/CL/CU/U */
+	(void)warm;
+	return conv_ftl->qlc_zone_rr_cursor++ % QLC_PAGE_PATTERN;
 }
 
 /* 前向声明以避免隐式声明错误 */
@@ -194,8 +186,8 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
 	uint64_t dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
 	if (dyn_thresh == 0)
 		dyn_thresh = 1;
-	start = cursor % spp->tt_pgs;
-	idx = start;
+    start = cursor % spp->tt_pgs;
+    idx = start;
     
 	while (scanned < MAX_SCAN && migrated < MAX_MIGRATE) {
 		if (conv_ftl->page_in_slc[idx]) {
@@ -247,8 +239,8 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
 	if (dyn_thresh == 0)
 		dyn_thresh = 1;
 	idx = cursor2 % spp->tt_pgs;
-	
-	while (scanned < 4096 && migrated < max_pages) {
+    
+    while (scanned < 4096 && migrated < max_pages) {
 		if (conv_ftl->page_in_slc[idx]) {
 			uint64_t acc = ht->access_count[idx];
 			
@@ -256,7 +248,7 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
 				struct ppa old_ppa = get_maptbl_ent(conv_ftl, idx);
 				if (mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk)) {
 					NVMEV_DEBUG("[MIGRATION_DEBUG] Found cold page to migrate: lpn=%llu, ppa=ch%d,lun%d,blk%d,pg%d\n",
-					       idx, old_ppa.g.ch, old_ppa.g.lun, old_ppa.g.blk, old_ppa.g.pg);
+                               idx, old_ppa.g.ch, old_ppa.g.lun, old_ppa.g.blk, old_ppa.g.pg);
                     /* 执行单页迁移 */
                     migrate_page_to_qlc(conv_ftl, idx, &old_ppa);
                     migrated++;
@@ -604,7 +596,6 @@ static bool find_best_victim(struct conv_ftl *conv_ftl, bool slc_pool,
 
 	if (slc_pool) {
 		struct line_mgmt *array = conv_ftl->slc_lunlm;
-		spinlock_t *lock = &conv_ftl->slc_lock;
 		uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
 		struct line *best = NULL;
 		uint32_t best_die = 0;
@@ -613,7 +604,7 @@ static bool find_best_victim(struct conv_ftl *conv_ftl, bool slc_pool,
 		if (!array)
 			return false;
 
-		spin_lock(lock);
+		spin_lock(&conv_ftl->slc_lock);
 		for (die = 0; die < die_count; die++) {
 			struct line_mgmt *lm = &array[die];
 			struct line *candidate = pqueue_peek(lm->victim_line_pq);
@@ -634,11 +625,10 @@ static bool find_best_victim(struct conv_ftl *conv_ftl, bool slc_pool,
 			cand->is_slc = true;
 			cand->vpc = best->vpc;
 		}
-		spin_unlock(lock);
+		spin_unlock(&conv_ftl->slc_lock);
 		return best != NULL;
 	}
 
-	/* QLC: 单一全局池 */
 	spin_lock(&conv_ftl->qlc_lock);
 	if (!conv_ftl->qlc_lm.lines) {
 		spin_unlock(&conv_ftl->qlc_lock);
@@ -662,7 +652,6 @@ static bool pop_victim_from_pool(struct conv_ftl *conv_ftl, struct victim_candid
 {
 	if (cand->is_slc) {
 		struct line_mgmt *array = conv_ftl->slc_lunlm;
-		spinlock_t *lock = &conv_ftl->slc_lock;
 		uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
 
 		if (!array || die_count == 0)
@@ -671,16 +660,16 @@ static bool pop_victim_from_pool(struct conv_ftl *conv_ftl, struct victim_candid
 		uint32_t die = cand->die % die_count;
 		struct line_mgmt *lm = &array[die];
 
-		spin_lock(lock);
+		spin_lock(&conv_ftl->slc_lock);
 		if (!lm->victim_line_cnt || pqueue_peek(lm->victim_line_pq) != cand->line) {
-			spin_unlock(lock);
+			spin_unlock(&conv_ftl->slc_lock);
 			return false;
 		}
 
 		pqueue_pop(lm->victim_line_pq);
 		cand->line->pos = 0;
 		lm->victim_line_cnt--;
-		spin_unlock(lock);
+		spin_unlock(&conv_ftl->slc_lock);
 		return true;
 	}
 
@@ -1246,7 +1235,7 @@ static int init_global_qlc_lines(struct conv_ftl *conv_ftl)
 
 	lm->lines = vmalloc(sizeof(struct line) * lm->tt_lines);
 	if (!lm->lines) {
-		NVMEV_ERROR("Failed to allocate global QLC line array (cnt=%u)\n", lm->tt_lines);
+		NVMEV_ERROR("Failed to allocate global QLC line array\n");
 		return -ENOMEM;
 	}
 
@@ -1264,7 +1253,7 @@ static int init_global_qlc_lines(struct conv_ftl *conv_ftl)
 	}
 
 	for (i = 0; i < lm->tt_lines; i++) {
-		lm->lines[i] = (struct line) {
+		lm->lines[i] = (struct line){
 			.id = conv_ftl->slc_blks_per_pl + i,
 			.ipc = 0,
 			.vpc = 0,
@@ -1278,7 +1267,6 @@ static int init_global_qlc_lines(struct conv_ftl *conv_ftl)
 
 	lm->victim_line_cnt = 0;
 	lm->full_line_cnt = 0;
-	NVMEV_DEBUG("[LINE_POOL] Global QLC lines initialized: total=%u\n", lm->tt_lines);
 	return 0;
 }
 
@@ -1348,7 +1336,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->gc_slc_lunwp = kcalloc(conv_ftl->die_count,
 					 sizeof(*conv_ftl->gc_slc_lunwp), GFP_KERNEL);
 	if (!conv_ftl->slc_lunwp || !conv_ftl->gc_slc_lunwp) {
-		NVMEV_ERROR("Failed to allocate per-die SLC write pointer arrays\n");
+		NVMEV_ERROR("Failed to allocate per-die write pointer arrays\n");
 		kfree(conv_ftl->slc_lunwp);
 		kfree(conv_ftl->gc_slc_lunwp);
 		conv_ftl->slc_lunwp = NULL;
@@ -1919,9 +1907,6 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
 	struct nand_page *old_pg = get_pg(conv_ftl->ssd, old_ppa);
 	uint64_t stored_prev_lpn = old_pg ? old_pg->oob_prev_lpn : INVALID_LPN;
-	uint32_t target_ch = old_ppa->g.ch;
-	uint32_t target_lun = old_ppa->g.lun;
-	uint32_t dies = total_dies(spp);
 	uint32_t src_die = encode_die(spp, old_ppa);
 	bool old_in_slc;
 /* int prev_die_log = -1;
@@ -1955,22 +1940,10 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	if (old_in_slc) {
 		uint32_t die_index = 0;
 
-		if (dies)
-			die_index = target_lun * spp->nchs + target_ch;
 		if (conv_ftl->die_count)
-			die_index %= conv_ftl->die_count;
+			die_index = conv_ftl->lunpointer % conv_ftl->die_count;
 		else
 			die_index = 0;
-
-		conv_ftl->lunpointer = die_index;
-
-		if (conv_ftl->gc_slc_lunwp) {
-			struct write_pointer *gc_wp = &conv_ftl->gc_slc_lunwp[die_index];
-			if (!gc_wp->curline || gc_wp->pg == 0) {
-				gc_wp->ch = target_ch;
-				gc_wp->lun = target_lun;
-			}
-		}
 
 		new_ppa = get_new_gc_slc_page(conv_ftl, die_index);
 		if (!mapped_ppa(&new_ppa)) {
@@ -2009,7 +1982,8 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 		if (zone_hint >= QLC_ZONE_COUNT)
 			zone_hint = QLC_ZONE_COUNT - 1;
 
-		qlc_wp_set_die_hint(conv_ftl, &conv_ftl->qlc_gc_wp, target_ch, target_lun);
+		qlc_wp_set_die_hint(conv_ftl, &conv_ftl->qlc_gc_wp,
+				    old_ppa->g.ch, old_ppa->g.lun);
 		if (qlc_get_new_gc_page(conv_ftl, zone_hint, &new_ppa) != 0) {
 			NVMEV_ERROR("gc_write_page: Failed to get new QLC GC page (zone_hint=%u).\n",
 				    zone_hint);
@@ -2597,22 +2571,6 @@ static void qlc_reset_line_accounting(struct line *line)
 	line->vpc = 0;
 }
 
-static void qlc_advance_die_cursor(struct conv_ftl *conv_ftl, struct write_pointer *wp)
-{
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-
-	if (!wp)
-		return;
-
-	wp->ch++;
-	if (wp->ch >= (uint32_t)spp->nchs) {
-		wp->ch = 0;
-		wp->lun++;
-		if (wp->lun >= (uint32_t)spp->luns_per_ch)
-			wp->lun = 0;
-	}
-}
-
 static struct line *qlc_ensure_active_line(struct conv_ftl *conv_ftl,
 				   struct write_pointer *wp,
 				   struct line_mgmt *lm)
@@ -2864,12 +2822,9 @@ static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
         return;
     }
     
-	/* 选择目标 die ，尽量让迁移后的页与前驱相邻 */
+	/* 顺序选择目标 die，不再强制与前驱保持亲和 */
 	uint64_t stored_prev_lpn = pg->oob_prev_lpn;
 	uint32_t src_die = encode_die(spp, slc_ppa);
-	// uint32_t target_die = src_die;
-	uint32_t target_ch = slc_ppa->g.ch;
-	uint32_t target_lun = slc_ppa->g.lun;
 	// int prev_die_log = -1;
 	// struct ppa prev_ppa = { .ppa = UNMAPPED_PPA };
 
