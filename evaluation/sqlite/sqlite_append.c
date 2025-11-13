@@ -20,6 +20,8 @@
 #define DEFAULT_ZIPF_ALPHA 1.2
 #define DEFAULT_EXP_LAMBDA 0.0008
 #define DEFAULT_SEED 42U
+#define DEFAULT_NORMAL_MEAN ((double)(APPENDCOUNT - 1) / 2.0)
+#define DEFAULT_NORMAL_STDDEV ((double)APPENDCOUNT / 6.0)
 
 typedef unsigned int UINT32;
 
@@ -33,6 +35,10 @@ static const struct option long_opts[] = {
 	{"lambda", required_argument, NULL, 'l'},
 	{"seed", required_argument, NULL, 's'},
 	{"log", required_argument, NULL, 'o'},
+	{"heatmap", required_argument, NULL, 'H'},
+	{"human-log", no_argument, NULL, 'U'},
+	{"normal-mean", required_argument, NULL, 'M'},
+	{"normal-stddev", required_argument, NULL, 'S'},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -46,6 +52,7 @@ enum distribution_type {
 	DIST_UNIFORM = 0,
 	DIST_ZIPF,
 	DIST_EXPONENTIAL,
+	DIST_NORMAL,
 };
 
 struct workload_options {
@@ -56,12 +63,26 @@ struct workload_options {
 	double exp_lambda;
 	unsigned int seed;
 	const char *log_path;
+	const char *heatmap_path;
+	bool human_log;
+	double normal_mean;
+	double normal_stddev;
 };
 
 struct zipf_sampler {
 	double *cdf;
 	unsigned int length;
 	double alpha;
+};
+
+struct pragma_snapshot {
+	char journal_mode[32];
+	char synchronous[32];
+};
+
+struct text_slot {
+	char *buf;
+	size_t len;
 };
 
 static void usage(const char *prog)
@@ -71,7 +92,9 @@ static void usage(const char *prog)
 		"  %s --mode init\n"
 		"  %s --mode read [--distribution zipf|exp|uniform]\n"
 		"                  [--reads N] [--alpha A] [--lambda L]\n"
-		"                  [--seed S] [--log path]\n",
+		"                  [--normal-mean MU] [--normal-stddev SIGMA]\n"
+		"                  [--seed S] [--log path] [--heatmap path]\n"
+		"                  [--human-log]\n",
 		prog, prog);
 }
 
@@ -93,6 +116,18 @@ static unsigned int next_rand(unsigned int *state)
 static double rand_uniform(unsigned int *state)
 {
 	return (double)next_rand(state) / (double)RAND_MAX;
+}
+
+static void copy_text(char *dst, size_t len, const char *src)
+{
+	if (len == 0)
+		return;
+	if (!src) {
+		dst[0] = '\0';
+		return;
+	}
+	strncpy(dst, src, len - 1);
+	dst[len - 1] = '\0';
 }
 
 static int cmp_double(const void *a, const void *b)
@@ -192,6 +227,33 @@ static unsigned int sample_exponential(unsigned int n, double lambda, unsigned i
 	}
 }
 
+static double sample_standard_normal(unsigned int *state)
+{
+	double u1, u2;
+
+	do {
+		u1 = rand_uniform(state);
+	} while (u1 <= 1e-12);
+	u2 = rand_uniform(state);
+
+	return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+}
+
+static unsigned int sample_normal(unsigned int n, double mean, double stddev, unsigned int *state)
+{
+	if (stddev <= 0.0)
+		stddev = DEFAULT_NORMAL_STDDEV;
+	if (mean < 0.0 || mean >= (double)n)
+		mean = DEFAULT_NORMAL_MEAN;
+
+	while (1) {
+		double z = sample_standard_normal(state);
+		long candidate = lround(mean + stddev * z);
+		if (candidate >= 0 && candidate < (long)n)
+			return (unsigned int)candidate;
+	}
+}
+
 static enum distribution_type parse_distribution(const char *arg)
 {
 	if (strcasecmp(arg, "zipf") == 0 || strcasecmp(arg, "zipfian") == 0)
@@ -200,9 +262,56 @@ static enum distribution_type parse_distribution(const char *arg)
 		return DIST_EXPONENTIAL;
 	if (strcasecmp(arg, "uniform") == 0)
 		return DIST_UNIFORM;
+	if (strcasecmp(arg, "normal") == 0 || strcasecmp(arg, "gaussian") == 0)
+		return DIST_NORMAL;
 
 	fprintf(stderr, "Unknown distribution '%s'\n", arg);
 	exit(EXIT_FAILURE);
+}
+
+static int capture_text_callback(void *ctx, int argc, char **argv, char **azColName)
+{
+	struct text_slot *slot = ctx;
+
+	(void)azColName;
+
+	if (argc > 0 && argv[0])
+		copy_text(slot->buf, slot->len, argv[0]);
+
+	return 0;
+}
+
+static void print_waiting_banner(const struct pragma_snapshot *snap)
+{
+	printf("Waiting.....\n");
+	printf("Waiting.....\n");
+	printf("journal_mode = %s\n\n", snap->journal_mode);
+	printf("synchronous = %s\n\n", snap->synchronous);
+}
+
+static int write_heatmap_csv(const char *path, const unsigned int *hits,
+			     const double *latency_sums)
+{
+	FILE *fp;
+
+	fp = fopen(path, "w");
+	if (!fp) {
+		perror("fopen heatmap");
+		return -1;
+	}
+
+	fprintf(fp, "logical_index,record_id,hits,total_latency_sec,avg_latency_sec\n");
+	for (unsigned int idx = 0; idx < APPENDCOUNT; ++idx) {
+		unsigned int hit = hits[idx];
+		double total = latency_sums[idx];
+		double avg = hit ? total / hit : 0.0;
+		int record_id = (int)(APPENDCOUNT - 1 - idx);
+
+		fprintf(fp, "%u,%d,%u,%.9f,%.9f\n", idx, record_id, hit, total, avg);
+	}
+
+	fclose(fp);
+	return 0;
 }
 
 static void configure_options(int argc, char **argv, struct workload_options *opts)
@@ -216,8 +325,12 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->exp_lambda = DEFAULT_EXP_LAMBDA;
 	opts->seed = DEFAULT_SEED;
 	opts->log_path = NULL;
+	opts->heatmap_path = NULL;
+	opts->human_log = false;
+	opts->normal_mean = DEFAULT_NORMAL_MEAN;
+	opts->normal_stddev = DEFAULT_NORMAL_STDDEV;
 
-	while ((c = getopt_long(argc, argv, "m:d:r:a:l:s:o:h", long_opts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "m:d:r:a:l:s:o:H:M:S:Uh", long_opts, NULL)) != -1) {
 		switch (c) {
 		case 'm':
 			if (strcasecmp(optarg, "init") == 0)
@@ -246,6 +359,18 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			break;
 		case 'o':
 			opts->log_path = optarg;
+			break;
+		case 'H':
+			opts->heatmap_path = optarg;
+			break;
+		case 'M':
+			opts->normal_mean = strtod(optarg, NULL);
+			break;
+		case 'S':
+			opts->normal_stddev = strtod(optarg, NULL);
+			break;
+		case 'U':
+			opts->human_log = true;
 			break;
 		case 'h':
 		default:
@@ -399,6 +524,9 @@ static int run_read_mode(const struct workload_options *opts)
 	struct zipf_sampler zipf = {};
 	FILE *log_fp = NULL;
 	double *latencies = NULL;
+	unsigned int *heat_hits = NULL;
+	double *heat_latency_sums = NULL;
+	struct pragma_snapshot snapshot = {};
 	int rc;
 
 	if (opts->log_path) {
@@ -419,6 +547,8 @@ static int run_read_mode(const struct workload_options *opts)
 	}
 
 	snprintf(db_path, sizeof(db_path), "%stestdb.db", TARGET_FOLDER);
+	copy_text(snapshot.journal_mode, sizeof(snapshot.journal_mode), "unknown");
+	copy_text(snapshot.synchronous, sizeof(snapshot.synchronous), "unknown");
 
 	rc = sqlite3_open(db_path, &db);
 	if (rc != SQLITE_OK) {
@@ -454,6 +584,42 @@ static int run_read_mode(const struct workload_options *opts)
 		goto out_err;
 	}
 
+	if (opts->heatmap_path) {
+		heat_hits = calloc(APPENDCOUNT, sizeof(*heat_hits));
+		heat_latency_sums = calloc(APPENDCOUNT, sizeof(*heat_latency_sums));
+		if (!heat_hits || !heat_latency_sums) {
+			fprintf(stderr, "Failed to allocate heatmap buffers\n");
+			goto out_err;
+		}
+	}
+
+	if (opts->human_log) {
+		struct text_slot journal_slot = {
+			.buf = snapshot.journal_mode,
+			.len = sizeof(snapshot.journal_mode),
+		};
+		struct text_slot sync_slot = {
+			.buf = snapshot.synchronous,
+			.len = sizeof(snapshot.synchronous),
+		};
+
+		rc = sqlite3_exec(db, "PRAGMA journal_mode;", capture_text_callback, &journal_slot, &err_msg);
+		if (rc != SQLITE_OK) {
+			fprintf(stderr, "journal_mode pragma read failed: %s\n", err_msg);
+			goto out_err;
+		}
+		sqlite3_free(err_msg);
+		err_msg = NULL;
+
+		rc = sqlite3_exec(db, "PRAGMA synchronous;", capture_text_callback, &sync_slot, &err_msg);
+		if (rc != SQLITE_OK) {
+			fprintf(stderr, "synchronous pragma read failed: %s\n", err_msg);
+			goto out_err;
+		}
+		sqlite3_free(err_msg);
+		err_msg = NULL;
+	}
+
 	for (unsigned int i = 0; i < opts->reads; ++i) {
 		unsigned int logical_idx;
 		int record_id;
@@ -466,6 +632,9 @@ static int run_read_mode(const struct workload_options *opts)
 		case DIST_EXPONENTIAL:
 			logical_idx = sample_exponential(APPENDCOUNT, opts->exp_lambda, &rng_state);
 			break;
+		case DIST_NORMAL:
+			logical_idx = sample_normal(APPENDCOUNT, opts->normal_mean, opts->normal_stddev, &rng_state);
+			break;
 		case DIST_UNIFORM:
 		default:
 			logical_idx = next_rand(&rng_state) % APPENDCOUNT;
@@ -477,6 +646,9 @@ static int run_read_mode(const struct workload_options *opts)
 		sqlite3_reset(stmt);
 		sqlite3_clear_bindings(stmt);
 		sqlite3_bind_int(stmt, 1, record_id);
+
+		if (opts->human_log)
+			print_waiting_banner(&snapshot);
 
 		start = monotonic_sec();
 		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
@@ -493,6 +665,14 @@ static int run_read_mode(const struct workload_options *opts)
 
 		if (log_fp)
 			fprintf(log_fp, "%u,%u,%d,%.9f\n", i, logical_idx, record_id, latency);
+
+		if (opts->heatmap_path) {
+			heat_hits[logical_idx]++;
+			heat_latency_sums[logical_idx] += latency;
+		}
+
+		if (opts->human_log)
+			printf("read %u, time: %.9f\n", i, latency);
 	}
 
 	qsort(latencies, opts->reads, sizeof(double), cmp_double);
@@ -505,15 +685,24 @@ static int run_read_mode(const struct workload_options *opts)
 	double p50 = latencies[opts->reads / 2];
 	double p95 = latencies[(unsigned int)(opts->reads * 0.95)];
 	double p99 = latencies[(unsigned int)(opts->reads * 0.99)];
+	double throughput = total > 0.0 ? opts->reads / total : 0.0;
 
 	printf("[sqlite_read] dist=%s reads=%u seed=%u avg=%.9f "
 	       "p50=%.9f p95=%.9f p99=%.9f\n",
 	       dist_name(opts->dist), opts->reads, opts->seed, avg, p50, p95, p99);
+	printf("[sqlite_read] throughput=%.3f ops/sec\n", throughput);
+
+	if (opts->heatmap_path) {
+		if (write_heatmap_csv(opts->heatmap_path, heat_hits, heat_latency_sums) != 0)
+			goto out_err;
+	}
 
 	sqlite3_finalize(stmt);
 	sqlite3_close(db);
 	destroy_zipf_sampler(&zipf);
 	free(latencies);
+	free(heat_hits);
+	free(heat_latency_sums);
 	if (log_fp)
 		fclose(log_fp);
 	return 0;
@@ -524,9 +713,11 @@ out_err:
 	if (stmt)
 		sqlite3_finalize(stmt);
 	if (db)
-		sqlite3_close(db);
+	sqlite3_close(db);
 	destroy_zipf_sampler(&zipf);
 	free(latencies);
+	free(heat_hits);
+	free(heat_latency_sums);
 	if (log_fp)
 		fclose(log_fp);
 	return -1;
