@@ -23,6 +23,9 @@ SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-6G}
 SQLITE_TRACE_DIR=${SQLITE_TRACE_DIR:-}
 SCAN_ITERS=${SCAN_ITERS:-10}
 
+ACCESS_COUNT_PATH=${ACCESS_COUNT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_count}
+ACCESS_INJECT_PATH=${ACCESS_INJECT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_inject}
+
 ensure_access_inject() {
     local debugfs_mount
     debugfs_mount=$(mount | grep -w debugfs || true)
@@ -30,17 +33,18 @@ ensure_access_inject() {
         sudo mount -t debugfs debugfs /sys/kernel/debug
     fi
 
-    local path="/sys/kernel/debug/access_inject"
+    local inject_path="$ACCESS_INJECT_PATH"
+    local count_path="$ACCESS_COUNT_PATH"
     local attempts=40
     while (( attempts > 0 )); do
-        if [[ -w $path ]]; then
+        if [[ -w $inject_path && -r $count_path ]]; then
             return 0
         fi
         sleep 0.25
         attempts=$((attempts - 1))
     done
 
-    echo "access_inject not ready at $path" >&2
+    echo "access inject/count nodes not ready under /sys/kernel/debug" >&2
     exit 1
 }
 
