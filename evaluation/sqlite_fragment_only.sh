@@ -23,6 +23,27 @@ SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-6G}
 SQLITE_TRACE_DIR=${SQLITE_TRACE_DIR:-}
 SCAN_ITERS=${SCAN_ITERS:-10}
 
+ensure_access_inject() {
+    local debugfs_mount
+    debugfs_mount=$(mount | grep -w debugfs || true)
+    if [[ -z $debugfs_mount ]]; then
+        sudo mount -t debugfs debugfs /sys/kernel/debug
+    fi
+
+    local path="/sys/kernel/debug/access_inject"
+    local attempts=40
+    while (( attempts > 0 )); do
+        if [[ -w $path ]]; then
+            return 0
+        fi
+        sleep 0.25
+        attempts=$((attempts - 1))
+    done
+
+    echo "access_inject not ready at $path" >&2
+    exit 1
+}
+
 run_fragment_suite() {
     local mode=$1
     local tag=$2
@@ -31,6 +52,7 @@ run_fragment_suite() {
     sleep 1
     lsblk
     source setdevice.sh
+    ensure_access_inject
 
     local trace_dir="${SQLITE_TRACE_DIR:-${TARGET_FOLDER%/}/sqlite_traces}"
     mkdir -p "$trace_dir"
