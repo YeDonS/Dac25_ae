@@ -9,6 +9,8 @@
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 #include <linux/math64.h>
+#include <linux/ctype.h>
+#include <linux/uaccess.h>
 /* kthread/waitqueue no longer needed (threads removed) */
 
 #include "nvmev.h"
@@ -157,6 +159,7 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
 /* 新增：GC 专用 SLC 写指针函数声明（仅在本文件使用） */
 static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
+static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
 
 static atomic_t fggc_throttle = ATOMIC_INIT(0);
 
@@ -494,6 +497,67 @@ static const struct file_operations access_count_fops = {
 		    .read    = seq_read,
 		        .llseek  = seq_lseek,
 			    .release = single_release,
+};
+
+static ssize_t access_inject_write(struct file *file, const char __user *user_buf,
+				   size_t len, loff_t *ppos)
+{
+	struct conv_ftl *conv_ftl = file->private_data;
+	struct heat_tracking *ht;
+	struct ssdparams *spp;
+	char kbuf[256];
+	size_t copy;
+	char *cursor;
+	unsigned long long lpn, count;
+	int ret;
+
+	if (!conv_ftl || !conv_ftl->ssd)
+		return -EINVAL;
+
+	ht = &conv_ftl->heat_track;
+	spp = &conv_ftl->ssd->sp;
+	if (!ht->access_count)
+		return -EINVAL;
+
+	if (len == 0)
+		return 0;
+
+	copy = min(len, sizeof(kbuf) - 1);
+	if (copy_from_user(kbuf, user_buf, copy))
+		return -EFAULT;
+	kbuf[copy] = '\0';
+
+	cursor = skip_spaces(kbuf);
+	if (!*cursor)
+		return -EINVAL;
+
+	ret = kstrtoull(cursor, 10, &lpn);
+	if (ret)
+		return ret;
+
+	while (*cursor && !isspace(*cursor))
+		cursor++;
+	cursor = skip_spaces(cursor);
+	if (!*cursor)
+		return -EINVAL;
+
+	ret = kstrtoull(cursor, 10, &count);
+	if (ret)
+		return ret;
+
+	if (lpn >= spp->tt_pgs)
+		return -ERANGE;
+
+	ht->access_count[lpn] = count;
+
+	return len;
+}
+
+static const struct file_operations access_inject_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = access_inject_write,
+	.llseek = no_llseek,
 };
 
 
@@ -1455,6 +1519,9 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->debug_access_count =
 		    debugfs_create_file("access_count", 0440, NULL,
 				                            conv_ftl, &access_count_fops);
+	conv_ftl->debug_access_inject =
+		    debugfs_create_file("access_inject", 0200, NULL,
+				                            conv_ftl, &access_inject_fops);
 
 	return;
 }
@@ -1466,6 +1533,10 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 	if (conv_ftl->debug_access_count) {
 		debugfs_remove(conv_ftl->debug_access_count);
 		conv_ftl->debug_access_count = NULL;
+	}
+	if (conv_ftl->debug_access_inject) {
+		debugfs_remove(conv_ftl->debug_access_inject);
+		conv_ftl->debug_access_inject = NULL;
 	}
 
     remove_lines(conv_ftl);
