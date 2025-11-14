@@ -19,9 +19,9 @@ RUN_NORMAL=${RUN_NORMAL:-0}
 NORMAL_MEAN=${NORMAL_MEAN:-5000}
 NORMAL_STDDEV=${NORMAL_STDDEV:-800}
 NORMAL_SEED=${NORMAL_SEED:-314159}
-SQLITE_TABLES=${SQLITE_TABLES:-10}
-SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
+SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-6G}
 SQLITE_TRACE_DIR=${SQLITE_TRACE_DIR:-}
+SCAN_ITERS=${SCAN_ITERS:-10}
 
 run_fragment_suite() {
     local mode=$1
@@ -38,9 +38,7 @@ run_fragment_suite() {
 
     sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
     numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append --mode init \
-        --table-count "$SQLITE_TABLES" \
         --target-bytes "$SQLITE_TARGET_BYTES" \
-        --reads "$READ_QUERIES" \
         --zipf-seed "$ZIPF_SEED" \
         --exp-seed "$EXP_SEED" \
         --normal-seed "$NORMAL_SEED" \
@@ -137,6 +135,12 @@ run_fragment_suite() {
             --human-log \
             > "./$RESULT_FOLDER/sqlite_${tag}_normal.txt"
     fi
+
+    sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+    numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append \
+        --mode scan --scan-iters "$SCAN_ITERS" \
+        --tag "$tag" \
+        > "./$RESULT_FOLDER/sqlite_${tag}_scan.txt"
 
     source resetdevice.sh
 }
