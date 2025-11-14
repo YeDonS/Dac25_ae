@@ -492,12 +492,18 @@ static int access_count_open(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations access_count_fops = {
-	    .owner   = THIS_MODULE,
-	        .open    = access_count_open,
-		    .read    = seq_read,
-		        .llseek  = seq_lseek,
-			    .release = single_release,
+	.owner = THIS_MODULE,
+	.open = access_count_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
 };
+
+static int access_inject_open(struct inode *inode, struct file *file)
+{
+	file->private_data = inode->i_private;
+	return nonseekable_open(inode, file);
+}
 
 static ssize_t access_inject_write(struct file *file, const char __user *user_buf,
 				   size_t len, loff_t *ppos)
@@ -555,7 +561,7 @@ static ssize_t access_inject_write(struct file *file, const char __user *user_bu
 
 static const struct file_operations access_inject_fops = {
 	.owner = THIS_MODULE,
-	.open = simple_open,
+	.open = access_inject_open,
 	.write = access_inject_write,
 	.llseek = no_llseek,
 };
