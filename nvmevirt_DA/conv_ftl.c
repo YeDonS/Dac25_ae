@@ -11,6 +11,7 @@
 #include <linux/math64.h>
 #include <linux/ctype.h>
 #include <linux/uaccess.h>
+#include <linux/mutex.h>
 /* kthread/waitqueue no longer needed (threads removed) */
 
 #include "nvmev.h"
@@ -72,6 +73,43 @@ static inline uint8_t qlc_page_type_from_index(uint32_t pg)
 static inline bool qlc_page_matches_type(uint32_t pg, uint32_t type)
 {
 	return qlc_page_type_from_index(pg) == (type % QLC_PAGE_PATTERN);
+}
+
+static struct dentry *nvmev_debug_root;
+static DEFINE_MUTEX(nvmev_debug_lock);
+static atomic_t nvmev_debug_counter = ATOMIC_INIT(0);
+
+static struct dentry *nvmev_debugfs_root(void)
+{
+	struct dentry *root;
+
+	mutex_lock(&nvmev_debug_lock);
+	if (!nvmev_debug_root)
+		nvmev_debug_root = debugfs_create_dir("nvmev", NULL);
+	root = nvmev_debug_root;
+	if (IS_ERR(root))
+		root = NULL;
+	mutex_unlock(&nvmev_debug_lock);
+	return root;
+}
+
+static void nvmev_debugfs_init_instance(struct conv_ftl *conv_ftl)
+{
+	struct dentry *root = nvmev_debugfs_root();
+	struct dentry *dir = NULL;
+	int inst_id;
+	char name[32];
+
+	if (!root)
+		return;
+
+	inst_id = atomic_inc_return(&nvmev_debug_counter) - 1;
+	snprintf(name, sizeof(name), "ftl%d", inst_id);
+	dir = debugfs_create_dir(name, root);
+	if (IS_ERR(dir))
+		dir = NULL;
+
+	conv_ftl->debug_dir = dir;
 }
 
 struct line_pool_stats {
@@ -514,7 +552,8 @@ static ssize_t access_inject_write(struct file *file, const char __user *user_bu
 	struct ssdparams *spp;
 	char kbuf[256];
 	size_t copy;
-	char *cursor;
+	char *cursor, *token_end;
+	char *count_str = NULL;
 	unsigned long long lpn, count;
 	int ret;
 
@@ -545,23 +584,38 @@ static ssize_t access_inject_write(struct file *file, const char __user *user_bu
 		return -EINVAL;
 	}
 
+	token_end = cursor;
+	while (*token_end && !isspace(*token_end))
+		token_end++;
+	if (*token_end) {
+		*token_end = '\0';
+		count_str = token_end + 1;
+	} else {
+		count_str = token_end;
+	}
+
 	ret = kstrtoull(cursor, 10, &lpn);
 	if (ret) {
-		NVMEV_ERROR("access_inject_write: invalid LPN in '%s' (ret=%d)\n", kbuf, ret);
+		NVMEV_ERROR("access_inject_write: invalid LPN token '%s' (ret=%d)\n", cursor, ret);
 		return ret;
 	}
 
-	while (*cursor && !isspace(*cursor))
-		cursor++;
-	cursor = skip_spaces(cursor);
-	if (!*cursor) {
+	count_str = skip_spaces(count_str);
+	if (!count_str || !*count_str) {
 		NVMEV_ERROR("access_inject_write: missing count token after LPN=%llu\n", lpn);
 		return -EINVAL;
 	}
 
-	ret = kstrtoull(cursor, 10, &count);
+	token_end = count_str;
+	while (*token_end && !isspace(*token_end))
+		token_end++;
+	if (*token_end)
+		*token_end = '\0';
+
+	ret = kstrtoull(count_str, 10, &count);
 	if (ret) {
-		NVMEV_ERROR("access_inject_write: invalid count for LPN=%llu (ret=%d)\n", lpn, ret);
+		NVMEV_ERROR("access_inject_write: invalid count token '%s' for LPN=%llu (ret=%d)\n",
+			    count_str, lpn, ret);
 		return ret;
 	}
 
@@ -1540,12 +1594,18 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	NVMEV_INFO("Per-block pages: SLC=%u, QLC=%u (pattern=%u)\n",
 		   conv_ftl->slc_pgs_per_blk, conv_ftl->qlc_pgs_per_blk, QLC_PAGE_PATTERN);
 
-	conv_ftl->debug_access_count =
-		    debugfs_create_file("access_count", 0440, NULL,
-				                            conv_ftl, &access_count_fops);
-	conv_ftl->debug_access_inject =
-		    debugfs_create_file("access_inject", 0200, NULL,
-				                            conv_ftl, &access_inject_fops);
+	nvmev_debugfs_init_instance(conv_ftl);
+	{
+		struct dentry *parent = conv_ftl->debug_dir ? conv_ftl->debug_dir :
+							   nvmev_debugfs_root();
+
+		conv_ftl->debug_access_count =
+			debugfs_create_file("access_count", 0440, parent,
+					    conv_ftl, &access_count_fops);
+		conv_ftl->debug_access_inject =
+			debugfs_create_file("access_inject", 0200, parent,
+					    conv_ftl, &access_inject_fops);
+	}
 
 	return;
 }
@@ -1554,13 +1614,20 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
 	/* 无后台线程可停止（同步模式） */
 
-	if (conv_ftl->debug_access_count) {
-		debugfs_remove(conv_ftl->debug_access_count);
+	if (conv_ftl->debug_dir) {
+		debugfs_remove_recursive(conv_ftl->debug_dir);
+		conv_ftl->debug_dir = NULL;
 		conv_ftl->debug_access_count = NULL;
-	}
-	if (conv_ftl->debug_access_inject) {
-		debugfs_remove(conv_ftl->debug_access_inject);
 		conv_ftl->debug_access_inject = NULL;
+	} else {
+		if (conv_ftl->debug_access_count) {
+			debugfs_remove(conv_ftl->debug_access_count);
+			conv_ftl->debug_access_count = NULL;
+		}
+		if (conv_ftl->debug_access_inject) {
+			debugfs_remove(conv_ftl->debug_access_inject);
+			conv_ftl->debug_access_inject = NULL;
+		}
 	}
 
     remove_lines(conv_ftl);
