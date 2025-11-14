@@ -35,7 +35,8 @@
 #define TRACE_FILENAME_FMT       "sqlite_trace_%s_%s.trace"
 #define HEAT_FILENAME_FMT        "sqlite_heat_%s.csv"
 #define DUMMY_FILENAME_FMT       "sqlite_dummy_%s.bin"
-#define ACCESS_INJECT_PATH       "/sys/kernel/debug/access_inject"
+#define ACCESS_COUNT_PATH        "/sys/kernel/debug/nvmev/ftl0/access_count"
+#define ACCESS_INJECT_PATH       "/sys/kernel/debug/nvmev/ftl0/access_inject"
 #define DEFAULT_TAG              "default"
 #define MAX_TABLE_NAME           64
 #define NORMAL_MEAN_SENTINEL     (-1.0)
@@ -47,6 +48,8 @@
 #define DUMMY_CHUNK_BYTES        (100ULL * 1024ULL)
 #define DUMMY_TOTAL_BYTES        (4ULL << 30)
 #define SCAN_ITER_DEFAULT        10U
+#define LOGICAL_PAGE_BYTES       4096ULL
+#define LPN_PER_ROW              (ROW_PAYLOAD_BYTES / LOGICAL_PAGE_BYTES)
 
 typedef unsigned int UINT32;
 
@@ -1114,6 +1117,15 @@ static int inject_heat_into_ftl(const unsigned int *heat, unsigned int total_row
 {
 	int fd;
 	char line[64];
+	unsigned int max_lpn = 0;
+	FILE *count_fp = fopen(ACCESS_COUNT_PATH, "r");
+	if (count_fp) {
+		while (fgets(line, sizeof(line), count_fp))
+			max_lpn++;
+		fclose(count_fp);
+	}
+	if (max_lpn == 0 || max_lpn > total_rows)
+		max_lpn = total_rows;
 
 	if (!heat || total_rows == 0)
 		return -EINVAL;
@@ -1124,22 +1136,43 @@ static int inject_heat_into_ftl(const unsigned int *heat, unsigned int total_row
 		return -errno;
 	}
 
-	for (unsigned int idx = 0; idx < total_rows; ++idx) {
-		int len = snprintf(line, sizeof(line), "%u %u\n", idx, heat[idx]);
-		if (len <= 0 || len >= (int)sizeof(line)) {
-			fprintf(stderr, "access_inject line too long for idx=%u\n", idx);
-			close(fd);
-			return -EOVERFLOW;
-		}
-		if (write(fd, line, len) != len) {
-			perror("write access_inject");
-			close(fd);
-			return -EIO;
+	unsigned long long current_lpn = 0;
+	bool truncated = false;
+	unsigned int lpns_per_row = LPN_PER_ROW ? (unsigned int)LPN_PER_ROW : 1;
+
+	for (unsigned int row = 0; row < total_rows; ++row) {
+		unsigned int value = heat[row];
+		for (unsigned int seg = 0; seg < lpns_per_row; ++seg) {
+			unsigned long long lpn = (unsigned long long)row * lpns_per_row + seg;
+			current_lpn = lpn;
+			if (lpn >= max_lpn) {
+				truncated = true;
+				goto out_close;
+			}
+
+			int len = snprintf(line, sizeof(line), "%llu %u\n", lpn, value);
+			if (len <= 0 || len >= (int)sizeof(line)) {
+				fprintf(stderr, "access_inject line too long for lpn=%llu\n", lpn);
+				close(fd);
+				return -EOVERFLOW;
+			}
+			if (write(fd, line, len) != len) {
+				perror("write access_inject");
+				fprintf(stderr, "failed at lpn=%llu (max_lpn=%u)\n", lpn, max_lpn);
+				close(fd);
+				return -EIO;
+			}
 		}
 	}
 
+out_close:
 	close(fd);
+	if (truncated) {
+		fprintf(stderr, "access_inject stopped at lpn=%llu due to max_lpn=%u\n",
+			current_lpn, max_lpn);
+	}
 	return 0;
+
 }
 
 static int run_single_table_insert(const struct dataset_layout *layout,
