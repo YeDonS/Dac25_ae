@@ -634,6 +634,7 @@ static void NVMeV_exit(void)
 	NVMEV_IO_PROC_FINAL(nvmev_vdev);
 
 	NVMEV_NAMESPACE_FINAL(nvmev_vdev);
+	nvmev_debugfs_cleanup_root();
 	NVMEV_STORAGE_FINAL(nvmev_vdev);
 
 	if (io_using_dma) {
