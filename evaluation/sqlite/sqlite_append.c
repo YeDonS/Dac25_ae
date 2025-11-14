@@ -1429,9 +1429,10 @@ static int run_scan_mode(const struct workload_options *opts)
 	struct dataset_layout layout = {};
 	char layout_path[PATH_MAX];
 	char db_path[PATH_MAX];
+	char table_name[MAX_TABLE_NAME];
+	char scan_sql[256];
 	sqlite3 *db = NULL;
 	sqlite3_stmt *stmt = NULL;
-	const char *scan_sql = "SELECT str1,str2,str3,str4 FROM DB1 ORDER BY id;";
 	unsigned int scan_iters = opts->scan_iters ? opts->scan_iters : SCAN_ITER_DEFAULT;
 	double total_bytes_mb;
 	double throughput_sum = 0.0;
@@ -1445,6 +1446,10 @@ static int run_scan_mode(const struct workload_options *opts)
 		fprintf(stderr, "scan mode requires single-table layout\n");
 		goto out;
 	}
+
+	build_table_name(table_name, sizeof(table_name), 0);
+	snprintf(scan_sql, sizeof(scan_sql),
+		 "SELECT str1,str2,str3,str4 FROM %s ORDER BY id;", table_name);
 
 	total_bytes_mb = (double)layout.total_rows * ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
 	build_db_path(db_path, sizeof(db_path), opts);
