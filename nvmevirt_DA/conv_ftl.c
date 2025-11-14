@@ -84,13 +84,37 @@ static struct dentry *nvmev_debugfs_root(void)
 	struct dentry *root;
 
 	mutex_lock(&nvmev_debug_lock);
-	if (!nvmev_debug_root)
-		nvmev_debug_root = debugfs_create_dir("nvmev", NULL);
+	if (!nvmev_debug_root) {
+		struct dentry *created = debugfs_create_dir("nvmev", NULL);
+
+		if (IS_ERR(created)) {
+			if (PTR_ERR(created) == -EEXIST) {
+				created = debugfs_lookup("nvmev", NULL);
+				if (!created)
+					created = NULL;
+			} else {
+				created = NULL;
+			}
+		}
+
+		nvmev_debug_root = created;
+	}
+
 	root = nvmev_debug_root;
-	if (IS_ERR(root))
-		root = NULL;
 	mutex_unlock(&nvmev_debug_lock);
+
 	return root;
+}
+
+void nvmev_debugfs_cleanup_root(void)
+{
+	mutex_lock(&nvmev_debug_lock);
+	if (nvmev_debug_root) {
+		debugfs_remove_recursive(nvmev_debug_root);
+		nvmev_debug_root = NULL;
+	}
+	atomic_set(&nvmev_debug_counter, 0);
+	mutex_unlock(&nvmev_debug_lock);
 }
 
 static void nvmev_debugfs_init_instance(struct conv_ftl *conv_ftl)

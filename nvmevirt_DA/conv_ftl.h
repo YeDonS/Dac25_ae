@@ -136,6 +136,7 @@ struct conv_ftl {
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
 	uint64_t migration_cnt;      /* 迁移计数 */
+	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
 	struct dentry *debug_access_inject; /* debugfs entry for counter injection */
 	
@@ -172,5 +173,7 @@ void conv_remove_namespace(struct nvmev_ns *ns);
 
 bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 			   struct nvmev_result *ret);
+
+void nvmev_debugfs_cleanup_root(void);
 
 #endif
