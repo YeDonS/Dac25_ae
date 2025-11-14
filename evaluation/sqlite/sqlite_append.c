@@ -1124,11 +1124,16 @@ static int inject_heat_into_ftl(const unsigned int *heat, unsigned int total_row
 			max_lpn++;
 		fclose(count_fp);
 	}
-	if (max_lpn == 0 || max_lpn > total_rows)
-		max_lpn = total_rows;
 
 	if (!heat || total_rows == 0)
 		return -EINVAL;
+
+	unsigned int lpns_per_row = LPN_PER_ROW ? (unsigned int)LPN_PER_ROW : 1;
+	unsigned long long total_needed_lpns =
+		(unsigned long long)total_rows * (unsigned long long)lpns_per_row;
+
+	if (max_lpn == 0 || max_lpn > total_needed_lpns)
+		max_lpn = (unsigned int)total_needed_lpns;
 
 	fd = open(ACCESS_INJECT_PATH, O_WRONLY | O_CLOEXEC);
 	if (fd < 0) {
@@ -1138,7 +1143,6 @@ static int inject_heat_into_ftl(const unsigned int *heat, unsigned int total_row
 
 	unsigned long long current_lpn = 0;
 	bool truncated = false;
-	unsigned int lpns_per_row = LPN_PER_ROW ? (unsigned int)LPN_PER_ROW : 1;
 
 	for (unsigned int row = 0; row < total_rows; ++row) {
 		unsigned int value = heat[row];
@@ -1187,6 +1191,7 @@ static int run_single_table_insert(const struct dataset_layout *layout,
 	char rstr2[STR2_LEN + 1];
 	char rstr3[STR3_LEN + 1];
 	char rstr4[STR4_LEN + 1];
+	char table_name[MAX_TABLE_NAME];
 	unsigned int total_rows = layout->rows_per_table[0];
 	unsigned long long dummy_written = 0;
 	int dummy_fd = -1;
@@ -1216,24 +1221,27 @@ static int run_single_table_insert(const struct dataset_layout *layout,
 		goto out;
 	}
 
+	build_table_name(table_name, sizeof(table_name), 0);
+
 	snprintf(sql, sizeof(sql),
-		 "CREATE TABLE DB1("
+		 "CREATE TABLE %s("
 		 "id INT PRIMARY KEY,"
 		 "str1 VARCHAR(%d),"
 		 "str2 VARCHAR(%d),"
 		 "str3 VARCHAR(%d),"
 		 "str4 VARCHAR(%d));",
-		 STR1_LEN, STR2_LEN, STR3_LEN, STR4_LEN);
+		 table_name, STR1_LEN, STR2_LEN, STR3_LEN, STR4_LEN);
 	rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Failed to create DB1 (%s)\n", sqlite3_errmsg(db));
+		fprintf(stderr, "Failed to create table %s (%s)\n", table_name, sqlite3_errmsg(db));
 		goto out;
 	}
 
-	snprintf(sql, sizeof(sql), "INSERT INTO DB1 VALUES(?, ?, ?, ?, ?);");
+	snprintf(sql, sizeof(sql), "INSERT INTO %s VALUES(?, ?, ?, ?, ?);", table_name);
 	rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Failed to prepare insert statement: %s\n", sqlite3_errmsg(db));
+		fprintf(stderr, "Failed to prepare insert statement for %s: %s\n",
+			table_name, sqlite3_errmsg(db));
 		goto out;
 	}
 
