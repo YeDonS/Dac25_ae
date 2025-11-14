@@ -501,6 +501,7 @@ static const struct file_operations access_count_fops = {
 
 static int access_inject_open(struct inode *inode, struct file *file)
 {
+	pr_info("access_inject_open: inode=%p private=%p\n", inode, inode->i_private);
 	file->private_data = inode->i_private;
 	return nonseekable_open(inode, file);
 }
@@ -517,13 +518,18 @@ static ssize_t access_inject_write(struct file *file, const char __user *user_bu
 	unsigned long long lpn, count;
 	int ret;
 
-	if (!conv_ftl || !conv_ftl->ssd)
+	if (!conv_ftl || !conv_ftl->ssd) {
+		NVMEV_ERROR("access_inject_write: missing conv_ftl (%p) or ssd (%p)\n",
+			    conv_ftl, conv_ftl ? conv_ftl->ssd : NULL);
 		return -EINVAL;
+	}
 
 	ht = &conv_ftl->heat_track;
 	spp = &conv_ftl->ssd->sp;
-	if (!ht->access_count)
+	if (!ht->access_count) {
+		NVMEV_ERROR("access_inject_write: access_count not initialized\n");
 		return -EINVAL;
+	}
 
 	if (len == 0)
 		return 0;
@@ -534,27 +540,39 @@ static ssize_t access_inject_write(struct file *file, const char __user *user_bu
 	kbuf[copy] = '\0';
 
 	cursor = skip_spaces(kbuf);
-	if (!*cursor)
+	if (!*cursor) {
+		NVMEV_ERROR("access_inject_write: missing LPN token in '%s'\n", kbuf);
 		return -EINVAL;
+	}
 
 	ret = kstrtoull(cursor, 10, &lpn);
-	if (ret)
+	if (ret) {
+		NVMEV_ERROR("access_inject_write: invalid LPN in '%s' (ret=%d)\n", kbuf, ret);
 		return ret;
+	}
 
 	while (*cursor && !isspace(*cursor))
 		cursor++;
 	cursor = skip_spaces(cursor);
-	if (!*cursor)
+	if (!*cursor) {
+		NVMEV_ERROR("access_inject_write: missing count token after LPN=%llu\n", lpn);
 		return -EINVAL;
+	}
 
 	ret = kstrtoull(cursor, 10, &count);
-	if (ret)
+	if (ret) {
+		NVMEV_ERROR("access_inject_write: invalid count for LPN=%llu (ret=%d)\n", lpn, ret);
 		return ret;
+	}
 
-	if (lpn >= spp->tt_pgs)
+	if (lpn >= spp->tt_pgs) {
+		NVMEV_ERROR("access_inject_write: LPN=%llu out of range (tt_pgs=%lu)\n",
+			    lpn, spp->tt_pgs);
 		return -ERANGE;
+	}
 
 	ht->access_count[lpn] = count;
+	pr_debug("access_inject_write: LPN=%llu heat=%llu\n", lpn, count);
 
 	return len;
 }
