@@ -155,7 +155,7 @@ run_normal_suite() {
 
     drop_caches
     numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append \
-        --mode read --distribution uniform --reads "$total_rows" \
+        --mode read --distribution sequential --reads "$total_rows" \
         --tag "$tag" \
         --log "./$RESULT_FOLDER/sqlite_${tag}_${dist_suffix}_fullcover_trace.csv" \
         --heatmap "./$RESULT_FOLDER/sqlite_${tag}_${dist_suffix}_fullcover_heat.csv" \
