@@ -94,6 +94,7 @@ enum distribution_type {
 	DIST_ZIPF,
 	DIST_EXPONENTIAL,
 	DIST_NORMAL,
+	DIST_SEQUENTIAL,
 };
 
 enum trace_mode {
@@ -241,7 +242,7 @@ static void usage(const char *prog)
 		"                 [--target-bytes SZ] [--reads N]\n"
 		"                 [--zipf-seed S] [--exp-seed S] [--normal-seed S]\n"
 		"                 [--tag NAME] [--trace-dir DIR]\n"
-		"  %s --mode read --distribution zipf|exp|uniform|normal\n"
+		"  %s --mode read --distribution zipf|exp|uniform|normal|sequential\n"
 		"                 [--reads N] [--alpha A] [--lambda L]\n"
 		"                 [--seed S] [--trace-mode record|replay]\n"
 		"                 [--trace-path PATH] [--log path] [--heatmap path]\n"
@@ -292,6 +293,8 @@ static const char *dist_name(enum distribution_type dist)
 		return "exp";
 	case DIST_NORMAL:
 		return "normal";
+	case DIST_SEQUENTIAL:
+		return "sequential";
 	default:
 		return "unknown";
 	}
@@ -307,6 +310,8 @@ static enum distribution_type parse_distribution(const char *arg)
 		return DIST_UNIFORM;
 	if (strcasecmp(arg, "normal") == 0 || strcasecmp(arg, "gaussian") == 0)
 		return DIST_NORMAL;
+	if (strcasecmp(arg, "sequential") == 0 || strcasecmp(arg, "seq") == 0)
+		return DIST_SEQUENTIAL;
 
 	fprintf(stderr, "Unknown distribution '%s'\n", arg);
 	exit(EXIT_FAILURE);
@@ -398,6 +403,8 @@ static const char *trace_suffix(enum distribution_type dist)
 		return "exp";
 	case DIST_NORMAL:
 		return "normal";
+	case DIST_SEQUENTIAL:
+		return "sequential";
 	case DIST_UNIFORM:
 	default:
 		return "uniform";
@@ -768,6 +775,7 @@ static unsigned int effective_seed(const struct workload_options *opts,
 		return opts->exp_seed ? opts->exp_seed : opts->seed;
 	case DIST_NORMAL:
 		return opts->normal_seed ? opts->normal_seed : opts->seed;
+	case DIST_SEQUENTIAL:
 	case DIST_UNIFORM:
 	default:
 		return opts->seed;
@@ -828,6 +836,9 @@ static int fill_request_sequence(struct request_sequence *seq,
 		unsigned int logical_idx;
 
 		switch (opts->dist) {
+		case DIST_SEQUENTIAL:
+			logical_idx = total_rows ? (i % total_rows) : 0U;
+			break;
 		case DIST_ZIPF:
 			logical_idx = sample_zipf(&zipf, rand_uniform(&rng_state));
 			break;
@@ -898,6 +909,8 @@ static enum distribution_type parse_dist_name(const char *name)
 		return DIST_EXPONENTIAL;
 	if (strcasecmp(name, "normal") == 0 || strcasecmp(name, "gaussian") == 0)
 		return DIST_NORMAL;
+	if (strcasecmp(name, "sequential") == 0 || strcasecmp(name, "seq") == 0)
+		return DIST_SEQUENTIAL;
 	return DIST_UNIFORM;
 }
 
