@@ -11,10 +11,10 @@ if [[ ! -f ./sqlite_append ]] || [[ $FORCE_REBUILD == 1 ]]; then
     gcc -D TARGET_FOLDER="$TARGET_FOLDER" -o ./sqlite_append ./$SRC_PATH/sqlite_append.c -lsqlite3 -lm
 fi
 
-READ_QUERIES=${READ_QUERIES:-6000}
+READ_QUERIES=${READ_QUERIES:-1000000}
 ZIPF_ALPHA=${ZIPF_ALPHA:-1.2}
 ZIPF_SEED=${ZIPF_SEED:-42}
-EXP_LAMBDA=${EXP_LAMBDA:-0.0008}
+EXP_LAMBDA=${EXP_LAMBDA:-0.000001}
 EXP_SEED=${EXP_SEED:-4242}
 NORMAL_MEAN=${NORMAL_MEAN:-5000}
 NORMAL_STDDEV=${NORMAL_STDDEV:-800}
@@ -99,6 +99,7 @@ run_exp_suite() {
     local trace_dir="${SQLITE_TRACE_DIR:-${TARGET_FOLDER%/}/sqlite_traces}"
     local trace_base="${trace_dir%/}"
     local trace_exp="${trace_base}/sqlite_trace_${tag}_exp.trace"
+    local layout_meta="${TARGET_FOLDER%/}/sqlite_layout_${tag}.meta"
 
     ./nvmevstart_on.sh
     sleep 1
@@ -126,6 +127,19 @@ run_exp_suite() {
         source resetdevice.sh
         exit 1
     fi
+    if [[ ! -f "$layout_meta" ]]; then
+        echo "Layout file not found: $layout_meta" >&2
+        source resetdevice.sh
+        exit 1
+    fi
+
+    local total_rows
+    total_rows=$(grep -m1 '^total_rows=' "$layout_meta" | cut -d'=' -f2)
+    if [[ -z $total_rows ]]; then
+        echo "Failed to parse total_rows from $layout_meta" >&2
+        source resetdevice.sh
+        exit 1
+    fi
 
     drop_caches
     numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append \
@@ -137,6 +151,14 @@ run_exp_suite() {
         --heatmap "./$RESULT_FOLDER/sqlite_${tag}_exp_heat.csv" \
         --human-log \
         >"./$RESULT_FOLDER/sqlite_${tag}_exp.txt"
+
+    drop_caches
+    numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append \
+        --mode read --distribution uniform --reads "$total_rows" \
+        --tag "$tag" \
+        --log "./$RESULT_FOLDER/sqlite_${tag}_${dist_suffix}_fullcover_trace.csv" \
+        --heatmap "./$RESULT_FOLDER/sqlite_${tag}_${dist_suffix}_fullcover_heat.csv" \
+        >"./$RESULT_FOLDER/sqlite_${tag}_${dist_suffix}_fullcover.txt"
 
     run_cold_scan "$tag" "$dist_suffix"
 
