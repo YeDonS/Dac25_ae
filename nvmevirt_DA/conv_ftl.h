@@ -67,6 +67,7 @@ struct write_flow_control {
 struct heat_tracking {
 	uint64_t *access_count;     /* 每个 LPN 的访问计数 */
 	uint64_t *last_access_time; /* 每个 LPN 的最后访问时间 */
+	uint64_t *write_epoch;      /* 最近写入序号 */
 	uint32_t migration_threshold; /* 迁移阈值 */
 };
 
@@ -136,6 +137,7 @@ struct conv_ftl {
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
 	uint64_t migration_cnt;      /* 迁移计数 */
+	uint64_t total_host_writes;  /* 总写入块数 */
 	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
 	struct dentry *debug_access_inject; /* debugfs entry for counter injection */
