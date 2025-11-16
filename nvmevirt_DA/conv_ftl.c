@@ -77,6 +77,8 @@ static inline bool qlc_page_matches_type(uint32_t pg, uint32_t type)
 	return qlc_page_type_from_index(pg) == (type % QLC_PAGE_PATTERN);
 }
 
+static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn);
+
 static struct dentry *nvmev_debug_root;
 static DEFINE_MUTEX(nvmev_debug_lock);
 static atomic_t nvmev_debug_counter = ATOMIC_INIT(0);
@@ -239,12 +241,13 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct heat_tracking *ht = &conv_ftl->heat_track;
 	uint32_t free_pct;
-    const uint32_t MAX_MIGRATE = 32;
-    const uint32_t MAX_SCAN = 4096;
-    static uint64_t cursor = 0;
-    uint64_t start, idx;
-    uint32_t scanned = 0;
-    uint32_t migrated = 0;
+	const uint32_t MAX_MIGRATE = 32;
+	const uint32_t MAX_SCAN = 4096;
+	static uint64_t cursor = 0;
+	uint64_t start, idx;
+	uint32_t scanned = 0;
+	uint32_t migrated = 0;
+	uint64_t dyn_thresh;
 
 	collect_slc_stats(conv_ftl, &slc_stats);
 	if (!slc_stats.total)
@@ -258,7 +261,7 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
 	if (!conv_ftl->page_in_slc || !ht || !ht->access_count)
 		return;
 
-	uint64_t dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
+	dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
 	if (dyn_thresh == 0)
 		dyn_thresh = 1;
 	start = cursor % spp->tt_pgs;
@@ -298,12 +301,13 @@ next_idx:
 /* 无阈值：总是尝试从 SLC 迁移少量更冷页面到 QLC */
 static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_pages)
 {
-    struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct heat_tracking *ht = &conv_ftl->heat_track;
 	uint32_t migrated = 0;
 	uint32_t scanned = 0;
 	static uint64_t cursor2 = 0;
 	uint64_t idx;
+	uint64_t dyn_thresh;
 
     NVMEV_DEBUG("[MIGRATION_DEBUG] migrate_some_cold_from_slc called: max_pages=%u\n", max_pages);
     
@@ -313,7 +317,7 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
 		return;
 	}
 
-	uint64_t dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
+	dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
 	if (dyn_thresh == 0)
 		dyn_thresh = 1;
 	idx = cursor2 % spp->tt_pgs;
