@@ -48,7 +48,7 @@
 #define DEFAULT_CHUNK_ROWS       16U   /* ~64 logical pages per chunk */
 #define DEFAULT_READ_INTERVAL    1000U
 #define DEFAULT_READS_PER_EVENT  1000U
-#define DEFAULT_COLD_SCAN_ITERS  5U
+#define DEFAULT_COLD_SCAN_ITERS  1U
 
 typedef unsigned int UINT32;
 
@@ -1790,10 +1790,8 @@ static int run_scan_mode(const struct workload_options *opts)
 	struct dataset_layout layout = {};
 	char layout_path[PATH_MAX];
 	char db_path[PATH_MAX];
-	char table_name[MAX_TABLE_NAME];
-	char scan_sql[256];
 	sqlite3 *db = NULL;
-	sqlite3_stmt *stmt = NULL;
+	sqlite3_stmt **stmts = NULL;
 	unsigned int scan_iters = opts->scan_iters ? opts->scan_iters : SCAN_ITER_DEFAULT;
 	double total_bytes_mb;
 	double throughput_sum = 0.0;
@@ -1802,15 +1800,6 @@ static int run_scan_mode(const struct workload_options *opts)
 	build_layout_path(layout_path, sizeof(layout_path), opts);
 	if (dataset_layout_from_file(layout_path, &layout) != 0)
 		return -1;
-
-	if (layout.table_count != 1) {
-		fprintf(stderr, "scan mode requires single-table layout\n");
-		goto out;
-	}
-
-	build_table_name(table_name, sizeof(table_name), 0);
-	snprintf(scan_sql, sizeof(scan_sql),
-		 "SELECT str1,str2,str3,str4 FROM %s ORDER BY id;", table_name);
 
 	total_bytes_mb = (double)layout.total_rows * ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
 	build_db_path(db_path, sizeof(db_path), opts);
@@ -1822,24 +1811,42 @@ static int run_scan_mode(const struct workload_options *opts)
 		goto out;
 	}
 
+	stmts = calloc(layout.table_count ? layout.table_count : 1U, sizeof(sqlite3_stmt *));
+	if (!stmts) {
+		fprintf(stderr, "Failed to allocate scan statements\n");
+		goto out;
+	}
+
+	for (unsigned int tbl = 0; tbl < layout.table_count; ++tbl) {
+		char table_name[MAX_TABLE_NAME];
+		char scan_sql[256];
+
+		build_table_name(table_name, sizeof(table_name), tbl);
+		snprintf(scan_sql, sizeof(scan_sql),
+			 "SELECT str1,str2,str3,str4 FROM %s ORDER BY id;", table_name);
+		rc = sqlite3_prepare_v2(db, scan_sql, -1, &stmts[tbl], NULL);
+		if (rc != SQLITE_OK) {
+			fprintf(stderr, "prepare scan failed for %s: %s\n",
+				table_name, sqlite3_errmsg(db));
+			goto out;
+		}
+	}
+
 	for (unsigned int iter = 0; iter < scan_iters; ++iter) {
 		double start = monotonic_sec();
 
-		rc = sqlite3_prepare_v2(db, scan_sql, -1, &stmt, NULL);
-		if (rc != SQLITE_OK) {
-			fprintf(stderr, "prepare scan failed: %s\n", sqlite3_errmsg(db));
-			goto out;
-		}
+		for (unsigned int tbl = 0; tbl < layout.table_count; ++tbl) {
+			sqlite3_stmt *stmt = stmts[tbl];
+			int step_rc;
 
-		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
-			;
-		if (rc != SQLITE_DONE) {
-			fprintf(stderr, "scan step error: %s\n", sqlite3_errmsg(db));
-			goto out;
+			sqlite3_reset(stmt);
+			while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW)
+				;
+			if (step_rc != SQLITE_DONE) {
+				fprintf(stderr, "scan step error: %s\n", sqlite3_errmsg(db));
+				goto out;
+			}
 		}
-
-		sqlite3_finalize(stmt);
-		stmt = NULL;
 
 		double end = monotonic_sec();
 		double elapsed = end - start;
@@ -1857,8 +1864,12 @@ static int run_scan_mode(const struct workload_options *opts)
 	rc = 0;
 
 out:
-	if (stmt)
-		sqlite3_finalize(stmt);
+	if (stmts) {
+		for (unsigned int tbl = 0; tbl < layout.table_count; ++tbl)
+			if (stmts[tbl])
+				sqlite3_finalize(stmts[tbl]);
+		free(stmts);
+	}
 	if (db)
 		sqlite3_close(db);
 	dataset_layout_destroy(&layout);
