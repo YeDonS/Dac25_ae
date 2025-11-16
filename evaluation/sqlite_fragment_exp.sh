@@ -54,6 +54,7 @@ run_exp_suite() {
         --rows-per-table "$SQLITE_ROWS_PER_TABLE" \
         --interleave-rows "$SQLITE_INTERLEAVE_ROWS" \
         --interleave-reads "$SQLITE_INTERLEAVE_READS" \
+        --distribution exp \
         --zipf-seed "$ZIPF_SEED" \
         --exp-seed "$EXP_SEED" \
         --normal-seed "$NORMAL_SEED" \
