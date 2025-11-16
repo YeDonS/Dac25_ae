@@ -19,40 +19,20 @@ EXP_SEED=${EXP_SEED:-4242}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
 NORMAL_STDDEV=${NORMAL_STDDEV:-150000}
 NORMAL_SEED=${NORMAL_SEED:-314159}
-SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-6G}
+SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
 SQLITE_TRACE_DIR=${SQLITE_TRACE_DIR:-}
-SCAN_ITERS=${SCAN_ITERS:-10}
+SCAN_ITERS=${SCAN_ITERS:-3}
 
-ACCESS_COUNT_PATH=${ACCESS_COUNT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_count}
-ACCESS_INJECT_PATH=${ACCESS_INJECT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_inject}
+SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-100}
+SQLITE_CHUNK_ROWS=${SQLITE_CHUNK_ROWS:-16}
+SQLITE_CHUNK_READ_INTERVAL=${SQLITE_CHUNK_READ_INTERVAL:-1000}
+SQLITE_CHUNK_READ_OPS=${SQLITE_CHUNK_READ_OPS:-1000}
 
 mkdir -p "$RESULT_FOLDER"
 
 drop_caches() {
     sync
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
-}
-
-ensure_access_inject() {
-    local debugfs_mount
-    debugfs_mount=$(mount | grep -w debugfs || true)
-    if [[ -z $debugfs_mount ]]; then
-        sudo mount -t debugfs debugfs /sys/kernel/debug
-    fi
-
-    local inject_path="$ACCESS_INJECT_PATH"
-    local count_path="$ACCESS_COUNT_PATH"
-    local attempts=40
-    while (( attempts > 0 )); do
-        if [[ -w $inject_path && -r $count_path ]]; then
-            return 0
-        fi
-        sleep 0.25
-        attempts=$((attempts - 1))
-    done
-
-    echo "access inject/count nodes not ready under /sys/kernel/debug" >&2
-    exit 1
 }
 
 run_cold_scan() {
@@ -105,12 +85,15 @@ run_normal_suite() {
     sleep 1
     lsblk
     source setdevice.sh
-    ensure_access_inject
     mkdir -p "$trace_dir"
 
     drop_caches
     numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append --mode init \
         --target-bytes "$SQLITE_TARGET_BYTES" \
+        --table-count "$SQLITE_TABLE_COUNT" \
+        --chunk-rows "$SQLITE_CHUNK_ROWS" \
+        --chunk-read-interval "$SQLITE_CHUNK_READ_INTERVAL" \
+        --chunk-read-ops "$SQLITE_CHUNK_READ_OPS" \
         --zipf-seed "$ZIPF_SEED" \
         --exp-seed "$EXP_SEED" \
         --normal-seed "$NORMAL_SEED" \
