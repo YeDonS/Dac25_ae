@@ -971,40 +971,69 @@ static int build_table_read_plan(const struct dataset_layout *layout,
 				 unsigned int reads_per_event,
 				 unsigned int **plan_out)
 {
-	struct request_sequence seq = {};
-	struct workload_options tmp;
+	struct zipf_sampler zipf = {};
 	unsigned int *plan;
-	int rc;
+	unsigned int table_count;
+	unsigned int rng_state;
+	double normal_mean;
+	double normal_stddev;
+	int rc = 0;
 
 	if (!layout || !plan_out)
 		return -EINVAL;
 
-	plan = calloc(layout->table_count, sizeof(unsigned int));
+	table_count = layout->table_count;
+	plan = calloc(table_count ? table_count : 1U, sizeof(unsigned int));
 	if (!plan)
 		return -ENOMEM;
 
-	if (reads_per_event == 0 || layout->table_count == 0) {
+	if (reads_per_event == 0 || table_count == 0) {
 		*plan_out = plan;
 		return 0;
 	}
 
-	tmp = *opts;
-	tmp.reads = reads_per_event;
-	tmp.reads_explicit = true;
+	time_t now = time(NULL);
+	unsigned int global_seed = opts->seed ? opts->seed : (unsigned int)now;
 
-	rc = fill_request_sequence(&seq, layout, &tmp);
-	if (rc != 0) {
-		free(plan);
-		return rc;
+	if (opts->dist == DIST_NORMAL) {
+		normal_mean = opts->normal_mean;
+		if (normal_mean <= NORMAL_MEAN_SENTINEL || normal_mean >= (double)table_count || normal_mean < 0.0)
+			normal_mean = table_count ? ((double)table_count - 1.0) / 2.0 : 0.0;
+		normal_stddev = opts->normal_stddev;
+		if (normal_stddev <= NORMAL_STDDEV_SENTINEL)
+			normal_stddev = table_count ? (double)table_count / 6.0 : 1.0;
+	} else {
+		normal_mean = 0.0;
+		normal_stddev = 1.0;
 	}
 
-	for (unsigned int i = 0; i < seq.count; ++i) {
+	for (unsigned int i = 0; i < reads_per_event; ++i) {
 		unsigned int table_id = 0;
-		if (layout_lookup(layout, seq.logical_idx[i], &table_id, NULL, NULL) == 0)
-			plan[table_id]++;
+		rng_state = global_seed;
+
+		switch (opts->dist) {
+		case DIST_SEQUENTIAL:
+			table_id = table_count ? (i % table_count) : 0U;
+			break;
+		case DIST_ZIPF:
+			table_id = sample_zipf(&zipf, rand_uniform(&rng_state));
+			break;
+		case DIST_EXPONENTIAL:
+			table_id = sample_exponential(table_count, opts->exp_lambda, &rng_state);
+			break;
+		case DIST_NORMAL:
+			table_id = sample_normal(table_count, normal_mean, normal_stddev, &rng_state);
+			break;
+		case DIST_UNIFORM:
+		default:
+			table_id = table_count ? (next_rand(&rng_state) % table_count) : 0U;
+			break;
+		}
+
+		plan[table_id]++;
 	}
 
-	free_request_sequence(&seq);
+	destroy_zipf_sampler(&zipf);
 	*plan_out = plan;
 	return 0;
 }
