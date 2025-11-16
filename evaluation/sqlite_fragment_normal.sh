@@ -23,11 +23,11 @@ SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
 SQLITE_TRACE_DIR=${SQLITE_TRACE_DIR:-}
 
 SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-100}
-SQLITE_CHUNK_ROWS=${SQLITE_CHUNK_ROWS:-16}
-SQLITE_CHUNK_READ_INTERVAL=${SQLITE_CHUNK_READ_INTERVAL:-1000}
-SQLITE_CHUNK_READ_OPS=${SQLITE_CHUNK_READ_OPS:-1000}
+SQLITE_INTERLEAVE_ROWS=${SQLITE_INTERLEAVE_ROWS:-1000}
+SQLITE_INTERLEAVE_READS=${SQLITE_INTERLEAVE_READS:-1000}
 
 mkdir -p "$RESULT_FOLDER"
+mkdir -p "$TARGET_FOLDER"
 
 drop_caches() {
     sync
@@ -51,9 +51,8 @@ run_normal_suite() {
     numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append --mode init \
         --target-bytes "$SQLITE_TARGET_BYTES" \
         --table-count "$SQLITE_TABLE_COUNT" \
-        --chunk-rows "$SQLITE_CHUNK_ROWS" \
-        --chunk-read-interval "$SQLITE_CHUNK_READ_INTERVAL" \
-        --chunk-read-ops "$SQLITE_CHUNK_READ_OPS" \
+        --interleave-rows "$SQLITE_INTERLEAVE_ROWS" \
+        --interleave-reads "$SQLITE_INTERLEAVE_READS" \
         --zipf-seed "$ZIPF_SEED" \
         --exp-seed "$EXP_SEED" \
         --normal-seed "$NORMAL_SEED" \
