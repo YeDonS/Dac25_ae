@@ -21,6 +21,10 @@
 #define TARGET_FOLDER "./device/"
 #endif
 
+#ifndef RESULT_FOLDER
+#define RESULT_FOLDER "./result/"
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -34,7 +38,7 @@
 #define LAYOUT_FILENAME_FMT      "sqlite_layout_%s.meta"
 #define TRACE_FILENAME_FMT       "sqlite_trace_%s_%s.trace"
 #define HEAT_FILENAME_FMT        "sqlite_heat_%s.csv"
-#define CHUNK_STATS_FILENAME_FMT "sqlite_chunk_%s.csv"
+#define ROW_STATS_FILENAME_FMT   "sqlite_row_%s.csv"
 #define TABLE_STATS_FILENAME_FMT "sqlite_table_%s.csv"
 #define DEFAULT_TAG              "default"
 #define MAX_TABLE_NAME           64
@@ -47,8 +51,7 @@
 #define SCAN_ITER_DEFAULT        10U
 #define LOGICAL_PAGE_BYTES       4096ULL
 #define LPN_PER_ROW              (ROW_PAYLOAD_BYTES / LOGICAL_PAGE_BYTES)
-#define DEFAULT_CHUNK_ROWS       16U   /* ~64 logical pages per chunk */
-#define DEFAULT_READ_INTERVAL    1000U
+#define DEFAULT_INTERLEAVE_ROWS  1000U
 #define DEFAULT_READS_PER_EVENT  1000U
 #define DEFAULT_COLD_SCAN_ITERS  1U
 
@@ -78,9 +81,8 @@ static const struct option long_opts[] = {
 	{"trace-path", required_argument, NULL, 1009},
 	{"suppress-report", no_argument, NULL, 1010},
 	{"scan-iters", required_argument, NULL, 1011},
-	{"chunk-rows", required_argument, NULL, 1012},
-	{"chunk-read-interval", required_argument, NULL, 1013},
-	{"chunk-read-ops", required_argument, NULL, 1014},
+	{"interleave-rows", required_argument, NULL, 1012},
+	{"interleave-reads", required_argument, NULL, 1013},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -131,9 +133,8 @@ struct workload_options {
 	bool suppress_report;
 	unsigned int scan_iters;
 	bool reads_explicit;
-	unsigned int chunk_rows;
-	unsigned int init_read_interval_chunks;
-	unsigned int init_reads_per_interval;
+	unsigned int interleave_rows;
+	unsigned int init_reads_per_event;
 };
 
 struct zipf_sampler {
@@ -169,11 +170,8 @@ struct table_state {
 	unsigned int table_id;
 	unsigned int total_rows;
 	unsigned int rows_inserted;
-	unsigned int chunk_rows;
-	unsigned int total_chunks;
-	unsigned int chunks_inserted;
-	unsigned long long *chunk_reads;
-	double *chunk_latency;
+	unsigned long long *row_reads;
+	double *row_latency;
 	sqlite3_stmt *insert_stmt;
 	sqlite3_stmt *select_stmt;
 };
@@ -184,30 +182,15 @@ static int build_trace_with_heat(enum distribution_type dist, unsigned int reads
 				 const struct workload_options *opts,
 				 const struct dataset_layout *layout,
 				 unsigned int *heat);
+static void build_db_path(char *buf, size_t len, const struct workload_options *opts);
+static void build_layout_path(char *buf, size_t len, const struct workload_options *opts);
+static void build_trace_path_for_dist(char *buf, size_t len,
+				      const struct workload_options *opts,
+				      enum distribution_type dist);
+static void build_heat_path(char *buf, size_t len, const struct workload_options *opts);
+static void build_row_stats_path(char *buf, size_t len, const struct workload_options *opts);
+static void build_table_stats_path(char *buf, size_t len, const struct workload_options *opts);
 
-static void build_heat_path(char *buf, size_t len, const struct workload_options *opts)
-{
-	char filename[128];
-
-	snprintf(filename, sizeof(filename), HEAT_FILENAME_FMT, effective_tag(opts));
-	join_path(buf, len, TARGET_FOLDER, filename);
-}
-
-static void build_chunk_stats_path(char *buf, size_t len, const struct workload_options *opts)
-{
-	char filename[128];
-
-	snprintf(filename, sizeof(filename), CHUNK_STATS_FILENAME_FMT, effective_tag(opts));
-	join_path(buf, len, TARGET_FOLDER, filename);
-}
-
-static void build_table_stats_path(char *buf, size_t len, const struct workload_options *opts)
-{
-	char filename[128];
-
-	snprintf(filename, sizeof(filename), TABLE_STATS_FILENAME_FMT, effective_tag(opts));
-	join_path(buf, len, TARGET_FOLDER, filename);
-}
 
 static int save_heat_csv(const char *path, const unsigned int *heat, unsigned int total_rows)
 {
@@ -254,8 +237,7 @@ static void usage(const char *prog)
 		"Usage:\n"
 		"  %s --mode init [--table-count N] [--rows-per-table N]\n"
 		"                 [--target-bytes SZ] [--reads N]\n"
-		"                 [--chunk-rows N] [--chunk-read-interval N]\n"
-		"                 [--chunk-read-ops N]\n"
+		"                 [--interleave-rows N] [--interleave-reads N]\n"
 		"                 [--zipf-seed S] [--exp-seed S] [--normal-seed S]\n"
 		"                 [--tag NAME] [--trace-dir DIR]\n"
 		"  %s --mode read --distribution zipf|exp|uniform|normal|sequential\n"
@@ -394,50 +376,6 @@ static void join_path(char *dst, size_t len, const char *dir, const char *leaf)
 		snprintf(dst, len, "%s/%s", dir, leaf ? leaf : "");
 }
 
-static void build_db_path(char *buf, size_t len, const struct workload_options *opts)
-{
-	char filename[128];
-
-	snprintf(filename, sizeof(filename), DB_FILENAME_FMT, effective_tag(opts));
-	join_path(buf, len, TARGET_FOLDER, filename);
-}
-
-static void build_layout_path(char *buf, size_t len, const struct workload_options *opts)
-{
-	char filename[128];
-
-	snprintf(filename, sizeof(filename), LAYOUT_FILENAME_FMT, effective_tag(opts));
-	join_path(buf, len, TARGET_FOLDER, filename);
-}
-
-static const char *trace_suffix(enum distribution_type dist)
-{
-	switch (dist) {
-	case DIST_ZIPF:
-		return "zipf";
-	case DIST_EXPONENTIAL:
-		return "exp";
-	case DIST_NORMAL:
-		return "normal";
-	case DIST_SEQUENTIAL:
-		return "sequential";
-	case DIST_UNIFORM:
-	default:
-		return "uniform";
-	}
-}
-
-static void build_trace_path_for_dist(char *buf, size_t len,
-				      const struct workload_options *opts,
-				      enum distribution_type dist)
-{
-	char filename[192];
-	const char *dir = opts->trace_dir ? opts->trace_dir : TARGET_FOLDER;
-
-	snprintf(filename, sizeof(filename), TRACE_FILENAME_FMT,
-		 effective_tag(opts), trace_suffix(dist));
-	join_path(buf, len, dir, filename);
-}
 
 static void build_default_trace_path(char *buf, size_t len, const struct workload_options *opts)
 {
@@ -895,45 +833,27 @@ static void destroy_table_states(struct table_state *tables, unsigned int count)
 			sqlite3_finalize(tables[i].insert_stmt);
 		if (tables[i].select_stmt)
 			sqlite3_finalize(tables[i].select_stmt);
-		free(tables[i].chunk_reads);
-		free(tables[i].chunk_latency);
-		tables[i].chunk_reads = NULL;
-		tables[i].chunk_latency = NULL;
+		free(tables[i].row_reads);
+		free(tables[i].row_latency);
+		tables[i].row_reads = NULL;
+		tables[i].row_latency = NULL;
 	}
 	free(tables);
-}
-
-static unsigned int rows_in_chunk(const struct table_state *table, unsigned int chunk_idx)
-{
-	unsigned int chunk_rows;
-	unsigned int start_row;
-	unsigned int remaining;
-
-	if (!table || table->chunk_rows == 0)
-		return 0;
-
-	chunk_rows = table->chunk_rows;
-	start_row = chunk_idx * chunk_rows;
-	if (start_row >= table->total_rows)
-		return 0;
-	remaining = table->total_rows - start_row;
-	return remaining < chunk_rows ? remaining : chunk_rows;
 }
 
 static int prepare_table_states(sqlite3 *db, const struct dataset_layout *layout,
 				const struct workload_options *opts,
 				struct table_state **tables_out,
-				unsigned long long *total_chunks_out)
+				unsigned long long *total_rows_out)
 {
 	struct table_state *tables = NULL;
-	unsigned long long total_chunks = 0;
-	unsigned int chunk_rows = opts->chunk_rows ? opts->chunk_rows : DEFAULT_CHUNK_ROWS;
+	unsigned long long total_rows = 0;
 	int rc = 0;
+
+	(void)opts;
 
 	if (!layout || !tables_out)
 		return -EINVAL;
-	if (chunk_rows == 0)
-		chunk_rows = 1;
 
 	tables = calloc(layout->table_count, sizeof(*tables));
 	if (!tables)
@@ -943,24 +863,13 @@ static int prepare_table_states(sqlite3 *db, const struct dataset_layout *layout
 		char sql[256];
 		char table_name[MAX_TABLE_NAME];
 		unsigned int rows = layout->rows_per_table[tbl];
-		unsigned int chunks = rows / chunk_rows + (rows % chunk_rows ? 1U : 0U);
-
-		if (chunks == 0)
-			chunks = 1;
 
 		tables[tbl].table_id = tbl;
 		tables[tbl].total_rows = rows;
-		tables[tbl].chunk_rows = chunk_rows;
-		tables[tbl].total_chunks = chunks;
 		tables[tbl].rows_inserted = 0;
-		tables[tbl].chunks_inserted = 0;
-		tables[tbl].chunk_reads = calloc(chunks, sizeof(unsigned long long));
-		tables[tbl].chunk_latency = calloc(chunks, sizeof(double));
-		if (!tables[tbl].chunk_reads) {
-			rc = -ENOMEM;
-			goto out;
-		}
-		if (!tables[tbl].chunk_latency) {
+		tables[tbl].row_reads = calloc(rows ? rows : 1U, sizeof(unsigned long long));
+		tables[tbl].row_latency = calloc(rows ? rows : 1U, sizeof(double));
+		if (!tables[tbl].row_reads || !tables[tbl].row_latency) {
 			rc = -ENOMEM;
 			goto out;
 		}
@@ -999,12 +908,12 @@ static int prepare_table_states(sqlite3 *db, const struct dataset_layout *layout
 			goto out;
 		}
 
-		total_chunks += chunks;
+		total_rows += rows;
 	}
 
 	*tables_out = tables;
-	if (total_chunks_out)
-		*total_chunks_out = total_chunks;
+	if (total_rows_out)
+		*total_rows_out = total_rows;
 	return 0;
 
 out:
@@ -1012,7 +921,7 @@ out:
 	return rc;
 }
 
-static int insert_chunk_rows(struct table_state *table, unsigned int rows_this_chunk)
+static int insert_rows_batch(struct table_state *table, unsigned int rows_this_batch)
 {
 	char rstr1[STR1_LEN + 1];
 	char rstr2[STR2_LEN + 1];
@@ -1024,11 +933,11 @@ static int insert_chunk_rows(struct table_state *table, unsigned int rows_this_c
 
 	if (!table || !table->insert_stmt)
 		return -EINVAL;
-	if (rows_this_chunk == 0)
+	if (rows_this_batch == 0)
 		return 0;
 
 	stmt = table->insert_stmt;
-	limit = table->rows_inserted + rows_this_chunk;
+	limit = table->rows_inserted + rows_this_batch;
 
 	for (unsigned int row = table->rows_inserted; row < limit; ++row) {
 		int record_id = (int)(table->total_rows - 1U - row);
@@ -1152,10 +1061,10 @@ static int run_read_event(unsigned int event_id,
 			table_read_ops[tbl]++;
 		}
 
-		for (unsigned int chunk = 0; chunk < table->chunks_inserted; ++chunk) {
-			table->chunk_reads[chunk] += reads;
-			if (table->chunk_latency)
-				table->chunk_latency[chunk] += table_event_latency;
+		for (unsigned int row = 0; row < table->rows_inserted; ++row) {
+			table->row_reads[row] += reads;
+			if (table->row_latency)
+				table->row_latency[row] += table_event_latency;
 		}
 	}
 
@@ -1167,8 +1076,8 @@ static int run_read_event(unsigned int event_id,
 	return 0;
 }
 
-static unsigned int *materialize_chunk_heat(const struct dataset_layout *layout,
-					    const struct table_state *tables)
+static unsigned int *materialize_row_heat(const struct dataset_layout *layout,
+					  const struct table_state *tables)
 {
 	unsigned int *heat = NULL;
 
@@ -1182,29 +1091,20 @@ static unsigned int *materialize_chunk_heat(const struct dataset_layout *layout,
 	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
 		const struct table_state *table = &tables[tbl];
 		unsigned int base = layout->row_prefix[tbl];
-		unsigned int row_cursor = 0;
 
-		for (unsigned int chunk = 0; chunk < table->total_chunks; ++chunk) {
-			unsigned int chunk_rows = rows_in_chunk(table, chunk);
-			unsigned long long chunk_heat = table->chunk_reads[chunk];
-
-			if (chunk_heat > UINT_MAX)
-				chunk_heat = UINT_MAX;
-
-			for (unsigned int r = 0; r < chunk_rows; ++r)
-				heat[base + row_cursor + r] = (unsigned int)chunk_heat;
-
-			row_cursor += chunk_rows;
-			if (row_cursor >= table->total_rows)
-				break;
+		for (unsigned int row = 0; row < table->total_rows; ++row) {
+			unsigned long long row_heat = table->row_reads ? table->row_reads[row] : 0ULL;
+			if (row_heat > UINT_MAX)
+				row_heat = UINT_MAX;
+			heat[base + row] = (unsigned int)row_heat;
 		}
 	}
 
 	return heat;
 }
 
-static int write_chunk_stats_csv(const char *path, const struct dataset_layout *layout,
-				 const struct table_state *tables)
+static int write_row_stats_csv(const char *path, const struct dataset_layout *layout,
+			       const struct table_state *tables)
 {
 	FILE *fp;
 
@@ -1213,43 +1113,28 @@ static int write_chunk_stats_csv(const char *path, const struct dataset_layout *
 
 	fp = fopen(path, "w");
 	if (!fp) {
-		perror("fopen chunk stats");
+		perror("fopen row stats");
 		return -1;
 	}
 
-	fprintf(fp, "table_id,table_name,chunk_index,table_row_start,table_row_end,"
-		"logical_row_start,logical_row_end,pages,reads,total_latency_sec,avg_latency_sec\n");
+	fprintf(fp, "table_id,table_name,row_index,logical_row_index,pages,reads,total_latency_sec,avg_latency_sec\n");
 
 	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
 		const struct table_state *table = &tables[tbl];
-		unsigned int table_row_cursor = 0;
 		unsigned int logical_base = layout->row_prefix[tbl];
 		char table_name[MAX_TABLE_NAME];
 
 		build_table_name(table_name, sizeof(table_name), tbl);
 
-		for (unsigned int chunk = 0; chunk < table->total_chunks; ++chunk) {
-			unsigned int chunk_rows = rows_in_chunk(table, chunk);
-			unsigned long long reads = table->chunk_reads ? table->chunk_reads[chunk] : 0ULL;
-			double total_latency = (table->chunk_latency && reads) ?
-				table->chunk_latency[chunk] : (table->chunk_latency ? table->chunk_latency[chunk] : 0.0);
-			double avg_latency = (reads > 0) ? total_latency / (double)reads : 0.0;
-			unsigned int table_row_start = table_row_cursor;
-			unsigned int table_row_end = table_row_start + (chunk_rows ? chunk_rows - 1 : 0);
-			unsigned int logical_row_start = logical_base + table_row_start;
-			unsigned int logical_row_end = chunk_rows ? logical_base + table_row_end : logical_row_start;
-			unsigned int pages = chunk_rows * (unsigned int)LPN_PER_ROW;
+		for (unsigned int row = 0; row < table->total_rows; ++row) {
+			unsigned long long reads = table->row_reads ? table->row_reads[row] : 0ULL;
+			double total_latency = table->row_latency ? table->row_latency[row] : 0.0;
+			double avg_latency = reads ? total_latency / (double)reads : 0.0;
+			unsigned int pages = (unsigned int)LPN_PER_ROW;
 
-			if (chunk_rows == 0)
-				break;
-
-			fprintf(fp, "%u,%s,%u,%u,%u,%u,%u,%u,%llu,%.9f,%.9f\n",
-				tbl, table_name, chunk, table_row_start, table_row_end,
-				logical_row_start, logical_row_end, pages, reads, total_latency, avg_latency);
-
-			table_row_cursor += chunk_rows;
-			if (table_row_cursor >= table->total_rows)
-				break;
+			fprintf(fp, "%u,%s,%u,%u,%u,%llu,%.9f,%.9f\n",
+				tbl, table_name, row, logical_base + row, pages,
+				reads, total_latency, avg_latency);
 		}
 	}
 
@@ -1366,8 +1251,8 @@ static void report_cold_tail_latency(const struct dataset_layout *layout,
 	for (unsigned int tbl = 0; tbl < table_count; ++tbl) {
 		unsigned long long heat_sum = 0;
 
-		for (unsigned int chunk = 0; chunk < tables[tbl].total_chunks; ++chunk)
-			heat_sum += tables[tbl].chunk_reads[chunk];
+		for (unsigned int row = 0; row < tables[tbl].total_rows; ++row)
+			heat_sum += tables[tbl].row_reads ? tables[tbl].row_reads[row] : 0ULL;
 
 		entries[tbl].table_id = tbl;
 		entries[tbl].heat_sum = heat_sum;
@@ -1409,18 +1294,18 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	double *table_latency = NULL;
 	unsigned long long *table_read_ops = NULL;
 	unsigned int table_count = layout->table_count;
-	unsigned long long total_chunks = 0;
-	unsigned long long chunks_written = 0;
+	unsigned long long total_rows = 0;
+	unsigned long long rows_written = 0;
 	unsigned int active_count = 0;
 	unsigned int rows_since_commit = 0;
 	unsigned int read_events = 0;
-	unsigned int chunk_interval = opts->init_read_interval_chunks ?
-		opts->init_read_interval_chunks : DEFAULT_READ_INTERVAL;
-	unsigned int chunk_rows = opts->chunk_rows ? opts->chunk_rows : DEFAULT_CHUNK_ROWS;
-	unsigned int reads_per_event = opts->init_reads_per_interval;
+	unsigned int interleave_rows = opts->interleave_rows ?
+		opts->interleave_rows : DEFAULT_INTERLEAVE_ROWS;
+	unsigned int reads_per_event = opts->init_reads_per_event ?
+		opts->init_reads_per_event : DEFAULT_READS_PER_EVENT;
 	unsigned int rng_state = opts->seed ? opts->seed : (unsigned int)time(NULL);
 	char db_path[PATH_MAX];
-	char chunk_stats_path[PATH_MAX];
+	char row_stats_path[PATH_MAX];
 	char table_stats_path[PATH_MAX];
 	double total_read_time = 0.0;
 	double cold_read_time = 0.0;
@@ -1454,11 +1339,11 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		goto out;
 	}
 
-	rc = prepare_table_states(db, layout, opts, &tables, &total_chunks);
+	rc = prepare_table_states(db, layout, opts, &tables, &total_rows);
 	if (rc != 0)
 		goto out;
 
-	build_chunk_stats_path(chunk_stats_path, sizeof(chunk_stats_path), opts);
+	build_row_stats_path(row_stats_path, sizeof(row_stats_path), opts);
 	build_table_stats_path(table_stats_path, sizeof(table_stats_path), opts);
 
 	active = malloc(table_count * sizeof(*active));
@@ -1473,10 +1358,10 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		active[i] = i;
 	active_count = table_count;
 
-	printf("[sqlite_init] config tables=%u chunk_rows=%u (%u pages) total_chunks=%llu "
-	       "read_interval_chunks=%u read_ops_per_event=%u\n",
-	       table_count, chunk_rows, chunk_rows * (unsigned int)LPN_PER_ROW, total_chunks,
-	       chunk_interval, reads_per_event);
+	printf("[sqlite_init] config tables=%u total_rows=%llu row_pages=%u interleave_rows=%u "
+	       "read_ops_per_event=%u\n",
+	       table_count, total_rows, (unsigned int)LPN_PER_ROW, interleave_rows,
+	       reads_per_event);
 
 	rc = build_table_read_plan(layout, opts, reads_per_event, &read_plan);
 	if (rc != 0)
@@ -1488,11 +1373,11 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		goto out;
 	}
 
-	while (chunks_written < total_chunks) {
+	while (rows_written < total_rows) {
 		unsigned int pick;
 		struct table_state *table;
 		unsigned int remaining_rows;
-		unsigned int rows_this_chunk;
+		unsigned int rows_this_step = 1;
 
 		if (active_count == 0)
 			break;
@@ -1502,28 +1387,22 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		remaining_rows = table->total_rows > table->rows_inserted ?
 			(table->total_rows - table->rows_inserted) : 0U;
 		if (remaining_rows == 0) {
-			if (table->chunks_inserted < table->total_chunks)
-				table->chunks_inserted = table->total_chunks;
 			active[pick] = active[active_count - 1];
 			active_count--;
 			continue;
 		}
-		rows_this_chunk = table->chunk_rows;
-		if (rows_this_chunk > remaining_rows)
-			rows_this_chunk = remaining_rows;
-		if (rows_this_chunk == 0)
-			rows_this_chunk = remaining_rows;
+		if (rows_this_step > remaining_rows)
+			rows_this_step = remaining_rows;
 
-		rc = insert_chunk_rows(table, rows_this_chunk);
+		rc = insert_rows_batch(table, rows_this_step);
 		if (rc != 0)
 			goto out;
 
-		table->rows_inserted += rows_this_chunk;
-		table->chunks_inserted++;
-		chunks_written++;
-		rows_since_commit += rows_this_chunk;
+		table->rows_inserted += rows_this_step;
+		rows_written += rows_this_step;
+		rows_since_commit += rows_this_step;
 
-		if (table->chunks_inserted >= table->total_chunks) {
+		if (table->rows_inserted >= table->total_rows) {
 			active[pick] = active[active_count - 1];
 			active_count--;
 		}
@@ -1534,8 +1413,8 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 			rows_since_commit = 0;
 		}
 
-		if ((chunk_interval && (chunks_written % chunk_interval == 0)) ||
-		    chunks_written == total_chunks) {
+		if ((rows_written && interleave_rows && (rows_written % interleave_rows == 0)) ||
+		    rows_written == total_rows) {
 			double event_elapsed = 0.0;
 
 			read_events++;
@@ -1551,26 +1430,29 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 
 	cold_read_time = run_cold_full_read(db, layout, DEFAULT_COLD_SCAN_ITERS);
 
-	heat = materialize_chunk_heat(layout, tables);
+	heat = materialize_row_heat(layout, tables);
 	if (!heat) {
 		rc = -ENOMEM;
 		goto out;
 	}
 
-	if (write_chunk_stats_csv(chunk_stats_path, layout, tables) != 0)
-		fprintf(stderr, "Failed to write chunk stats %s\n", chunk_stats_path);
+	if (write_row_stats_csv(row_stats_path, layout, tables) != 0)
+		fprintf(stderr, "Failed to write row stats %s\n", row_stats_path);
 	if (write_table_latency_csv(table_stats_path, layout, table_latency, table_read_ops) != 0)
 		fprintf(stderr, "Failed to write table stats %s\n", table_stats_path);
-	printf("[sqlite_init] chunk_stats=%s table_stats=%s\n",
-	       chunk_stats_path, table_stats_path);
+	printf("[sqlite_init] row_stats=%s table_stats=%s\n",
+	       row_stats_path, table_stats_path);
 
 	report_cold_tail_latency(layout, tables, table_latency, table_read_ops);
 
-	printf("[sqlite_init] tag=%s tables=%u total_rows=%u total_chunks=%llu chunk_rows=%u "
-	       "read_events=%u interleaved_read_time=%.6fs cold_full_read_avg=%.6fs (iters=%u) db=%s\n",
-	       effective_tag(opts), layout->table_count, layout->total_rows, total_chunks,
-	       chunk_rows, read_events, total_read_time, cold_read_time, DEFAULT_COLD_SCAN_ITERS,
-	       db_path);
+	double cold_bytes_mb = (double)layout->total_rows * ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+	double cold_throughput = cold_read_time > 0.0 ? cold_bytes_mb / cold_read_time : 0.0;
+
+	printf("[sqlite_init] tag=%s tables=%u total_rows=%u read_events=%u "
+	       "interleaved_read_time=%.6fs cold_full_read_avg=%.6fs (iters=%u) cold_full_read_tp=%.2fMB/s db=%s\n",
+	       effective_tag(opts), layout->table_count, layout->total_rows, read_events,
+	       total_read_time, cold_read_time, DEFAULT_COLD_SCAN_ITERS,
+	       cold_throughput, db_path);
 
 	*heat_out = heat;
 	heat = NULL;
@@ -2274,9 +2156,8 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->suppress_report = false;
 	opts->scan_iters = SCAN_ITER_DEFAULT;
 	opts->reads_explicit = false;
-	opts->chunk_rows = DEFAULT_CHUNK_ROWS;
-	opts->init_read_interval_chunks = DEFAULT_READ_INTERVAL;
-	opts->init_reads_per_interval = DEFAULT_READS_PER_EVENT;
+	opts->interleave_rows = DEFAULT_INTERLEAVE_ROWS;
+	opts->init_reads_per_event = DEFAULT_READS_PER_EVENT;
 
 	while ((c = getopt_long(argc, argv, "m:d:r:a:l:s:o:H:M:S:Uh", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -2371,15 +2252,12 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 				opts->scan_iters = SCAN_ITER_DEFAULT;
 			break;
 		case 1012:
-			opts->chunk_rows = (unsigned int)strtoul(optarg, NULL, 10);
-			if (opts->chunk_rows == 0)
-				opts->chunk_rows = DEFAULT_CHUNK_ROWS;
+			opts->interleave_rows = (unsigned int)strtoul(optarg, NULL, 10);
+			if (opts->interleave_rows == 0)
+				opts->interleave_rows = DEFAULT_INTERLEAVE_ROWS;
 			break;
 		case 1013:
-			opts->init_read_interval_chunks = (unsigned int)strtoul(optarg, NULL, 10);
-			break;
-		case 1014:
-			opts->init_reads_per_interval = (unsigned int)strtoul(optarg, NULL, 10);
+			opts->init_reads_per_event = (unsigned int)strtoul(optarg, NULL, 10);
 			break;
 		case 'h':
 		default:
@@ -2416,4 +2294,72 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "Unsupported mode\n");
 	return EXIT_FAILURE;
+}
+static void build_db_path(char *buf, size_t len, const struct workload_options *opts)
+{
+	char filename[128];
+
+	snprintf(filename, sizeof(filename), DB_FILENAME_FMT, effective_tag(opts));
+	join_path(buf, len, TARGET_FOLDER, filename);
+}
+
+static void build_layout_path(char *buf, size_t len, const struct workload_options *opts)
+{
+	char filename[128];
+
+	snprintf(filename, sizeof(filename), LAYOUT_FILENAME_FMT, effective_tag(opts));
+	join_path(buf, len, RESULT_FOLDER, filename);
+}
+
+static const char *trace_suffix(enum distribution_type dist)
+{
+	switch (dist) {
+	case DIST_ZIPF:
+		return "zipf";
+	case DIST_EXPONENTIAL:
+		return "exp";
+	case DIST_NORMAL:
+		return "normal";
+	case DIST_SEQUENTIAL:
+		return "sequential";
+	case DIST_UNIFORM:
+	default:
+		return "uniform";
+	}
+}
+
+static void build_trace_path_for_dist(char *buf, size_t len,
+				      const struct workload_options *opts,
+				      enum distribution_type dist)
+{
+	char filename[192];
+	const char *dir = opts->trace_dir ? opts->trace_dir : RESULT_FOLDER;
+
+	snprintf(filename, sizeof(filename), TRACE_FILENAME_FMT,
+		 effective_tag(opts), trace_suffix(dist));
+	join_path(buf, len, dir, filename);
+}
+
+static void build_heat_path(char *buf, size_t len, const struct workload_options *opts)
+{
+	char filename[128];
+
+	snprintf(filename, sizeof(filename), HEAT_FILENAME_FMT, effective_tag(opts));
+	join_path(buf, len, RESULT_FOLDER, filename);
+}
+
+static void build_row_stats_path(char *buf, size_t len, const struct workload_options *opts)
+{
+	char filename[128];
+
+	snprintf(filename, sizeof(filename), ROW_STATS_FILENAME_FMT, effective_tag(opts));
+	join_path(buf, len, RESULT_FOLDER, filename);
+}
+
+static void build_table_stats_path(char *buf, size_t len, const struct workload_options *opts)
+{
+	char filename[128];
+
+	snprintf(filename, sizeof(filename), TABLE_STATS_FILENAME_FMT, effective_tag(opts));
+	join_path(buf, len, RESULT_FOLDER, filename);
 }
