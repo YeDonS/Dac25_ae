@@ -21,7 +21,6 @@ NORMAL_STDDEV=${NORMAL_STDDEV:-800}
 NORMAL_SEED=${NORMAL_SEED:-314159}
 SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
 SQLITE_TRACE_DIR=${SQLITE_TRACE_DIR:-}
-SCAN_ITERS=${SCAN_ITERS:-3}
 
 SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-100}
 SQLITE_CHUNK_ROWS=${SQLITE_CHUNK_ROWS:-16}
@@ -35,47 +34,8 @@ drop_caches() {
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 }
 
-run_cold_scan() {
-    local tag=$1
-    local dist_suffix=$2
-    local scan_log="./$RESULT_FOLDER/sqlite_${tag}_${dist_suffix}_scan.txt"
-
-    : >"$scan_log"
-    for ((iter = 0; iter < SCAN_ITERS; ++iter)); do
-        drop_caches
-        output=$(numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append \
-            --mode scan --scan-iters 1 \
-            --tag "$tag")
-        printf "%s\n" "$output" >>"$scan_log"
-    done
-
-    python3 - "$scan_log" <<'PY' >>"$scan_log"
-import re, statistics, sys
-log_path = sys.argv[1]
-times = []
-throughputs = []
-with open(log_path) as fh:
-    for line in fh:
-        if not line.startswith("[sqlite_scan] iter="):
-            continue
-        mt = re.search(r"time=([0-9.]+)s", line)
-        if mt:
-            times.append(float(mt.group(1)))
-        mp = re.search(r"throughput=([0-9.]+)MB/s", line)
-        if mp:
-            throughputs.append(float(mp.group(1)))
-if not times:
-    print("[sqlite_scan_cold] no data captured")
-    sys.exit(0)
-avg_time = statistics.mean(times)
-avg_tp = statistics.mean(throughputs) if throughputs else 0.0
-print(f"[sqlite_scan_cold] average_time={avg_time:.6f}s average_throughput={avg_tp:.2f}MB/s ({len(times)} cold iterations)")
-PY
-}
-
 run_exp_suite() {
     local tag="fragment_on"
-    local dist_suffix="exp"
     local trace_dir="${SQLITE_TRACE_DIR:-${TARGET_FOLDER%/}/sqlite_traces}"
     local trace_base="${trace_dir%/}"
     local trace_exp="${trace_base}/sqlite_trace_${tag}_exp.trace"
@@ -134,16 +94,6 @@ run_exp_suite() {
         --heatmap "./$RESULT_FOLDER/sqlite_${tag}_exp_heat.csv" \
         --human-log \
         >"./$RESULT_FOLDER/sqlite_${tag}_exp.txt"
-
-    drop_caches
-    numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append \
-        --mode read --distribution sequential --reads "$total_rows" \
-        --tag "$tag" \
-        --log "./$RESULT_FOLDER/sqlite_${tag}_${dist_suffix}_fullcover_trace.csv" \
-        --heatmap "./$RESULT_FOLDER/sqlite_${tag}_${dist_suffix}_fullcover_heat.csv" \
-        >"./$RESULT_FOLDER/sqlite_${tag}_${dist_suffix}_fullcover.txt"
-
-    run_cold_scan "$tag" "$dist_suffix"
 
     source resetdevice.sh
 }
