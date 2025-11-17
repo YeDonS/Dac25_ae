@@ -5,6 +5,7 @@
 
 #include <linux/types.h>
 #include <linux/spinlock.h>
+#include <linux/atomic.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "ssd.h"
@@ -138,6 +139,7 @@ struct conv_ftl {
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
 	uint64_t migration_cnt;      /* 迁移计数 */
 	uint64_t total_host_writes;  /* 总写入块数 */
+	atomic64_t slc_resident_page_cnt; /* 当前驻留在 SLC 的页面数 */
 	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
 	struct dentry *debug_access_inject; /* debugfs entry for counter injection */
