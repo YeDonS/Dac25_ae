@@ -760,6 +760,7 @@ static int fill_request_sequence(struct request_sequence *seq,
 {
 	unsigned int seed = effective_seed(opts, opts->dist);
 	struct zipf_sampler zipf = {};
+	bool zipf_initialized = false;
 	unsigned int total_rows = layout->total_rows;
 	double normal_mean, normal_stddev;
 	int rc = 0;
@@ -972,6 +973,7 @@ static int build_table_read_plan(const struct dataset_layout *layout,
 				 unsigned int **plan_out)
 {
 	struct zipf_sampler zipf = {};
+	bool zipf_initialized = false;
 	unsigned int *plan;
 	unsigned int table_count;
 	unsigned int rng_state;
@@ -994,6 +996,15 @@ static int build_table_read_plan(const struct dataset_layout *layout,
 
 	time_t now = time(NULL);
 	unsigned int global_seed = opts->seed ? opts->seed : (unsigned int)now;
+
+	if (opts->dist == DIST_ZIPF) {
+		rc = init_zipf_sampler(&zipf, table_count, opts->zipf_alpha);
+		if (rc != 0) {
+			free(plan);
+			return rc;
+		}
+		zipf_initialized = true;
+	}
 
 	if (opts->dist == DIST_NORMAL) {
 		normal_mean = opts->normal_mean;
@@ -1033,7 +1044,8 @@ static int build_table_read_plan(const struct dataset_layout *layout,
 		plan[table_id]++;
 	}
 
-	destroy_zipf_sampler(&zipf);
+	if (zipf_initialized)
+		destroy_zipf_sampler(&zipf);
 	*plan_out = plan;
 	return 0;
 }
