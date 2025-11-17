@@ -41,6 +41,8 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 
 #define RECENT_WRITE_GUARD_PCT 10U
 
+static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn);
+
 static inline void compute_line_distribution(uint32_t total_lines,
 					     uint32_t *slc_lines,
 					     uint32_t *qlc_lines)
