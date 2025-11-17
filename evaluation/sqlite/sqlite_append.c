@@ -996,6 +996,7 @@ static int build_table_read_plan(const struct dataset_layout *layout,
 
 	time_t now = time(NULL);
 	unsigned int global_seed = opts->seed ? opts->seed : (unsigned int)now;
+	rng_state = global_seed;
 
 	if (opts->dist == DIST_ZIPF) {
 		rc = init_zipf_sampler(&zipf, table_count, opts->zipf_alpha);
@@ -1020,7 +1021,6 @@ static int build_table_read_plan(const struct dataset_layout *layout,
 
 	for (unsigned int i = 0; i < reads_per_event; ++i) {
 		unsigned int table_id = 0;
-		rng_state = global_seed;
 
 		switch (opts->dist) {
 		case DIST_SEQUENTIAL:
