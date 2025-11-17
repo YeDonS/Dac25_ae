@@ -8,7 +8,7 @@ source commonvariables.sh
 SRC_PATH="sqlite"
 
 if [[ ! -f ./sqlite_append ]] || [[ $FORCE_REBUILD == 1 ]]; then
-    gcc -D TARGET_FOLDER="\"$TARGET_FOLDER\"" -o ./sqlite_append ./$SRC_PATH/sqlite_append.c -lsqlite3 -lm
+    gcc -D TARGET_FOLDER="\"$TARGET_FOLDER\"" -D RESULT_FOLDER="\"$RESULT_FOLDER\"" -o ./sqlite_append ./$SRC_PATH/sqlite_append.c -lsqlite3 -lm
 fi
 
 ZIPF_ALPHA=${ZIPF_ALPHA:-0.8}
