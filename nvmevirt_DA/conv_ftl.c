@@ -2,6 +2,7 @@
 
 
 #include <linux/sched/clock.h>
+#include <linux/sched.h>
 #include <linux/delay.h>
 #include <linux/atomic.h>
 #include <linux/slab.h>
@@ -352,6 +353,9 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
 next_idx2:
         scanned++;
         idx = (idx + 1) % spp->tt_pgs;
+
+        if ((scanned & 0x7F) == 0)
+        	cond_resched();
     }
     
     cursor2 = idx;
@@ -2523,6 +2527,9 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 		if (pg_iter && pg_iter->status == PG_VALID) {
 			gc_write_page(conv_ftl, &ppa);
 		}
+
+		if ((pg & 0x3F) == 0)
+			cond_resched();
 	}
 
 	/*
@@ -3494,6 +3501,11 @@ retry_alloc_write_buffer:
     //struct ppa old_ppa = { .ppa = UNMAPPED_PPA };  /* 用于迁移检查 */
     
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+		uint64_t iter = lpn - start_lpn;
+		bool allow_maintenance = ((iter & 0x3F) == 0);
+
+		if (allow_maintenance)
+			cond_resched();
 		        /* 调试：检查是否进入了写入循环 */
 		if (lpn == start_lpn) {
 			NVMEV_DEBUG("[DEBUG] conv_write: Starting write loop, lpn=%llu to %llu\n", start_lpn, end_lpn);
@@ -3565,14 +3577,14 @@ retry_alloc_write_buffer:
         uint32_t slc_used_lines = slc_stats.total - slc_free_lines;
         NVMEV_DEBUG("[DEBUG] SLC status: free_lines=%u, used_lines=%u, high_watermark=%u, total=%u\n", 
                    slc_free_lines, slc_used_lines, conv_ftl->slc_high_watermark, slc_stats.total);
-        if (slc_used_lines >= conv_ftl->slc_high_watermark) {
+        if (slc_used_lines >= conv_ftl->slc_high_watermark && allow_maintenance) {
             NVMEV_DEBUG("[DEBUG] SLC usage high (%u >= %u), migrating some cold pages synchronously\n", 
                       slc_used_lines, conv_ftl->slc_high_watermark);
             /* DEPRECATED: wakeup_migration_thread(conv_ftl); */
             migrate_some_cold_from_slc(conv_ftl, 8);
         }
         /* SLC free 低于阈值时尝试触发前台 GC，按固定频率节流 */
-        if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+        if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high && allow_maintenance) {
             int ticket = atomic_inc_return(&fggc_throttle);
 
             if ((ticket & 0x3F) == 0) {
