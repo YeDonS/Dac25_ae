@@ -53,7 +53,7 @@
 #define LPN_PER_ROW              (ROW_PAYLOAD_BYTES / LOGICAL_PAGE_BYTES)
 #define DEFAULT_INTERLEAVE_ROWS  1000U
 #define DEFAULT_READS_PER_EVENT  1000U
-#define DEFAULT_COLD_SCAN_ITERS  1U
+#define DEFAULT_COLD_SCAN_ITERS  3U
 
 typedef unsigned int UINT32;
 
@@ -190,6 +190,7 @@ static void build_trace_path_for_dist(char *buf, size_t len,
 static void build_heat_path(char *buf, size_t len, const struct workload_options *opts);
 static void build_row_stats_path(char *buf, size_t len, const struct workload_options *opts);
 static void build_table_stats_path(char *buf, size_t len, const struct workload_options *opts);
+static void drop_page_cache(void);
 
 
 static int save_heat_csv(const char *path, const unsigned int *heat, unsigned int total_rows)
@@ -219,6 +220,20 @@ static double monotonic_sec(void)
 		return 0.0;
 	}
 	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static void drop_page_cache(void)
+{
+	int rc = system("sync");
+	(void)rc;
+	FILE *fp = fopen("/proc/sys/vm/drop_caches", "w");
+	if (!fp) {
+		perror("drop_caches");
+		return;
+	}
+	if (fputs("3\n", fp) < 0)
+		perror("drop_caches write");
+	fclose(fp);
 }
 
 static unsigned int next_rand(unsigned int *state)
@@ -1193,6 +1208,7 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 		return 0.0;
 
 	for (unsigned int iter = 0; iter < runs; ++iter) {
+		drop_page_cache();
 		double start = monotonic_sec();
 
 		for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
