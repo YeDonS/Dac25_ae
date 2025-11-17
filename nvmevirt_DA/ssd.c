@@ -116,8 +116,25 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 	} else {
 		NVMEV_ASSERT(BLK_SIZE > 0);
 		blk_size = BLK_SIZE;
-		spp->blks_per_pl = DIV_ROUND_UP(capacity, blk_size * spp->pls_per_lun *
-								  spp->luns_per_ch * spp->nchs);
+		{
+			uint64_t total_planes =
+				(uint64_t)spp->pls_per_lun * spp->luns_per_ch * spp->nchs;
+			uint64_t weighted_num =
+				(uint64_t)QLC_BLOCK_CAPACITY_FACTOR * SLC_LINE_RATIO_NUM;
+			uint64_t weighted_den = (uint64_t)SLC_BLOCK_CAPACITY_FACTOR *
+						       QLC_LINE_RATIO_NUM +
+					       weighted_num;
+			uint64_t avg_cap_factor_num =
+				weighted_num * SLC_BLOCK_CAPACITY_FACTOR +
+				(weighted_den - weighted_num) * QLC_BLOCK_CAPACITY_FACTOR;
+			uint64_t denom = (uint64_t)blk_size * total_planes * avg_cap_factor_num;
+			uint64_t numer = capacity * weighted_den;
+
+			NVMEV_ASSERT(total_planes);
+			spp->blks_per_pl = DIV_ROUND_UP(numer, denom);
+			if (!spp->blks_per_pl)
+				spp->blks_per_pl = 1;
+		}
 	}
 
 	NVMEV_ASSERT((ONESHOT_PAGE_SIZE % spp->pgsz) == 0 && (FLASH_PAGE_SIZE % spp->pgsz) == 0);
