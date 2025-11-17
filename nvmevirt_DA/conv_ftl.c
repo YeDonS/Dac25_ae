@@ -232,6 +232,7 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
 /* 新增：GC 专用 SLC 写指针函数声明（仅在本文件使用） */
 static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
+static bool slc_recover_free_lines(struct conv_ftl *conv_ftl, uint32_t min_free_lines);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
 
 static atomic_t fggc_throttle = ATOMIC_INIT(0);
@@ -2575,6 +2576,34 @@ static void forground_gc(struct conv_ftl *conv_ftl)
 	}
 }
 
+static bool slc_recover_free_lines(struct conv_ftl *conv_ftl, uint32_t min_free_lines)
+{
+	struct line_pool_stats slc_stats;
+	const int max_attempts = 16;
+	int attempt = 0;
+
+	if (!conv_ftl)
+		return false;
+
+	while (attempt++ < max_attempts) {
+		collect_slc_stats(conv_ftl, &slc_stats);
+		if (slc_stats.free >= min_free_lines)
+			return true;
+
+		migrate_some_cold_from_slc(conv_ftl, 16);
+
+		if (should_gc_slc_high(conv_ftl))
+			do_gc(conv_ftl, true, 1);
+
+		cond_resched();
+	}
+
+	collect_slc_stats(conv_ftl, &slc_stats);
+	NVMEV_DEBUG("SLC recovery stalled: free=%u target=%u attempts=%d\n",
+		    slc_stats.free, min_free_lines, max_attempts);
+	return false;
+}
+
 static bool is_same_flash_page(struct conv_ftl *conv_ftl, struct ppa ppa1, struct ppa ppa2)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -3511,10 +3540,8 @@ retry_alloc_write_buffer:
 			NVMEV_DEBUG("[DEBUG] conv_write: Starting write loop, lpn=%llu to %llu\n", start_lpn, end_lpn);
 		}
 		
-		/* 注释掉旧的同步迁移逻辑，现在使用后台异步迁移 */
-		/* if ((lpn & 0x3FF) == 0) {
+		if ((iter & 0x3FF) == 0)
 			trigger_slc_migration_if_low(conv_ftl);
-		} */
 
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
@@ -3583,18 +3610,28 @@ retry_alloc_write_buffer:
             /* DEPRECATED: wakeup_migration_thread(conv_ftl); */
             migrate_some_cold_from_slc(conv_ftl, 8);
         }
-        /* SLC free 低于阈值时尝试触发前台 GC，按固定频率节流 */
-        if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high && allow_maintenance) {
-            int ticket = atomic_inc_return(&fggc_throttle);
+        if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+            uint32_t recover_target = conv_ftl->slc_gc_free_thres_low;
+            if (recover_target <= conv_ftl->slc_gc_free_thres_high)
+                recover_target = conv_ftl->slc_gc_free_thres_high + 1;
 
-            if ((ticket & 0x3F) == 0) {
-                NVMEV_DEBUG("FGGC: SLC free=%u <= thres_high=%u, running SLC GC now\n",
-                           slc_free_lines, conv_ftl->slc_gc_free_thres_high);
-                forground_gc(conv_ftl);
-            } else if ((ticket & 0x3F) == 1) {
-                NVMEV_DEBUG("FGGC throttled (ticket=%d)\n", ticket);
+            if (!slc_recover_free_lines(conv_ftl, recover_target) && allow_maintenance) {
+                int ticket = atomic_inc_return(&fggc_throttle);
+
+                if ((ticket & 0x3F) == 0) {
+                    NVMEV_DEBUG("FGGC: SLC free=%u <= thres_high=%u, running SLC GC now\n",
+                               slc_free_lines, conv_ftl->slc_gc_free_thres_high);
+                    forground_gc(conv_ftl);
+                } else if ((ticket & 0x3F) == 1) {
+                    NVMEV_DEBUG("FGGC throttled (ticket=%d)\n", ticket);
+                }
             }
-        }	   
+
+            collect_slc_stats(conv_ftl, &slc_stats);
+            slc_free_lines = slc_stats.free;
+            slc_used_lines = slc_stats.total - slc_free_lines;
+        }
+
 	        /* 尝试获取SLC页面 */
 	        ppa = get_new_slc_page(conv_ftl);
         if (!mapped_ppa(&ppa)) {
