@@ -250,6 +250,151 @@ static void stop_background_threads(struct conv_ftl *conv_ftl);
 static void wakeup_migration_thread(struct conv_ftl *conv_ftl);
 static void wakeup_gc_thread(struct conv_ftl *conv_ftl);
 
+static int background_migration_thread(void *data)
+{
+	struct conv_ftl *conv_ftl = data;
+
+	NVMEV_INFO("Background migration thread started\n");
+
+	while (!kthread_should_stop()) {
+		int rc = wait_event_interruptible(conv_ftl->migration_wq,
+						  atomic_read(&conv_ftl->migration_needed) ||
+							  kthread_should_stop() ||
+							  conv_ftl->threads_should_stop);
+		if (rc == -ERESTARTSYS)
+			continue;
+
+		if (kthread_should_stop() || conv_ftl->threads_should_stop)
+			break;
+
+		while (atomic_read(&conv_ftl->migration_needed) &&
+		       !kthread_should_stop() && !conv_ftl->threads_should_stop) {
+			struct line_pool_stats slc_stats;
+
+			collect_slc_stats(conv_ftl, &slc_stats);
+			if (slc_stats.free >= conv_ftl->slc_gc_free_thres_low) {
+				atomic_set(&conv_ftl->migration_needed, 0);
+				break;
+			}
+
+			migrate_some_cold_from_slc(conv_ftl, SLC_MIGRATION_BATCH_PAGES);
+			cond_resched();
+		}
+	}
+
+	NVMEV_INFO("Background migration thread stopped\n");
+	return 0;
+}
+
+static int background_gc_thread(void *data)
+{
+	struct conv_ftl *conv_ftl = data;
+
+	NVMEV_INFO("Background GC thread started\n");
+
+	while (!kthread_should_stop()) {
+		int rc = wait_event_interruptible(conv_ftl->gc_wq,
+						  atomic_read(&conv_ftl->gc_needed) ||
+							  kthread_should_stop() ||
+							  conv_ftl->threads_should_stop);
+		if (rc == -ERESTARTSYS)
+			continue;
+
+		if (kthread_should_stop() || conv_ftl->threads_should_stop)
+			break;
+
+		while (atomic_read(&conv_ftl->gc_needed) &&
+		       !kthread_should_stop() && !conv_ftl->threads_should_stop) {
+			struct line_pool_stats slc_stats, qlc_stats;
+			uint32_t total_free;
+
+			collect_slc_stats(conv_ftl, &slc_stats);
+			collect_qlc_stats(conv_ftl, &qlc_stats);
+			total_free = slc_stats.free + qlc_stats.free;
+
+			if (total_free >= conv_ftl->gc_low_watermark) {
+				atomic_set(&conv_ftl->gc_needed, 0);
+				break;
+			}
+
+			if (do_gc(conv_ftl, false, 0) < 0)
+				msleep(GC_IDLE_SLEEP_MS);
+
+			cond_resched();
+		}
+	}
+
+	NVMEV_INFO("Background GC thread stopped\n");
+	return 0;
+}
+
+static void init_background_threads(struct conv_ftl *conv_ftl)
+{
+	uint32_t slc_total = max_t(uint32_t, 1, conv_ftl->slc_lm.tt_lines);
+	uint32_t total_lines =
+		max_t(uint32_t, 1, conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines);
+
+	conv_ftl->slc_high_watermark = max_t(uint32_t, 1, slc_total * SLC_HIGH_WM_PCT / 100);
+	conv_ftl->slc_low_watermark = max_t(uint32_t, 1, slc_total * SLC_LOW_WM_PCT / 100);
+	conv_ftl->gc_high_watermark = max_t(uint32_t, 1, total_lines * GC_HIGH_WM_PCT / 100);
+	conv_ftl->gc_low_watermark = max_t(uint32_t, 1, total_lines * GC_LOW_WM_PCT / 100);
+
+	init_waitqueue_head(&conv_ftl->migration_wq);
+	init_waitqueue_head(&conv_ftl->gc_wq);
+	atomic_set(&conv_ftl->migration_needed, 0);
+	atomic_set(&conv_ftl->gc_needed, 0);
+	conv_ftl->threads_should_stop = false;
+
+	conv_ftl->migration_thread =
+		kthread_run(background_migration_thread, conv_ftl, "nvmev_migration");
+	if (IS_ERR(conv_ftl->migration_thread)) {
+		NVMEV_ERROR("Failed to create migration thread\n");
+		conv_ftl->migration_thread = NULL;
+	}
+
+	conv_ftl->gc_thread = kthread_run(background_gc_thread, conv_ftl, "nvmev_gc");
+	if (IS_ERR(conv_ftl->gc_thread)) {
+		NVMEV_ERROR("Failed to create GC thread\n");
+		conv_ftl->gc_thread = NULL;
+	}
+
+	NVMEV_INFO("Background threads initialized: migration=%p gc=%p\n",
+		   conv_ftl->migration_thread, conv_ftl->gc_thread);
+}
+
+static void stop_background_threads(struct conv_ftl *conv_ftl)
+{
+	conv_ftl->threads_should_stop = true;
+	wake_up_interruptible(&conv_ftl->migration_wq);
+	wake_up_interruptible(&conv_ftl->gc_wq);
+
+	if (conv_ftl->migration_thread) {
+		kthread_stop(conv_ftl->migration_thread);
+		conv_ftl->migration_thread = NULL;
+	}
+
+	if (conv_ftl->gc_thread) {
+		kthread_stop(conv_ftl->gc_thread);
+		conv_ftl->gc_thread = NULL;
+	}
+}
+
+static void wakeup_migration_thread(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+	atomic_set(&conv_ftl->migration_needed, 1);
+	wake_up_interruptible(&conv_ftl->migration_wq);
+}
+
+static void wakeup_gc_thread(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+	atomic_set(&conv_ftl->gc_needed, 1);
+	wake_up_interruptible(&conv_ftl->gc_wq);
+}
+
 /* 后台线程已移除（同步模式） */
 
 /* 当 SLC 空闲低于阈值时，挑选一小批"冷数据"从 SLC 迁移到 QLC。
@@ -3951,152 +4096,3 @@ static void cleanup_on_alloc_failure(struct conv_ftl *conv_ftl)
 	conv_ftl->heat_track_initialized = false;
 }
 
-static void wakeup_migration_thread(struct conv_ftl *conv_ftl);
-static void wakeup_gc_thread(struct conv_ftl *conv_ftl);
-
-static int background_migration_thread(void *data)
-{
-	struct conv_ftl *conv_ftl = data;
-
-	NVMEV_INFO("Background migration thread started\n");
-
-	while (!kthread_should_stop()) {
-		int rc = wait_event_interruptible(conv_ftl->migration_wq,
-						  atomic_read(&conv_ftl->migration_needed) ||
-							  kthread_should_stop() ||
-							  conv_ftl->threads_should_stop);
-		if (rc == -ERESTARTSYS)
-			continue;
-
-		if (kthread_should_stop() || conv_ftl->threads_should_stop)
-			break;
-
-		while (atomic_read(&conv_ftl->migration_needed) &&
-		       !kthread_should_stop() && !conv_ftl->threads_should_stop) {
-			struct line_pool_stats slc_stats;
-
-			collect_slc_stats(conv_ftl, &slc_stats);
-			if (slc_stats.free >= conv_ftl->slc_gc_free_thres_low) {
-				atomic_set(&conv_ftl->migration_needed, 0);
-				break;
-			}
-
-			migrate_some_cold_from_slc(conv_ftl, SLC_MIGRATION_BATCH_PAGES);
-			cond_resched();
-		}
-	}
-
-	NVMEV_INFO("Background migration thread stopped\n");
-	return 0;
-}
-
-static int background_gc_thread(void *data)
-{
-	struct conv_ftl *conv_ftl = data;
-
-	NVMEV_INFO("Background GC thread started\n");
-
-	while (!kthread_should_stop()) {
-		int rc = wait_event_interruptible(conv_ftl->gc_wq,
-						  atomic_read(&conv_ftl->gc_needed) ||
-							  kthread_should_stop() ||
-							  conv_ftl->threads_should_stop);
-		if (rc == -ERESTARTSYS)
-			continue;
-
-		if (kthread_should_stop() || conv_ftl->threads_should_stop)
-			break;
-
-		while (atomic_read(&conv_ftl->gc_needed) &&
-		       !kthread_should_stop() && !conv_ftl->threads_should_stop) {
-			struct line_pool_stats slc_stats, qlc_stats;
-			uint32_t total_free;
-
-			collect_slc_stats(conv_ftl, &slc_stats);
-			collect_qlc_stats(conv_ftl, &qlc_stats);
-			total_free = slc_stats.free + qlc_stats.free;
-
-			if (total_free >= conv_ftl->gc_low_watermark) {
-				atomic_set(&conv_ftl->gc_needed, 0);
-				break;
-			}
-
-			if (do_gc(conv_ftl, false, 0) < 0)
-				msleep(GC_IDLE_SLEEP_MS);
-
-			cond_resched();
-		}
-	}
-
-	NVMEV_INFO("Background GC thread stopped\n");
-	return 0;
-}
-
-static void init_background_threads(struct conv_ftl *conv_ftl)
-{
-	uint32_t slc_total = max_t(uint32_t, 1, conv_ftl->slc_lm.tt_lines);
-	uint32_t total_lines =
-		max_t(uint32_t, 1, conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines);
-
-	conv_ftl->slc_high_watermark = max_t(uint32_t, 1, slc_total * SLC_HIGH_WM_PCT / 100);
-	conv_ftl->slc_low_watermark = max_t(uint32_t, 1, slc_total * SLC_LOW_WM_PCT / 100);
-	conv_ftl->gc_high_watermark = max_t(uint32_t, 1, total_lines * GC_HIGH_WM_PCT / 100);
-	conv_ftl->gc_low_watermark = max_t(uint32_t, 1, total_lines * GC_LOW_WM_PCT / 100);
-
-	init_waitqueue_head(&conv_ftl->migration_wq);
-	init_waitqueue_head(&conv_ftl->gc_wq);
-	atomic_set(&conv_ftl->migration_needed, 0);
-	atomic_set(&conv_ftl->gc_needed, 0);
-	conv_ftl->threads_should_stop = false;
-
-	conv_ftl->migration_thread =
-		kthread_run(background_migration_thread, conv_ftl, "nvmev_migration");
-	if (IS_ERR(conv_ftl->migration_thread)) {
-		NVMEV_ERROR("Failed to create migration thread\n");
-		conv_ftl->migration_thread = NULL;
-	}
-
-	conv_ftl->gc_thread = kthread_run(background_gc_thread, conv_ftl, "nvmev_gc");
-	if (IS_ERR(conv_ftl->gc_thread)) {
-		NVMEV_ERROR("Failed to create GC thread\n");
-		conv_ftl->gc_thread = NULL;
-	}
-
-	NVMEV_INFO("Background threads initialized: migration=%p gc=%p\n",
-		   conv_ftl->migration_thread, conv_ftl->gc_thread);
-}
-
-static void stop_background_threads(struct conv_ftl *conv_ftl)
-{
-	conv_ftl->threads_should_stop = true;
-	wake_up_interruptible(&conv_ftl->migration_wq);
-	wake_up_interruptible(&conv_ftl->gc_wq);
-
-	if (conv_ftl->migration_thread) {
-		kthread_stop(conv_ftl->migration_thread);
-		conv_ftl->migration_thread = NULL;
-	}
-
-	if (conv_ftl->gc_thread) {
-		kthread_stop(conv_ftl->gc_thread);
-		conv_ftl->gc_thread = NULL;
-	}
-}
-
-static void wakeup_migration_thread(struct conv_ftl *conv_ftl)
-{
-	if (!conv_ftl)
-		return;
-	atomic_set(&conv_ftl->migration_needed, 1);
-	wake_up_interruptible(&conv_ftl->migration_wq);
-}
-
-static void wakeup_gc_thread(struct conv_ftl *conv_ftl)
-{
-	if (!conv_ftl)
-		return;
-	atomic_set(&conv_ftl->gc_needed, 1);
-	wake_up_interruptible(&conv_ftl->gc_wq);
-}
-
- /* background threads removed */
