@@ -432,8 +432,11 @@ uint64_t ssd_advance_write_buffer(struct ssd *ssd, uint64_t request_time, uint64
 /* 辅助函数：检查块是否为 QLC（需要从 conv_ftl 访问） */
 static bool is_qlc_block_ssd(struct ssd *ssd, uint32_t blk_id)
 {
-	/* 简单的判断：前 20% 是 SLC，后 80% 是 QLC */
-	uint32_t slc_blks = ssd->sp.blks_per_pl / 5;  /* 0.2 = 1/5 */
+	uint32_t slc_blks = ssd->sp.slc_blks_per_pl;
+
+	if (!slc_blks || slc_blks > ssd->sp.blks_per_pl)
+		slc_blks = ssd->sp.blks_per_pl / 5;  /* 兜底到旧逻辑 */
+
 	return blk_id >= slc_blks;
 }
 

@@ -207,6 +207,9 @@ struct ssdparams {
 	unsigned long pgs_per_ch; /* # of pages per channel */
 	unsigned long tt_pgs; /* total # of pages in the SSD */
 
+	uint32_t slc_blks_per_pl; /* # of SLC-classified blocks per plane */
+	uint32_t qlc_blks_per_pl; /* # of QLC-classified blocks per plane */
+
 	unsigned long blks_per_lun; /* # of blocks per LUN */
 	unsigned long blks_per_ch; /* # of blocks per channel */
 	unsigned long tt_blks; /* total # of blocks in the SSD */

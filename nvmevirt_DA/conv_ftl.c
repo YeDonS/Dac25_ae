@@ -28,7 +28,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define SLC_FREE_LOW_WM_PCT 10
 
 #define SLC_LINE_RATIO_NUM 1
-#define QLC_LINE_RATIO_NUM 9
+#define QLC_LINE_RATIO_NUM 60   /* ~1:15 capacity ratio once QLC block factor (4) applied */
 
 #define RECENT_WRITE_GUARD_PCT 10U
 
@@ -1110,6 +1110,8 @@ static int init_slc_qlc_blocks_with_retry(struct conv_ftl *conv_ftl, int max_ret
 				compute_line_distribution(total_blks_per_pl, &slc_lines, &qlc_lines);
 				conv_ftl->slc_blks_per_pl = slc_lines;
 				conv_ftl->qlc_blks_per_pl = qlc_lines;
+				conv_ftl->ssd->sp.slc_blks_per_pl = slc_lines;
+				conv_ftl->ssd->sp.qlc_blks_per_pl = qlc_lines;
 				
 				for (i = 0; i < total_blks_per_pl; i++) {
 					if (i < slc_lines) {
@@ -1155,6 +1157,8 @@ static int init_slc_qlc_blocks_fallback(struct conv_ftl *conv_ftl)
 	/* 调整配置以适应较小的分配（仍按 line 比例拆分） */
 	compute_line_distribution(reduced_size, &conv_ftl->slc_blks_per_pl,
 				  &conv_ftl->qlc_blks_per_pl);
+	conv_ftl->ssd->sp.slc_blks_per_pl = conv_ftl->slc_blks_per_pl;
+	conv_ftl->ssd->sp.qlc_blks_per_pl = conv_ftl->qlc_blks_per_pl;
 	
 	/* 初始化标记 */
 	for (i = 0; i < reduced_size; i++) {
@@ -3220,7 +3224,8 @@ static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
     /* 更新统计 */
     conv_ftl->migration_cnt++;
     
-    NVMEV_DEBUG("Migrated LPN %llu from SLC to QLC (zone_hint=%u)\n", lpn, zone_hint);
+	NVMEV_DEBUG("Migrated LPN %llu from SLC to QLC (zone_hint=%u read_cnt=%llu avg_reads=%llu)\n",
+		    lpn, zone_hint, read_cnt, migration_avg);
 }
 static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
