@@ -10,6 +10,18 @@
 #define KV_PROTOTYPE 3
 #define WD_ZN540 4
 
+#define QLC_PAGE_PATTERN 4
+#define QLC_PAGE_TYPE_L   0
+#define QLC_PAGE_TYPE_CL  1
+#define QLC_PAGE_TYPE_CU  2
+#define QLC_PAGE_TYPE_U   3
+
+#define SLC_LINE_RATIO_NUM 1
+#define QLC_LINE_RATIO_NUM 15
+
+#define SLC_BLOCK_CAPACITY_FACTOR 1
+#define QLC_BLOCK_CAPACITY_FACTOR QLC_PAGE_PATTERN
+
 /* SSD Type */
 #define SSD_TYPE_NVM 0
 #define SSD_TYPE_CONV 1

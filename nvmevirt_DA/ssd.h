@@ -96,6 +96,7 @@ struct nand_page {
 struct nand_block {
 	struct nand_page *pg;
 	int npgs;
+	bool is_qlc;
 	int ipc; /* invalid page count */
 	int vpc; /* valid page count */
 	int erase_cnt;
@@ -158,7 +159,9 @@ struct ssdparams {
 	int flashpgs_per_blk; /* # of flash pages per block */
 	int pgs_per_oneshotpg; /* # of pgs per oneshot page */
 	int oneshotpgs_per_blk; /* # of oneshot pages per block */
-	int pgs_per_blk; /* # of pages per block */
+	int pgs_per_blk; /* legacy: pages per SLC block */
+	int slc_pgs_per_blk; /* # of pages per SLC block */
+	int qlc_pgs_per_blk; /* # of pages per QLC block */
 	int blks_per_pl; /* # of blocks per plane */
 	int pls_per_lun; /* # of planes per LUN (Die) */
 	int luns_per_ch; /* # of LUNs per channel */

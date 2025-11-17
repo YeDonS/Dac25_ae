@@ -2,9 +2,26 @@
 
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
+#include <linux/math64.h>
 
 #include "nvmev.h"
 #include "ssd.h"
+
+static inline void compute_line_distribution(uint32_t total_lines,
+					     uint32_t *slc_lines,
+					     uint32_t *qlc_lines)
+{
+	uint64_t numerator = (uint64_t)QLC_BLOCK_CAPACITY_FACTOR * SLC_LINE_RATIO_NUM;
+	uint64_t denominator = (uint64_t)SLC_BLOCK_CAPACITY_FACTOR * QLC_LINE_RATIO_NUM +
+			       (uint64_t)QLC_BLOCK_CAPACITY_FACTOR * SLC_LINE_RATIO_NUM;
+	uint32_t slc = div_u64((uint64_t)total_lines * numerator, denominator);
+	if (slc == 0)
+		slc = 1;
+	if (slc >= total_lines)
+		slc = total_lines - 1;
+	*slc_lines = slc;
+	*qlc_lines = total_lines - slc;
+}
 
 uint64_t __get_ioclock(struct ssd *ssd)
 {
@@ -112,7 +129,12 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 	spp->pgs_per_flashpg = FLASH_PAGE_SIZE / (spp->pgsz);
 	spp->flashpgs_per_blk = (ONESHOT_PAGE_SIZE / FLASH_PAGE_SIZE) * spp->oneshotpgs_per_blk;
 
-	spp->pgs_per_blk = spp->pgs_per_oneshotpg * spp->oneshotpgs_per_blk;
+	spp->slc_pgs_per_blk = spp->pgs_per_oneshotpg * spp->oneshotpgs_per_blk;
+	spp->pgs_per_blk = spp->slc_pgs_per_blk;
+	spp->qlc_pgs_per_blk = spp->slc_pgs_per_blk * QLC_PAGE_PATTERN;
+
+	compute_line_distribution(spp->blks_per_pl, &spp->slc_blks_per_pl,
+				  &spp->qlc_blks_per_pl);
 
 	spp->write_unit_size = WRITE_UNIT_SIZE;
 
@@ -160,13 +182,17 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 	spp->write_early_completion = WRITE_EARLY_COMPLETION;
 
 	/* calculated values */
-	spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
-	spp->secs_per_pl = spp->secs_per_blk * spp->blks_per_pl;
+	spp->secs_per_blk = spp->secs_per_pg * spp->slc_pgs_per_blk;
+	{
+		uint64_t slc_pages = (uint64_t)spp->slc_blks_per_pl * spp->slc_pgs_per_blk;
+		uint64_t qlc_pages = (uint64_t)spp->qlc_blks_per_pl * spp->qlc_pgs_per_blk;
+		spp->pgs_per_pl = slc_pages + qlc_pages;
+	}
+	spp->secs_per_pl = spp->pgs_per_pl * spp->secs_per_pg;
 	spp->secs_per_lun = spp->secs_per_pl * spp->pls_per_lun;
 	spp->secs_per_ch = spp->secs_per_lun * spp->luns_per_ch;
 	spp->tt_secs = spp->secs_per_ch * spp->nchs;
 
-	spp->pgs_per_pl = spp->pgs_per_blk * spp->blks_per_pl;
 	spp->pgs_per_lun = spp->pgs_per_pl * spp->pls_per_lun;
 	spp->pgs_per_ch = spp->pgs_per_lun * spp->luns_per_ch;
 	spp->tt_pgs = spp->pgs_per_ch * spp->nchs;
@@ -182,7 +208,7 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 
 	/* line is special, put it at the end */
 	spp->blks_per_line = spp->tt_luns; /* TODO: to fix under multiplanes */
-	spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;
+	spp->pgs_per_line = spp->blks_per_line * spp->slc_pgs_per_blk;
 	spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
 	spp->tt_lines = spp->blks_per_lun;
 	/* TODO: to fix under multiplanes */ // lun size is super-block(line) size
@@ -197,14 +223,13 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 
 	check_params(spp);
 
-	total_size = (unsigned long)spp->tt_luns * spp->blks_per_lun * spp->pgs_per_blk *
-		     spp->secsz * spp->secs_per_pg;
-	blk_size = spp->pgs_per_blk * spp->secsz * spp->secs_per_pg;
+	total_size = (unsigned long long)spp->tt_pgs * spp->secsz * spp->secs_per_pg;
+	blk_size = spp->slc_pgs_per_blk * spp->secsz * spp->secs_per_pg;
 	NVMEV_INFO(
 		"Total Capacity(GiB,MiB)=%llu,%llu chs=%u luns=%lu lines=%lu blk-size(MiB,KiB)=%u,%u line-size(MiB,KiB)=%lu,%lu",
 		BYTE_TO_GB(total_size), BYTE_TO_MB(total_size), spp->nchs, spp->tt_luns,
-		spp->tt_lines, BYTE_TO_MB(spp->pgs_per_blk * spp->pgsz),
-		BYTE_TO_KB(spp->pgs_per_blk * spp->pgsz), BYTE_TO_MB(spp->pgs_per_line * spp->pgsz),
+		spp->tt_lines, BYTE_TO_MB(spp->slc_pgs_per_blk * spp->pgsz),
+		BYTE_TO_KB(spp->slc_pgs_per_blk * spp->pgsz), BYTE_TO_MB(spp->pgs_per_line * spp->pgsz),
 		BYTE_TO_KB(spp->pgs_per_line * spp->pgsz));
 }
 
@@ -230,10 +255,14 @@ static void ssd_remove_nand_page(struct nand_page *pg)
 	kfree(pg->sec);
 }
 
-static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp)
+static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp, bool qlc_blk)
 {
 	int i;
-	blk->npgs = spp->pgs_per_blk;
+	uint32_t slc_pages = spp->slc_pgs_per_blk;
+	uint32_t qlc_pages = spp->qlc_pgs_per_blk;
+
+	blk->is_qlc = qlc_blk;
+	blk->npgs = qlc_blk ? qlc_pages : slc_pages;
 	blk->pg = kmalloc(sizeof(struct nand_page) * blk->npgs, GFP_KERNEL);
 	if (!blk->pg) {
 		NVMEV_ERROR("Failed to allocate block pages memory\n");
@@ -268,7 +297,8 @@ static void ssd_init_nand_plane(struct nand_plane *pl, struct ssdparams *spp)
 		return;
 	}
 	for (i = 0; i < pl->nblks; i++) {
-		ssd_init_nand_blk(&pl->blk[i], spp);
+		bool is_qlc = (spp->slc_blks_per_pl && (uint32_t)i >= spp->slc_blks_per_pl);
+		ssd_init_nand_blk(&pl->blk[i], spp, is_qlc);
 	}
 }
 
@@ -486,11 +516,13 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
         int blk_idx = ppa->g.blk;
         int pg_idx = ppa->g.pg;
         struct ssdparams *vspp = &ssd->sp;
+	uint32_t max_pg = (blk_idx < (int)vspp->slc_blks_per_pl) ?
+			  vspp->slc_pgs_per_blk : vspp->qlc_pgs_per_blk;
         if (unlikely(ch_idx < 0 || ch_idx >= vspp->nchs ||
                      lun_idx < 0 || lun_idx >= vspp->luns_per_ch ||
                      pl_idx < 0 || pl_idx >= vspp->pls_per_lun ||
                      blk_idx < 0 || blk_idx >= vspp->blks_per_pl ||
-                     pg_idx < 0 || pg_idx >= vspp->pgs_per_blk)) {
+                     pg_idx < 0 || pg_idx >= (int)max_pg)) {
             NVMEV_ERROR("ssd_advance_nand: invalid PPA ch=%d lun=%d pl=%d blk=%d pg=%d\n",
                         ch_idx, lun_idx, pl_idx, blk_idx, pg_idx);
             return cmd_stime;
