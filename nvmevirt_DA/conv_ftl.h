@@ -140,6 +140,7 @@ struct conv_ftl {
 	uint64_t migration_cnt;      /* 迁移计数 */
 	uint64_t total_host_writes;  /* 总写入块数 */
 	atomic64_t slc_resident_page_cnt; /* 当前驻留在 SLC 的页面数 */
+	atomic_t slc_recover_lock;        /* 序列化 SLC 回收 */
 	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
 	struct dentry *debug_access_inject; /* debugfs entry for counter injection */

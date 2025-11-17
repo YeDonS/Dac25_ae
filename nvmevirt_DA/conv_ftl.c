@@ -1661,6 +1661,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->qlc_migration_page_cnt = 0;
 	conv_ftl->qlc_zone_rr_cursor = 0;
 	spin_lock_init(&conv_ftl->qlc_zone_lock);
+	atomic_set(&conv_ftl->slc_recover_lock, 0);
 
 	/* 直接初始化水位线（无后台线程） */
 	{
@@ -3611,25 +3612,46 @@ retry_alloc_write_buffer:
             migrate_some_cold_from_slc(conv_ftl, 8);
         }
         if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-            uint32_t recover_target = conv_ftl->slc_gc_free_thres_low;
-            if (recover_target <= conv_ftl->slc_gc_free_thres_high)
-                recover_target = conv_ftl->slc_gc_free_thres_high + 1;
+            uint32_t recover_target =
+                max_t(uint32_t, conv_ftl->slc_gc_free_thres_low,
+                      conv_ftl->slc_gc_free_thres_high + 1);
+            bool recovered = false;
+            int wait_loops = 0;
 
-            if (!slc_recover_free_lines(conv_ftl, recover_target) && allow_maintenance) {
-                int ticket = atomic_inc_return(&fggc_throttle);
-
-                if ((ticket & 0x3F) == 0) {
-                    NVMEV_DEBUG("FGGC: SLC free=%u <= thres_high=%u, running SLC GC now\n",
-                               slc_free_lines, conv_ftl->slc_gc_free_thres_high);
-                    forground_gc(conv_ftl);
-                } else if ((ticket & 0x3F) == 1) {
-                    NVMEV_DEBUG("FGGC throttled (ticket=%d)\n", ticket);
+            while (atomic_read(&conv_ftl->slc_recover_lock)) {
+                cond_resched();
+                collect_slc_stats(conv_ftl, &slc_stats);
+                slc_free_lines = slc_stats.free;
+                slc_used_lines = slc_stats.total - slc_free_lines;
+                if (slc_free_lines > conv_ftl->slc_gc_free_thres_high) {
+                    recovered = true;
+                    break;
                 }
+                if (++wait_loops >= 16)
+                    break;
             }
 
-            collect_slc_stats(conv_ftl, &slc_stats);
-            slc_free_lines = slc_stats.free;
-            slc_used_lines = slc_stats.total - slc_free_lines;
+            if (!recovered &&
+                atomic_cmpxchg(&conv_ftl->slc_recover_lock, 0, 1) == 0) {
+                recovered = slc_recover_free_lines(conv_ftl, recover_target);
+                atomic_set(&conv_ftl->slc_recover_lock, 0);
+
+                if (!recovered && allow_maintenance) {
+                    int ticket = atomic_inc_return(&fggc_throttle);
+
+                    if ((ticket & 0x3F) == 0) {
+                        NVMEV_DEBUG("FGGC: SLC free=%u <= thres_high=%u, running SLC GC now\n",
+                                   slc_free_lines, conv_ftl->slc_gc_free_thres_high);
+                        forground_gc(conv_ftl);
+                    } else if ((ticket & 0x3F) == 1) {
+                        NVMEV_DEBUG("FGGC throttled (ticket=%d)\n", ticket);
+                    }
+                }
+
+                collect_slc_stats(conv_ftl, &slc_stats);
+                slc_free_lines = slc_stats.free;
+                slc_used_lines = slc_stats.total - slc_free_lines;
+            }
         }
 
 	        /* 尝试获取SLC页面 */
