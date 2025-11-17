@@ -245,6 +245,8 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static bool slc_recover_free_lines(struct conv_ftl *conv_ftl, uint32_t min_free_lines);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
+static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_pages);
+static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool);
 static void init_background_threads(struct conv_ftl *conv_ftl);
 static void stop_background_threads(struct conv_ftl *conv_ftl);
 static void wakeup_migration_thread(struct conv_ftl *conv_ftl);
