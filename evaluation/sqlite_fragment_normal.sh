@@ -39,7 +39,7 @@ run_normal_suite() {
     local trace_dir="${SQLITE_TRACE_DIR:-${TARGET_FOLDER%/}/sqlite_traces}"
     local trace_base="${trace_dir%/}"
     local trace_normal="${trace_base}/sqlite_trace_${tag}_normal.trace"
-    local layout_meta="${TARGET_FOLDER%/}/sqlite_layout_${tag}.meta"
+    local layout_meta="${RESULT_FOLDER%/}/sqlite_layout_${tag}.meta"
 
     ./nvmevstart_on.sh
     sleep 1
