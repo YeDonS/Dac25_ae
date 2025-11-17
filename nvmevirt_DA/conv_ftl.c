@@ -29,22 +29,6 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 
 #define RECENT_WRITE_GUARD_PCT 10U
 
-static inline void compute_line_distribution(uint32_t total_lines,
-					     uint32_t *slc_lines,
-					     uint32_t *qlc_lines)
-{
-	uint64_t numerator = (uint64_t)QLC_BLOCK_CAPACITY_FACTOR * SLC_LINE_RATIO_NUM;
-	uint64_t denominator = (uint64_t)SLC_BLOCK_CAPACITY_FACTOR * QLC_LINE_RATIO_NUM +
-			       (uint64_t)QLC_BLOCK_CAPACITY_FACTOR * SLC_LINE_RATIO_NUM;
-	uint32_t slc = div_u64((uint64_t)total_lines * numerator, denominator);
-	if (slc == 0)
-		slc = 1;
-	if (slc >= total_lines)
-		slc = total_lines - 1;
-	*slc_lines = slc;
-	*qlc_lines = total_lines - slc;
-}
-
 static inline uint32_t blk_from_line(uint32_t line_id)
 {
 	return line_id;
@@ -65,9 +49,9 @@ static inline bool qlc_page_matches_type(uint32_t pg, uint32_t type)
 	return qlc_page_type_from_index(pg) == (type % QLC_PAGE_PATTERN);
 }
 
-static inline void compute_line_distribution(uint32_t total_lines,
-					     uint32_t *slc_lines,
-					     uint32_t *qlc_lines)
+static inline void ftl_compute_line_distribution(uint32_t total_lines,
+						 uint32_t *slc_lines,
+						 uint32_t *qlc_lines)
 {
 	uint64_t numerator = (uint64_t)QLC_BLOCK_CAPACITY_FACTOR * SLC_LINE_RATIO_NUM;
 	uint64_t denominator = (uint64_t)SLC_BLOCK_CAPACITY_FACTOR * QLC_LINE_RATIO_NUM +
@@ -1154,7 +1138,7 @@ static int init_slc_qlc_blocks_with_retry(struct conv_ftl *conv_ftl, int max_ret
 	int i, retry_count = 0;
 
 	if (!slc_lines || slc_lines >= total_blks_per_pl) {
-		compute_line_distribution(total_blks_per_pl, &slc_lines, &qlc_lines);
+		ftl_compute_line_distribution(total_blks_per_pl, &slc_lines, &qlc_lines);
 		spp->slc_blks_per_pl = slc_lines;
 		spp->qlc_blks_per_pl = qlc_lines;
 	}
