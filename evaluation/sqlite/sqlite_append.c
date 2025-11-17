@@ -1,4 +1,9 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200112L
+#endif
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <ctype.h>
 #include <errno.h>
@@ -12,10 +17,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
 
 #ifndef TARGET_FOLDER
 #define TARGET_FOLDER "./device/"
@@ -1340,6 +1350,44 @@ static void report_cold_tail_latency(const struct dataset_layout *layout,
 	free(entries);
 }
 
+static void drop_dataset_cache(sqlite3 *db, const char *db_path)
+{
+	if (db) {
+		int rc = sqlite3_db_cacheflush(db);
+
+		if (rc != SQLITE_OK)
+			fprintf(stderr, "sqlite3_db_cacheflush failed: %s\n", sqlite3_errstr(rc));
+		sqlite3_db_release_memory(db);
+	}
+
+	if (!db_path || !db_path[0])
+		return;
+
+	int fd = open(db_path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		perror("open db for cache drop");
+		return;
+	}
+
+#if defined(__linux__)
+	int err = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+	if (err != 0) {
+		errno = err;
+		perror("posix_fadvise");
+	}
+#elif defined(F_NOCACHE)
+	int flag = 1;
+	if (fcntl(fd, F_NOCACHE, &flag) == -1)
+		perror("fcntl F_NOCACHE enable");
+	flag = 0;
+	if (fcntl(fd, F_NOCACHE, &flag) == -1)
+		perror("fcntl F_NOCACHE disable");
+#else
+	(void)fd;
+#endif
+	close(fd);
+}
+
 static int run_interleaved_init(const struct dataset_layout *layout,
 				const struct workload_options *opts,
 				unsigned int **heat_out)
@@ -1367,6 +1415,7 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	double total_read_time = 0.0;
 	double cold_read_time = 0.0;
 	unsigned int *heat = NULL;
+	bool txn_active = false;
 	int rc = -1;
 
 	if (!heat_out)
@@ -1429,6 +1478,7 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		fprintf(stderr, "Failed to begin transaction\n");
 		goto out;
 	}
+	txn_active = true;
 
 	while (rows_written < total_rows) {
 		unsigned int pick;
@@ -1465,14 +1515,24 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		}
 
 		if (rows_since_commit >= 0x4000U) {
-			sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+			if (txn_active)
+				sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+			txn_active = false;
 			sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+			txn_active = true;
 			rows_since_commit = 0;
 		}
 
 		if ((rows_written && interleave_rows && (rows_written % interleave_rows == 0)) ||
 		    rows_written == total_rows) {
 			double event_elapsed = 0.0;
+			bool restart_txn = rows_written < total_rows;
+
+			if (txn_active)
+				sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+			txn_active = false;
+			rows_since_commit = 0;
+			drop_dataset_cache(db, db_path);
 
 			read_events++;
 			rc = run_read_event(read_events, layout, tables, table_count, read_plan,
@@ -1480,10 +1540,22 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 			if (rc != 0)
 				goto out;
 			total_read_time += event_elapsed;
+
+			if (restart_txn) {
+				rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+				if (rc != SQLITE_OK) {
+					fprintf(stderr, "Failed to restart transaction\n");
+					goto out;
+				}
+				txn_active = true;
+			}
 		}
 	}
 
-	sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+	if (txn_active) {
+		sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+		txn_active = false;
+	}
 
 	cold_read_time = run_cold_full_read(db, layout, DEFAULT_COLD_SCAN_ITERS);
 
