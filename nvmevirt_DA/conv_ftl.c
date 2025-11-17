@@ -13,7 +13,8 @@
 #include <linux/ctype.h>
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
-/* kthread/waitqueue no longer needed (threads removed) */
+#include <linux/kthread.h>
+#include <linux/wait.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -29,6 +30,16 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define SLC_FREE_LOW_WM_PCT 10
 
 #define RECENT_WRITE_GUARD_PCT 10U
+#define SLC_HIGH_WM_PCT 70
+#define SLC_LOW_WM_PCT 60
+#define GC_HIGH_WM_PCT 85
+#define GC_LOW_WM_PCT 75
+#define SLC_GC_FREE_HIGH_PCT 30
+#define SLC_GC_FREE_LOW_PCT 35
+#define SLC_MIGRATION_BATCH_PAGES 8U
+#define SLC_RECOVER_MAX_WAIT_LOOPS 6
+#define SLC_RECOVER_WAIT_US 2000
+#define GC_IDLE_SLEEP_MS 5
 
 static inline uint32_t blk_from_line(uint32_t line_id)
 {
@@ -234,8 +245,6 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static bool slc_recover_free_lines(struct conv_ftl *conv_ftl, uint32_t min_free_lines);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
-
-static atomic_t fggc_throttle = ATOMIC_INIT(0);
 
 /* 后台线程已移除（同步模式） */
 
@@ -1672,18 +1681,9 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		uint64_t qlc_total_pages = total_qlc_pages(conv_ftl);
 		uint64_t tmp;
 
-		tmp = div_u64(slc_total_pages * 80, 100);
-		conv_ftl->slc_high_watermark = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
-
-		tmp = div_u64(slc_total_pages * 70, 100);
-		conv_ftl->slc_low_watermark = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
-
-		conv_ftl->gc_high_watermark = total_lines * 90 / 100;
-		conv_ftl->gc_low_watermark = total_lines * 80 / 100;
-
-		tmp = div_u64(slc_total_pages * 15, 100);
+		tmp = div_u64(slc_total_pages * SLC_GC_FREE_HIGH_PCT, 100);
 		conv_ftl->slc_gc_free_thres_high = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
-		tmp = div_u64(slc_total_pages * 20, 100);
+		tmp = div_u64(slc_total_pages * SLC_GC_FREE_LOW_PCT, 100);
 		conv_ftl->slc_gc_free_thres_low = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
 
 		tmp = div_u64(qlc_total_pages * 15, 100);
@@ -1698,6 +1698,8 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		   conv_ftl->slc_blks_per_pl, conv_ftl->qlc_blks_per_pl, QLC_ZONE_COUNT);
 	NVMEV_INFO("Per-block pages: SLC=%u, QLC=%u (pattern=%u)\n",
 		   conv_ftl->slc_pgs_per_blk, conv_ftl->qlc_pgs_per_blk, QLC_PAGE_PATTERN);
+
+	init_background_threads(conv_ftl);
 
 	nvmev_debugfs_init_instance(conv_ftl);
 	{
@@ -1717,7 +1719,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
-	/* 无后台线程可停止（同步模式） */
+	stop_background_threads(conv_ftl);
 
 	if (conv_ftl->debug_dir) {
 		debugfs_remove_recursive(conv_ftl->debug_dir);
@@ -2580,28 +2582,34 @@ static void forground_gc(struct conv_ftl *conv_ftl)
 static bool slc_recover_free_lines(struct conv_ftl *conv_ftl, uint32_t min_free_lines)
 {
 	struct line_pool_stats slc_stats;
-	const int max_attempts = 16;
-	int attempt = 0;
+	bool owner = false;
+	int wait_loops = 0;
 
 	if (!conv_ftl)
 		return false;
 
-	while (attempt++ < max_attempts) {
+	if (atomic_cmpxchg(&conv_ftl->slc_recover_lock, 0, 1) == 0)
+		owner = true;
+
+	wakeup_migration_thread(conv_ftl);
+
+	while (wait_loops++ < SLC_RECOVER_MAX_WAIT_LOOPS) {
+		usleep_range(SLC_RECOVER_WAIT_US, SLC_RECOVER_WAIT_US * 2);
 		collect_slc_stats(conv_ftl, &slc_stats);
-		if (slc_stats.free >= min_free_lines)
+		if (slc_stats.free >= min_free_lines) {
+			if (owner)
+				atomic_set(&conv_ftl->slc_recover_lock, 0);
 			return true;
+		}
 
-		migrate_some_cold_from_slc(conv_ftl, 16);
-
-		if (should_gc_slc_high(conv_ftl))
-			do_gc(conv_ftl, true, 1);
-
-		cond_resched();
+		if ((wait_loops & 1) == 0)
+			wakeup_migration_thread(conv_ftl);
 	}
 
-	collect_slc_stats(conv_ftl, &slc_stats);
-	NVMEV_DEBUG("SLC recovery stalled: free=%u target=%u attempts=%d\n",
-		    slc_stats.free, min_free_lines, max_attempts);
+	if (owner)
+		atomic_set(&conv_ftl->slc_recover_lock, 0);
+
+	wakeup_gc_thread(conv_ftl);
 	return false;
 }
 
@@ -3603,54 +3611,38 @@ retry_alloc_write_buffer:
         
         /* 检查SLC使用率是否超过高水位线，触发后台迁移 */
         uint32_t slc_used_lines = slc_stats.total - slc_free_lines;
-        NVMEV_DEBUG("[DEBUG] SLC status: free_lines=%u, used_lines=%u, high_watermark=%u, total=%u\n", 
-                   slc_free_lines, slc_used_lines, conv_ftl->slc_high_watermark, slc_stats.total);
-        if (slc_used_lines >= conv_ftl->slc_high_watermark && allow_maintenance) {
-            NVMEV_DEBUG("[DEBUG] SLC usage high (%u >= %u), migrating some cold pages synchronously\n", 
-                      slc_used_lines, conv_ftl->slc_high_watermark);
-            /* DEPRECATED: wakeup_migration_thread(conv_ftl); */
-            migrate_some_cold_from_slc(conv_ftl, 8);
-        }
+        if (slc_used_lines >= conv_ftl->slc_high_watermark)
+            wakeup_migration_thread(conv_ftl);
         if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
             uint32_t recover_target =
                 max_t(uint32_t, conv_ftl->slc_gc_free_thres_low,
                       conv_ftl->slc_gc_free_thres_high + 1);
-            bool recovered = false;
-            int wait_loops = 0;
+            bool recovered = slc_recover_free_lines(conv_ftl, recover_target);
 
-            while (atomic_read(&conv_ftl->slc_recover_lock)) {
-                cond_resched();
-                collect_slc_stats(conv_ftl, &slc_stats);
-                slc_free_lines = slc_stats.free;
-                slc_used_lines = slc_stats.total - slc_free_lines;
-                if (slc_free_lines > conv_ftl->slc_gc_free_thres_high) {
-                    recovered = true;
-                    break;
-                }
-                if (++wait_loops >= 16)
-                    break;
+            if (!recovered) {
+                wakeup_gc_thread(conv_ftl);
+                recovered = slc_recover_free_lines(conv_ftl, recover_target);
             }
 
-            if (!recovered &&
-                atomic_cmpxchg(&conv_ftl->slc_recover_lock, 0, 1) == 0) {
-                recovered = slc_recover_free_lines(conv_ftl, recover_target);
-                atomic_set(&conv_ftl->slc_recover_lock, 0);
+            collect_slc_stats(conv_ftl, &slc_stats);
+            slc_free_lines = slc_stats.free;
+            slc_used_lines = slc_stats.total - slc_free_lines;
 
-                if (!recovered && allow_maintenance) {
-                    int ticket = atomic_inc_return(&fggc_throttle);
-
-                    if ((ticket & 0x3F) == 0) {
-                        NVMEV_DEBUG("FGGC: SLC free=%u <= thres_high=%u, running SLC GC now\n",
-                                   slc_free_lines, conv_ftl->slc_gc_free_thres_high);
-                        forground_gc(conv_ftl);
-                    } else if ((ticket & 0x3F) == 1) {
-                        NVMEV_DEBUG("FGGC throttled (ticket=%d)\n", ticket);
-                    }
+            if (!recovered && slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+                if (!allow_maintenance) {
+                    ret->status = NVME_SC_BUSY;
+                    ret->nsecs_target = nsecs_latest;
+                    return true;
                 }
 
+                forground_gc(conv_ftl);
                 collect_slc_stats(conv_ftl, &slc_stats);
                 slc_free_lines = slc_stats.free;
-                slc_used_lines = slc_stats.total - slc_free_lines;
+                if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+                    ret->status = NVME_SC_BUSY;
+                    ret->nsecs_target = nsecs_latest;
+                    return true;
+                }
             }
         }
 
@@ -3953,6 +3945,154 @@ static void cleanup_on_alloc_failure(struct conv_ftl *conv_ftl)
 	conv_ftl->rmap_initialized = false;
 	conv_ftl->slc_initialized = false;
 	conv_ftl->heat_track_initialized = false;
+}
+
+static void wakeup_migration_thread(struct conv_ftl *conv_ftl);
+static void wakeup_gc_thread(struct conv_ftl *conv_ftl);
+
+static int background_migration_thread(void *data)
+{
+	struct conv_ftl *conv_ftl = data;
+
+	NVMEV_INFO("Background migration thread started\n");
+
+	while (!kthread_should_stop()) {
+		int rc = wait_event_interruptible(conv_ftl->migration_wq,
+						  atomic_read(&conv_ftl->migration_needed) ||
+							  kthread_should_stop() ||
+							  conv_ftl->threads_should_stop);
+		if (rc == -ERESTARTSYS)
+			continue;
+
+		if (kthread_should_stop() || conv_ftl->threads_should_stop)
+			break;
+
+		while (atomic_read(&conv_ftl->migration_needed) &&
+		       !kthread_should_stop() && !conv_ftl->threads_should_stop) {
+			struct line_pool_stats slc_stats;
+
+			collect_slc_stats(conv_ftl, &slc_stats);
+			if (slc_stats.free >= conv_ftl->slc_gc_free_thres_low) {
+				atomic_set(&conv_ftl->migration_needed, 0);
+				break;
+			}
+
+			migrate_some_cold_from_slc(conv_ftl, SLC_MIGRATION_BATCH_PAGES);
+			cond_resched();
+		}
+	}
+
+	NVMEV_INFO("Background migration thread stopped\n");
+	return 0;
+}
+
+static int background_gc_thread(void *data)
+{
+	struct conv_ftl *conv_ftl = data;
+
+	NVMEV_INFO("Background GC thread started\n");
+
+	while (!kthread_should_stop()) {
+		int rc = wait_event_interruptible(conv_ftl->gc_wq,
+						  atomic_read(&conv_ftl->gc_needed) ||
+							  kthread_should_stop() ||
+							  conv_ftl->threads_should_stop);
+		if (rc == -ERESTARTSYS)
+			continue;
+
+		if (kthread_should_stop() || conv_ftl->threads_should_stop)
+			break;
+
+		while (atomic_read(&conv_ftl->gc_needed) &&
+		       !kthread_should_stop() && !conv_ftl->threads_should_stop) {
+			struct line_pool_stats slc_stats, qlc_stats;
+			uint32_t total_free;
+
+			collect_slc_stats(conv_ftl, &slc_stats);
+			collect_qlc_stats(conv_ftl, &qlc_stats);
+			total_free = slc_stats.free + qlc_stats.free;
+
+			if (total_free >= conv_ftl->gc_low_watermark) {
+				atomic_set(&conv_ftl->gc_needed, 0);
+				break;
+			}
+
+			if (do_gc(conv_ftl, false, 0) < 0)
+				msleep(GC_IDLE_SLEEP_MS);
+
+			cond_resched();
+		}
+	}
+
+	NVMEV_INFO("Background GC thread stopped\n");
+	return 0;
+}
+
+static void init_background_threads(struct conv_ftl *conv_ftl)
+{
+	uint32_t slc_total = max_t(uint32_t, 1, conv_ftl->slc_lm.tt_lines);
+	uint32_t total_lines =
+		max_t(uint32_t, 1, conv_ftl->slc_lm.tt_lines + conv_ftl->qlc_lm.tt_lines);
+
+	conv_ftl->slc_high_watermark = max_t(uint32_t, 1, slc_total * SLC_HIGH_WM_PCT / 100);
+	conv_ftl->slc_low_watermark = max_t(uint32_t, 1, slc_total * SLC_LOW_WM_PCT / 100);
+	conv_ftl->gc_high_watermark = max_t(uint32_t, 1, total_lines * GC_HIGH_WM_PCT / 100);
+	conv_ftl->gc_low_watermark = max_t(uint32_t, 1, total_lines * GC_LOW_WM_PCT / 100);
+
+	init_waitqueue_head(&conv_ftl->migration_wq);
+	init_waitqueue_head(&conv_ftl->gc_wq);
+	atomic_set(&conv_ftl->migration_needed, 0);
+	atomic_set(&conv_ftl->gc_needed, 0);
+	conv_ftl->threads_should_stop = false;
+
+	conv_ftl->migration_thread =
+		kthread_run(background_migration_thread, conv_ftl, "nvmev_migration");
+	if (IS_ERR(conv_ftl->migration_thread)) {
+		NVMEV_ERROR("Failed to create migration thread\n");
+		conv_ftl->migration_thread = NULL;
+	}
+
+	conv_ftl->gc_thread = kthread_run(background_gc_thread, conv_ftl, "nvmev_gc");
+	if (IS_ERR(conv_ftl->gc_thread)) {
+		NVMEV_ERROR("Failed to create GC thread\n");
+		conv_ftl->gc_thread = NULL;
+	}
+
+	NVMEV_INFO("Background threads initialized: migration=%p gc=%p\n",
+		   conv_ftl->migration_thread, conv_ftl->gc_thread);
+}
+
+static void stop_background_threads(struct conv_ftl *conv_ftl)
+{
+	conv_ftl->threads_should_stop = true;
+	wake_up_interruptible(&conv_ftl->migration_wq);
+	wake_up_interruptible(&conv_ftl->gc_wq);
+
+	if (conv_ftl->migration_thread) {
+		kthread_stop(conv_ftl->migration_thread);
+		conv_ftl->migration_thread = NULL;
+	}
+
+	if (conv_ftl->gc_thread) {
+		kthread_stop(conv_ftl->gc_thread);
+		conv_ftl->gc_thread = NULL;
+	}
+}
+
+static void wakeup_migration_thread(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+	atomic_set(&conv_ftl->migration_needed, 1);
+	wake_up_interruptible(&conv_ftl->migration_wq);
+}
+
+static void wakeup_gc_thread(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+	atomic_set(&conv_ftl->gc_needed, 1);
+	wake_up_interruptible(&conv_ftl->gc_wq);
 }
 
  /* background threads removed */
