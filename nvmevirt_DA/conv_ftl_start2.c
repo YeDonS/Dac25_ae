@@ -39,6 +39,8 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define QLC_PAGE_TYPE_CU  2
 #define QLC_PAGE_TYPE_U   3
 
+#define RECENT_WRITE_GUARD_PCT 10U
+
 static inline void compute_line_distribution(uint32_t total_lines,
 					     uint32_t *slc_lines,
 					     uint32_t *qlc_lines)
@@ -231,12 +233,13 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct heat_tracking *ht = &conv_ftl->heat_track;
 	uint32_t free_pct;
-    const uint32_t MAX_MIGRATE = 32;
-    const uint32_t MAX_SCAN = 4096;
-    static uint64_t cursor = 0;
-    uint64_t start, idx;
-    uint32_t scanned = 0;
-    uint32_t migrated = 0;
+	const uint32_t MAX_MIGRATE = 32;
+	const uint32_t MAX_SCAN = 4096;
+	static uint64_t cursor = 0;
+	uint64_t start, idx;
+	uint32_t scanned = 0;
+	uint32_t migrated = 0;
+	uint64_t dyn_thresh;
 
 	collect_slc_stats(conv_ftl, &slc_stats);
 	if (!slc_stats.total)
@@ -250,7 +253,7 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
 	if (!conv_ftl->page_in_slc || !ht || !ht->access_count)
 		return;
 
-	uint64_t dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
+	dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
 	if (dyn_thresh == 0)
 		dyn_thresh = 1;
 	start = cursor % spp->tt_pgs;
@@ -261,6 +264,8 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
 			uint64_t acc = ht->access_count[idx];
 
 			if (acc <= dyn_thresh) {
+				if (recent_write_guard(conv_ftl, idx))
+					goto next_idx;
 				struct ppa old_ppa = get_maptbl_ent(conv_ftl, idx);
 				if (mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk)) {
 					/* 直接调用单页迁移函数 */
@@ -270,16 +275,17 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
 			}
 		}
         
-        scanned++;
-        idx = (idx + 1) % spp->tt_pgs;
-        if (idx == start) break;
-    }
+next_idx:
+		scanned++;
+		idx = (idx + 1) % spp->tt_pgs;
+		if (idx == start)
+			break;
+	}
     
-    cursor = idx;
+	cursor = idx;
     
-    if (migrated > 0) {
-        NVMEV_DEBUG("Migrated %d cold pages from SLC to QLC\n", migrated);
-    }
+	if (migrated > 0)
+		NVMEV_DEBUG("Migrated %d cold pages from SLC to QLC\n", migrated);
 }
 
 
@@ -287,12 +293,13 @@ static void trigger_slc_migration_if_low(struct conv_ftl *conv_ftl)
 /* 无阈值：总是尝试从 SLC 迁移少量更冷页面到 QLC */
 static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_pages)
 {
-    struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct heat_tracking *ht = &conv_ftl->heat_track;
 	uint32_t migrated = 0;
 	uint32_t scanned = 0;
 	static uint64_t cursor2 = 0;
 	uint64_t idx;
+	uint64_t dyn_thresh;
 
     NVMEV_DEBUG("[MIGRATION_DEBUG] migrate_some_cold_from_slc called: max_pages=%u\n", max_pages);
     
@@ -302,7 +309,7 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
 		return;
 	}
 
-	uint64_t dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
+	dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
 	if (dyn_thresh == 0)
 		dyn_thresh = 1;
 	idx = cursor2 % spp->tt_pgs;
@@ -312,6 +319,8 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
 			uint64_t acc = ht->access_count[idx];
 			
 			if (acc <= dyn_thresh) {
+				if (recent_write_guard(conv_ftl, idx))
+					goto next_idx2;
 				struct ppa old_ppa = get_maptbl_ent(conv_ftl, idx);
 				if (mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk)) {
 					NVMEV_DEBUG("[MIGRATION_DEBUG] Found cold page to migrate: lpn=%llu, ppa=ch%d,lun%d,blk%d,pg%d\n",
@@ -326,6 +335,7 @@ static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_p
             }
         }
         
+next_idx2:
         scanned++;
         idx = (idx + 1) % spp->tt_pgs;
     }
@@ -480,6 +490,31 @@ static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl)
 	}
 
 	return ht ? ht->migration_threshold : 0;
+}
+
+static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn)
+{
+	struct heat_tracking *ht = conv_ftl ? &conv_ftl->heat_track : NULL;
+	uint64_t total = conv_ftl ? conv_ftl->total_host_writes : 0;
+	uint64_t epoch;
+	uint64_t protected_count;
+	uint64_t cutoff;
+
+	if (!ht || !ht->write_epoch || total == 0)
+		return false;
+
+	epoch = ht->write_epoch[lpn];
+	if (epoch == 0)
+		return false;
+
+	protected_count = (total * RECENT_WRITE_GUARD_PCT) / 100ULL;
+	if (protected_count == 0 && total > 0)
+		protected_count = 1;
+	if (protected_count >= total)
+		return true;
+
+	cutoff = total - protected_count + 1ULL;
+	return epoch >= cutoff;
 }
 
 static void update_qlc_latency_zone(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
@@ -1167,6 +1202,27 @@ static int init_heat_tracking_with_retry(struct conv_ftl *conv_ftl, int max_retr
 		return -ENOMEM;
 	}
 	
+	/* 重试分配 write_epoch */
+	retry_count = 0;
+	while (retry_count < max_retries) {
+		ht->write_epoch = vmalloc(sizeof(uint64_t) * spp->tt_pgs);
+		if (ht->write_epoch)
+			break;
+		NVMEV_ERROR("Failed to allocate write epoch memory, retry %d/%d\n",
+			   retry_count + 1, max_retries);
+		msleep(50);
+		retry_count++;
+	}
+	
+	if (!ht->write_epoch) {
+		NVMEV_ERROR("Failed to allocate write epoch memory after %d retries\n", max_retries);
+		vfree(ht->access_count);
+		vfree(ht->last_access_time);
+		ht->access_count = NULL;
+		ht->last_access_time = NULL;
+		return -ENOMEM;
+	}
+	
 	/* 重试分配 page_in_slc */
 	retry_count = 0;
 	while (retry_count < max_retries) {
@@ -1184,8 +1240,10 @@ static int init_heat_tracking_with_retry(struct conv_ftl *conv_ftl, int max_retr
 		NVMEV_ERROR("Failed to allocate page in SLC marker memory after %d retries\n", max_retries);
 		vfree(ht->access_count);
 		vfree(ht->last_access_time);
+		vfree(ht->write_epoch);
 		ht->access_count = NULL;
 		ht->last_access_time = NULL;
+		ht->write_epoch = NULL;
 		return -ENOMEM;
 	}
 	
@@ -1193,6 +1251,7 @@ static int init_heat_tracking_with_retry(struct conv_ftl *conv_ftl, int max_retr
 	for (i = 0; i < spp->tt_pgs; i++) {
 		ht->access_count[i] = 0;
 		ht->last_access_time[i] = 0;
+		ht->write_epoch[i] = 0;
 		conv_ftl->page_in_slc[i] = false;
 	}
 	
@@ -1201,6 +1260,7 @@ static int init_heat_tracking_with_retry(struct conv_ftl *conv_ftl, int max_retr
 	conv_ftl->migration.pending_migrations = 0;
 	
 	conv_ftl->heat_track_initialized = true;
+	conv_ftl->total_host_writes = 0;
 	return 0;
 }
 
@@ -1225,6 +1285,7 @@ static void init_migration_mgmt(struct conv_ftl *conv_ftl)
     conv_ftl->slc_write_cnt = 0;
     conv_ftl->qlc_write_cnt = 0;
     conv_ftl->migration_cnt = 0;
+    conv_ftl->total_host_writes = 0;
 
     /* 初始化账本并发保护锁 */
     spin_lock_init(&conv_ftl->slc_lock);
@@ -1447,7 +1508,12 @@ static void remove_heat_tracking(struct conv_ftl *conv_ftl)
 {
 	vfree(conv_ftl->heat_track.access_count);
 	vfree(conv_ftl->heat_track.last_access_time);
+	vfree(conv_ftl->heat_track.write_epoch);
 	vfree(conv_ftl->page_in_slc);
+	conv_ftl->heat_track.access_count = NULL;
+	conv_ftl->heat_track.last_access_time = NULL;
+	conv_ftl->heat_track.write_epoch = NULL;
+	conv_ftl->page_in_slc = NULL;
 }
 
 static void destroy_per_die_lines(struct line_mgmt **lms, uint32_t die_cnt)
@@ -2975,6 +3041,9 @@ static bool should_migrate_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn)
 	uint64_t avg_reads = 0;
 	bool have_avg;
 
+	if (recent_write_guard(conv_ftl, lpn))
+		return false;
+
 	if (ht && ht->access_count)
 		read_cnt = ht->access_count[lpn];
 
@@ -3475,6 +3544,9 @@ retry_alloc_write_buffer:
         /* 记录页面在 SLC 中 */
         conv_ftl->page_in_slc[local_lpn] = true;
         conv_ftl->slc_write_cnt++;
+        conv_ftl->total_host_writes++;
+        if (conv_ftl->heat_track.write_epoch)
+            conv_ftl->heat_track.write_epoch[local_lpn] = conv_ftl->total_host_writes;
 
 		//NVMEV_ERROR("PPA: ch:%d, lun:%d, blk:%d, pg:%d \n", ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg );
 
