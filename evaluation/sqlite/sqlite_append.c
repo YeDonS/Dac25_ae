@@ -29,7 +29,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define ROW_PAYLOAD_BYTES        16384ULL
+#define ROW_PAYLOAD_BYTES        262144ULL
 #define DEFAULT_TABLE_COUNT      1U
 #define DEFAULT_TARGET_BYTES     (10ULL << 30)
 #define DEFAULT_READS            5000U
@@ -44,10 +44,10 @@
 #define MAX_TABLE_NAME           64
 #define NORMAL_MEAN_SENTINEL     (-1.0)
 #define NORMAL_STDDEV_SENTINEL   (-1.0)
-#define STR1_LEN                 4096
-#define STR2_LEN                 4096
-#define STR3_LEN                 4096
-#define STR4_LEN                 4094
+#define STR1_LEN                 65536
+#define STR2_LEN                 65536
+#define STR3_LEN                 65536
+#define STR4_LEN                 65534
 #define SCAN_ITER_DEFAULT        10U
 #define LOGICAL_PAGE_BYTES       4096ULL
 #define LPN_PER_ROW              (ROW_PAYLOAD_BYTES / LOGICAL_PAGE_BYTES)
