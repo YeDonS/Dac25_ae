@@ -3760,33 +3760,50 @@ retry_alloc_write_buffer:
         collect_slc_stats(conv_ftl, &slc_stats);
         uint32_t slc_free_lines = slc_stats.free;
         
-        /* 检查SLC使用率是否超过高水位线，触发后台迁移 */
+        /* Trigger background migration if high watermark reached */
         uint32_t slc_used_lines = slc_stats.total - slc_free_lines;
         if (slc_used_lines >= conv_ftl->slc_high_watermark)
             wakeup_migration_thread(conv_ftl);
 
-        /* 当 SLC 空间严重不足时，强制等待直到有空间释放 */
-        /* 不要返回 BUSY 或 Error，这会导致 Host 报错 (Critical Medium Error) */
+        /* Block if SLC space is critically low (Backpressure) */
         unsigned long wait_loops = 0;
+        const unsigned long MAX_WAIT_LOOPS = 2000; /* ~200ms timeout */
+
         while (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
             
-            /* 唤醒后台线程 */
+            /* Wake up background threads */
             wakeup_migration_thread(conv_ftl);
-            if (slc_free_lines <= 2) /* 极度危险，唤醒 GC */
+            if (slc_free_lines <= 2) /* Extremely critical, wake GC */
                 wakeup_gc_thread(conv_ftl);
 
-            /* 短暂休眠，让出 CPU 给后台线程，防止 soft lockup */
-            /* 注意：这是在 IO worker 中休眠，会阻塞该队列的其他 IO，这是预期的反压行为 */
+            /* Yield CPU to background threads */
+            /* This blocks the current IO worker, creating natural backpressure */
             usleep_range(100, 200);
             
-            /* 重新检查状态 */
+            /* Re-check SLC status */
             collect_slc_stats(conv_ftl, &slc_stats);
             slc_free_lines = slc_stats.free;
 
-            /* 防止卡死太久没有任何反应，打印警告 */
             wait_loops++;
-            if (wait_loops % 10000 == 0) { // 约 1~2 秒打印一次
-                NVMEV_WARN("Write stalled waiting for SLC space (free=%u)...\n", slc_free_lines);
+
+            /* Safety Net: If background threads are too slow or stuck */
+            if (wait_loops > MAX_WAIT_LOOPS) {
+                 /* 
+                  * If we've waited too long (>200ms), the background thread might be 
+                  * starved or stuck. We must force progress to prevent IO timeout.
+                  */
+                NVMEV_WARN("Write stalled for %lu loops (free=%u). Forcing foreground migration.\n", 
+                           wait_loops, slc_free_lines);
+                
+                /* Force migrate a small batch synchronously */
+                migrate_some_cold_from_slc(conv_ftl, 1);
+                
+                /* Re-check after forced work */
+                collect_slc_stats(conv_ftl, &slc_stats);
+                slc_free_lines = slc_stats.free;
+                
+                /* Reset counter to continue monitoring */
+                wait_loops = 0;
             }
         }
 
