@@ -30,15 +30,15 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define SLC_FREE_LOW_WM_PCT 10
 
 #define RECENT_WRITE_GUARD_PCT 10U
-#define SLC_HIGH_WM_PCT 70
-#define SLC_LOW_WM_PCT 60
+#define SLC_HIGH_WM_PCT 50
+#define SLC_LOW_WM_PCT 40
 #define GC_HIGH_WM_PCT 85
 #define GC_LOW_WM_PCT 75
 #define SLC_GC_FREE_HIGH_PCT 30
-#define SLC_GC_FREE_LOW_PCT 35
-#define SLC_MIGRATION_BATCH_PAGES 8U
-#define SLC_RECOVER_MAX_WAIT_LOOPS 6
-#define SLC_RECOVER_WAIT_US 2000
+#define SLC_GC_FREE_LOW_PCT 60
+#define SLC_MIGRATION_BATCH_PAGES 32U
+#define SLC_RECOVER_MAX_WAIT_LOOPS 1000
+#define SLC_RECOVER_WAIT_US 100
 #define GC_IDLE_SLEEP_MS 5
 
 static inline uint32_t blk_from_line(uint32_t line_id)
@@ -3765,9 +3765,12 @@ retry_alloc_write_buffer:
         if (slc_used_lines >= conv_ftl->slc_high_watermark)
             wakeup_migration_thread(conv_ftl);
         if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-            uint32_t recover_target =
-                max_t(uint32_t, conv_ftl->slc_gc_free_thres_low,
-                      conv_ftl->slc_gc_free_thres_high + 1);
+            /* 仅仅等待少量空间释放，而不是等待后台任务完全达标，以减少阻塞时间 */
+            uint32_t recover_target = conv_ftl->slc_gc_free_thres_high + SLC_MIGRATION_BATCH_PAGES * 4;
+            /* 不要超过后台线程的停止阈值 */
+            if (recover_target > conv_ftl->slc_gc_free_thres_low)
+                recover_target = conv_ftl->slc_gc_free_thres_low;
+                
             bool recovered = slc_recover_free_lines(conv_ftl, recover_target);
 
             if (!recovered) {
