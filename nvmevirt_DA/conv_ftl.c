@@ -3764,39 +3764,29 @@ retry_alloc_write_buffer:
         uint32_t slc_used_lines = slc_stats.total - slc_free_lines;
         if (slc_used_lines >= conv_ftl->slc_high_watermark)
             wakeup_migration_thread(conv_ftl);
-        if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-            /* 仅仅等待少量空间释放，而不是等待后台任务完全达标，以减少阻塞时间 */
-            uint32_t recover_target = conv_ftl->slc_gc_free_thres_high + SLC_MIGRATION_BATCH_PAGES * 4;
-            /* 不要超过后台线程的停止阈值 */
-            if (recover_target > conv_ftl->slc_gc_free_thres_low)
-                recover_target = conv_ftl->slc_gc_free_thres_low;
-                
-            bool recovered = slc_recover_free_lines(conv_ftl, recover_target);
 
-            if (!recovered) {
+        /* 当 SLC 空间严重不足时，强制等待直到有空间释放 */
+        /* 不要返回 BUSY 或 Error，这会导致 Host 报错 (Critical Medium Error) */
+        unsigned long wait_loops = 0;
+        while (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+            
+            /* 唤醒后台线程 */
+            wakeup_migration_thread(conv_ftl);
+            if (slc_free_lines <= 2) /* 极度危险，唤醒 GC */
                 wakeup_gc_thread(conv_ftl);
-                recovered = slc_recover_free_lines(conv_ftl, recover_target);
-            }
 
+            /* 短暂休眠，让出 CPU 给后台线程，防止 soft lockup */
+            /* 注意：这是在 IO worker 中休眠，会阻塞该队列的其他 IO，这是预期的反压行为 */
+            usleep_range(100, 200);
+            
+            /* 重新检查状态 */
             collect_slc_stats(conv_ftl, &slc_stats);
             slc_free_lines = slc_stats.free;
-            slc_used_lines = slc_stats.total - slc_free_lines;
 
-            if (!recovered && slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-                if (!allow_maintenance) {
-                    ret->status = NVME_SC_BUSY;
-                    ret->nsecs_target = nsecs_latest;
-                    return true;
-                }
-
-                forground_gc(conv_ftl);
-                collect_slc_stats(conv_ftl, &slc_stats);
-                slc_free_lines = slc_stats.free;
-                if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-                    ret->status = NVME_SC_BUSY;
-                    ret->nsecs_target = nsecs_latest;
-                    return true;
-                }
+            /* 防止卡死太久没有任何反应，打印警告 */
+            wait_loops++;
+            if (wait_loops % 10000 == 0) { // 约 1~2 秒打印一次
+                NVMEV_WARN("Write stalled waiting for SLC space (free=%u)...\n", slc_free_lines);
             }
         }
 
