@@ -36,9 +36,9 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define GC_LOW_WM_PCT 75
 #define SLC_GC_FREE_HIGH_PCT 30
 #define SLC_GC_FREE_LOW_PCT 60
-#define SLC_MIGRATION_BATCH_PAGES 32U
+#define SLC_MIGRATION_BATCH_PAGES 64U
 #define SLC_RECOVER_MAX_WAIT_LOOPS 1000
-#define SLC_RECOVER_WAIT_US 100
+#define SLC_RECOVER_WAIT_US 500
 #define GC_IDLE_SLEEP_MS 5
 
 static inline uint32_t blk_from_line(uint32_t line_id)
@@ -3778,7 +3778,7 @@ retry_alloc_write_buffer:
 
             /* Yield CPU to background threads */
             /* This blocks the current IO worker, creating natural backpressure */
-            usleep_range(100, 200);
+            usleep_range(500, 1000);
             
             /* Re-check SLC status */
             collect_slc_stats(conv_ftl, &slc_stats);

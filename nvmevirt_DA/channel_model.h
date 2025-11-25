@@ -4,8 +4,8 @@
 #define _CHANNEL_MODEL_H
 
 /* Macros for channel model */
-#define NR_CREDIT_ENTRIES (1024 * 96)
-#define UNIT_TIME_INTERVAL (4000ULL) //ns
+#define NR_CREDIT_ENTRIES (1024 * 384)
+#define UNIT_TIME_INTERVAL (2000ULL) //ns
 #define UNIT_XFER_SIZE (128ULL) //bytes
 #define UNIT_XFER_CREDITS (1) //credits needed to transfer data(UNIT_XFER_SIZE)
 
@@ -34,6 +34,7 @@ struct channel_model {
 	uint32_t command_credits;
 	uint32_t xfer_lat; /*XKB NAND CH transfer time in nanoseconds*/
 
+	spinlock_t lock; /* Protect concurrent access */
 	credit_t avail_credits[NR_CREDIT_ENTRIES];
 };
 
