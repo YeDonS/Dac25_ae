@@ -13,20 +13,28 @@ static inline unsigned long long __get_wallclock(void)
 	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
 }
 
-void chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/)
+int chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/)
 {
-	ch->head = 0;
-	ch->valid_len = 0;
-	ch->cur_time = 0;
+	size_t bytes = sizeof(credit_t) * NR_CREDIT_ENTRIES;
+
+	memset(ch, 0, sizeof(*ch));
+	ch->avail_credits = kvzalloc(bytes, GFP_KERNEL);
+	if (!ch->avail_credits) {
+		NVMEV_ERROR("Failed to allocate channel performance model memory (%zu bytes)\n",
+			    bytes);
+		return -ENOMEM;
+	}
+
 	ch->max_credits = BANDWIDTH_TO_MAX_CREDITS(bandwidth);
-	ch->command_credits = 0;
 	ch->xfer_lat = BANDWIDTH_TO_TX_TIME(bandwidth);
 
 	spin_lock_init(&ch->lock);
-	MEMSET(&(ch->avail_credits[0]), ch->max_credits, NR_CREDIT_ENTRIES);
+	MEMSET(ch->avail_credits, ch->max_credits, NR_CREDIT_ENTRIES);
 
 	NVMEV_INFO("[%s] bandwidth %llu max_credits %u tx_time %u\n", __FUNCTION__, bandwidth,
 		   ch->max_credits, ch->xfer_lat);
+
+	return 0;
 }
 
 uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64_t length)
@@ -39,6 +47,9 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 	uint64_t total_latency;
 	uint32_t units_to_xfer = DIV_ROUND_UP(length, UNIT_XFER_SIZE);
 	uint32_t cur_time_offs, request_time_offs;
+
+	if (!ch || !ch->avail_credits)
+		return request_time;
 
 	spin_lock(&ch->lock);
 
@@ -75,12 +86,8 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 	//Search request time index
 	request_time_offs = (request_time / UNIT_TIME_INTERVAL) - (cur_time / UNIT_TIME_INTERVAL);
 
-	if (request_time_offs >= NR_CREDIT_ENTRIES) {
-		NVMEV_ERROR("[%s] Need to increase array size 0x%llx 0x%llx 0x%x\n", __FUNCTION__,
-			    request_time, cur_time, request_time_offs);
-		spin_unlock(&ch->lock);
-		return request_time + (ch->xfer_lat * units_to_xfer);
-	}
+	if (request_time_offs >= NR_CREDIT_ENTRIES)
+		request_time_offs = NR_CREDIT_ENTRIES - 1;
 
 	pos = (ch->head + request_time_offs) % NR_CREDIT_ENTRIES;
 	remaining_credits = units_to_xfer * UNIT_XFER_CREDITS;

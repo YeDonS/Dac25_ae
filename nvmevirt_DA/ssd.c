@@ -373,7 +373,11 @@ static void ssd_init_ch(struct ssd_channel *ch, struct ssdparams *spp)
 		NVMEV_ERROR("Failed to allocate channel performance model memory\n");
 		return;
 	}
-	chmodel_init(ch->perf_model, spp->ch_bandwidth);
+	if (chmodel_init(ch->perf_model, spp->ch_bandwidth)) {
+		kfree(ch->perf_model);
+		ch->perf_model = NULL;
+		return;
+	}
 
 	/* Add firmware overhead */
 	ch->perf_model->xfer_lat += (spp->fw_ch_xfer_lat * UNIT_XFER_SIZE / KB(4));
@@ -383,7 +387,10 @@ static void ssd_remove_ch(struct ssd_channel *ch)
 {
 	int i;
 
-	kfree(ch->perf_model);
+	if (ch->perf_model) {
+		kvfree(ch->perf_model->avail_credits);
+		kfree(ch->perf_model);
+	}
 
 	for (i = 0; i < ch->nluns; i++)
 		ssd_remove_nand_lun(&ch->lun[i]);
@@ -394,12 +401,23 @@ static void ssd_remove_ch(struct ssd_channel *ch)
 static void ssd_init_pcie(struct ssd_pcie *pcie, struct ssdparams *spp)
 {
 	pcie->perf_model = kmalloc(sizeof(struct channel_model), GFP_KERNEL);
-	chmodel_init(pcie->perf_model, spp->pcie_bandwidth);
+	if (!pcie->perf_model) {
+		NVMEV_ERROR("Failed to allocate pcie performance model memory\n");
+		return;
+	}
+	if (chmodel_init(pcie->perf_model, spp->pcie_bandwidth)) {
+		kfree(pcie->perf_model);
+		pcie->perf_model = NULL;
+		return;
+	}
 }
 
 static void ssd_remove_pcie(struct ssd_pcie *pcie)
 {
-	kfree(pcie->perf_model);
+	if (pcie->perf_model) {
+		kvfree(pcie->perf_model->avail_credits);
+		kfree(pcie->perf_model);
+	}
 }
 
 void ssd_init(struct ssd *ssd, struct ssdparams *spp, uint32_t cpu_nr_dispatcher)
@@ -439,7 +457,10 @@ void ssd_remove(struct ssd *ssd)
 
 	kfree(ssd->write_buffer);
 	if (ssd->pcie) {
-		kfree(ssd->pcie->perf_model);
+		if (ssd->pcie->perf_model) {
+			kvfree(ssd->pcie->perf_model->avail_credits);
+			kfree(ssd->pcie->perf_model);
+		}
 		kfree(ssd->pcie);
 	}
 
