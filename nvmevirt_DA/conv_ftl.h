@@ -104,7 +104,9 @@ struct conv_ftl {
 	struct write_pointer slc_wp;
 	struct write_pointer gc_wp;
 	
-	struct line_mgmt qlc_lm;              /* QLC 使用全局 line 池 */
+	struct line_mgmt *qlc_lunlm;          /* per-die QLC line pools */
+	struct write_pointer *qlc_lunwp;      /* per-die QLC write pointers */
+	struct write_pointer *gc_qlc_lunwp;   /* per-die QLC GC write pointers */
 	uint32_t qlc_zone_offsets[QLC_ZONE_COUNT];/* 每个zone在block中的起始页 */
 	uint32_t qlc_zone_limits[QLC_ZONE_COUNT]; /* 每个zone允许写入的页数 */
 	uint32_t qlc_zone_rr_cursor;             /* 无机制版本：线性填充所用的轮询游标 */
@@ -112,9 +114,7 @@ struct conv_ftl {
 	struct write_pointer qlc_gc_wp;
 
 	uint32_t slc_gc_free_thres_high;
-	uint32_t slc_gc_free_thres_low;
 	uint32_t qlc_gc_free_thres_high;
-	uint32_t qlc_gc_free_thres_low;
 
 	/* 热数据跟踪和迁移管理 */
 	struct heat_tracking heat_track;
@@ -133,6 +133,10 @@ struct conv_ftl {
 	spinlock_t qlc_zone_lock;    /* 保护 QLC 区域统计 */
 	uint64_t qlc_migration_read_sum;   /* 迁移页累计读次数 */
 	uint64_t qlc_migration_page_cnt;   /* 迁移页数量 */
+	uint64_t global_read_sum;         /* 全局有效页读次数总和 */
+	uint64_t global_valid_pg_cnt;     /* 全局有效页总数 */
+	uint64_t migration_read_path_count;    /* 读路径触发迁移次数 */
+	uint64_t migration_read_path_time_ns;  /* 读路径迁移耗时累计 */
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
@@ -166,9 +170,6 @@ struct conv_ftl {
 	
 	/* 水位线控制 - 基于剩余空间数量 */
 	uint32_t slc_high_watermark;             /* SLC 高水位线: 剩余空间低于此值时触发迁移 */
-	uint32_t slc_low_watermark;              /* SLC 低水位线: 剩余空间高于此值时停止迁移 */
-	uint32_t gc_high_watermark;              /* GC 高水位线: 总剩余空间低于此值时触发GC */
-	uint32_t gc_low_watermark;               /* GC 低水位线: 总剩余空间高于此值时停止GC */
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
