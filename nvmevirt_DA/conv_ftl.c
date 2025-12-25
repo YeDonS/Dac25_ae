@@ -220,11 +220,6 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
 static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
-
-static atomic_t fggc_throttle = ATOMIC_INIT(0);
-
-/* 后台线程已移除（同步模式） */
-
 /* 无阈值：总是尝试从 SLC 迁移少量更冷页面到 QLC */
 static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_pages)
 {
@@ -1484,11 +1479,17 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		tmp = div_u64(slc_total_pages * 80, 100);
 		conv_ftl->slc_high_watermark = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
 
-		tmp = div_u64(slc_total_pages * 15, 100);
+		tmp = div_u64(slc_total_pages * 75, 100);
+		conv_ftl->slc_target_watermark = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
+
+		tmp = div_u64(slc_total_pages * 25, 100);
 		conv_ftl->slc_gc_free_thres_high = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
 
 		tmp = div_u64(qlc_total_pages * 15, 100);
 		conv_ftl->qlc_gc_free_thres_high = pages_to_lines(tmp, conv_ftl->qlc_pgs_per_blk);
+
+		tmp = div_u64(slc_total_pages * 10, 100);
+		conv_ftl->slc_repromote_guard_lines = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
 	}
 
 	NVMEV_INFO("Init FTL Instance with %d channels(%ld pages)\n", conv_ftl->ssd->sp.nchs,
@@ -3090,12 +3091,16 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 				if (access_cnt > avg_reads) {
 					uint64_t migration_done = 0;
 					uint64_t mig_start = ktime_get_ns();
+					NVMEV_ERROR("[REPROMOTION_VERIFY] Hot LPN %llu (Acc:%llu > Avg:%llu) triggering QLC->SLC migration\n", 
+							                               local_lpn, access_cnt, avg_reads);
 
 					migrate_page_to_slc(conv_ftl, local_lpn, &cur_ppa,
 							    &migration_done);
 					cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
 					conv_ftl->migration_read_path_time_ns +=
 						ktime_get_ns() - mig_start;
+					NVMEV_ERROR("[REPROMOTION_VERIFY] LPN %llu Promoted. Extra Latency: %llu ns\n", 
+							                               local_lpn,ktime_get_ns() - mig_start);
 					conv_ftl->migration_read_path_count++;
 					if (migration_done)
 						nsecs_latest = max(nsecs_latest, migration_done);
@@ -3172,6 +3177,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 ret->nsecs_target = nsecs_latest;
 	ret->status = NVME_SC_SUCCESS;
+	    NVMEV_ERROR("[READ_VERIFY] LBA Range: %llu + %d. Total Latency: %llu ns\n", 
+			                   cmd->rw.slba, cmd->rw.length, nsecs_latest - nsecs_start);
 	return true;
 }
 
@@ -3187,11 +3194,21 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	uint32_t die_index;
 	struct nand_page *pg;
 	unsigned long flags;
+	struct line_pool_stats slc_stats;
 
 	if (!conv_ftl || !qlc_ppa)
 		return;
 	if (!mapped_ppa(qlc_ppa) || !valid_ppa(conv_ftl, qlc_ppa))
 		return;
+
+	if (conv_ftl->slc_repromote_guard_lines) {
+		collect_slc_stats(conv_ftl, &slc_stats);
+		if (slc_stats.free <= conv_ftl->slc_repromote_guard_lines) {
+			NVMEV_DEBUG("migrate_page_to_slc: skip due to low SLC free lines (%u <= %u)\n",
+				    slc_stats.free, conv_ftl->slc_repromote_guard_lines);
+			return;
+		}
+	}
 
 	/* Read QLC page */
 	srd.type = USER_IO;
@@ -3252,7 +3269,13 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	set_rmap_ent(conv_ftl, INVALID_LPN, qlc_ppa);
 
 	/* Update new SLC valid */
-	slc_mark_page_resident(conv_ftl, lpn);
+	//slc_mark_page_resident(conv_ftl, lpn);
+		/* Update new SLC valid */
+		if (conv_ftl->page_in_slc && lpn < conv_ftl->ssd->sp.tt_pgs &&
+					    !conv_ftl->page_in_slc[lpn]) {
+					conv_ftl->page_in_slc[lpn] = true;
+							atomic64_inc(&conv_ftl->slc_resident_page_cnt);
+								}
 	mark_page_valid(conv_ftl, &new_ppa);
 
 	/* Advance GC WP */
@@ -3489,22 +3512,31 @@ retry_alloc_write_buffer:
         NVMEV_DEBUG("[DEBUG] SLC status: free_lines=%u, used_lines=%u, high_watermark=%u, total=%u\n", 
                    slc_free_lines, slc_used_lines, conv_ftl->slc_high_watermark, slc_stats.total);
         if (slc_used_lines >= conv_ftl->slc_high_watermark) {
-            NVMEV_DEBUG("[DEBUG] SLC usage high (%u >= %u), migrating some cold pages synchronously\n", 
-                      slc_used_lines, conv_ftl->slc_high_watermark);
-            /* DEPRECATED: wakeup_migration_thread(conv_ftl); */
-            migrate_some_cold_from_slc(conv_ftl, 8);
-        }
-        /* SLC free 低于阈值时尝试触发前台 GC，按固定频率节流 */
-        if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-            int ticket = atomic_inc_return(&fggc_throttle);
+			uint32_t target_lines = conv_ftl->slc_target_watermark;
+			uint32_t over_lines;
+			uint32_t max_pages;
+			uint32_t cap_pages;
 
-            if ((ticket & 0x3F) == 0) {
-                NVMEV_DEBUG("FGGC: SLC free=%u <= thres_high=%u, running SLC GC now\n",
-                           slc_free_lines, conv_ftl->slc_gc_free_thres_high);
-                forground_gc(conv_ftl);
-            } else if ((ticket & 0x3F) == 1) {
-                NVMEV_DEBUG("FGGC throttled (ticket=%d)\n", ticket);
-            }
+			if (!target_lines || target_lines >= slc_stats.total)
+				target_lines = (slc_stats.total > 1) ? (slc_stats.total - 1) : slc_stats.total;
+
+			over_lines = (slc_used_lines > target_lines) ? (slc_used_lines - target_lines) : 1;
+			max_pages = over_lines * conv_ftl->slc_pgs_per_blk;
+			cap_pages = conv_ftl->slc_pgs_per_blk ? (conv_ftl->slc_pgs_per_blk * 4) : 0;
+			if (max_pages < 8)
+				max_pages = 8;
+			if (cap_pages && max_pages > cap_pages)
+				max_pages = cap_pages;
+
+            NVMEV_DEBUG("[DEBUG] SLC usage high (%u >= %u), migrating %u cold pages (target=%u, cap=%u)\n", 
+                      slc_used_lines, conv_ftl->slc_high_watermark, max_pages, target_lines, cap_pages);
+            migrate_some_cold_from_slc(conv_ftl, max_pages);
+        }
+        /* SLC free 低于阈值时触发前台 GC（无节流） */
+        if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+            NVMEV_DEBUG("FGGC: SLC free=%u <= thres_high=%u, running SLC GC now\n",
+                       slc_free_lines, conv_ftl->slc_gc_free_thres_high);
+            forground_gc(conv_ftl);
         }	   
 	        /* 尝试获取SLC页面 */
 	        ppa = get_new_slc_page(conv_ftl);

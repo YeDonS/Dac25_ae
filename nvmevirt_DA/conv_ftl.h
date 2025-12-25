@@ -115,6 +115,8 @@ struct conv_ftl {
 
 	uint32_t slc_gc_free_thres_high;
 	uint32_t qlc_gc_free_thres_high;
+	uint32_t slc_target_watermark;        /* 迁移目标水位线（高水位触发后回落到此值） */
+	uint32_t slc_repromote_guard_lines;   /* QLC->SLC 回迁的安全预留行数 */
 
 	/* 热数据跟踪和迁移管理 */
 	struct heat_tracking heat_track;
