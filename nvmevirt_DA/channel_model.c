@@ -40,6 +40,7 @@ int chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/)
 uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64_t length)
 {
 	uint64_t cur_time = __get_wallclock();
+	uint64_t start_detect = ktime_get_ns();
 	uint32_t pos, next_pos;
 	uint32_t remaining_credits, consumed_credits;
 	uint32_t default_delay, delay = 0;
@@ -137,6 +138,12 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 	delay = (delay > default_delay) ? (delay - default_delay) : 0;
 
 	total_latency = (ch->xfer_lat * units_to_xfer) + (delay * UNIT_TIME_INTERVAL);
+
+	uint64_t end_detect = ktime_get_ns();
+	if (end_detect - start_detect > 100000000) { // > 100ms
+		NVMEV_ERROR("SLOW_PATH: chmodel_request took %llu ns! MEMSET? valid_len=%u\n",
+			    end_detect - start_detect, ch->valid_len);
+	}
 
 	return request_time + total_latency;
 }

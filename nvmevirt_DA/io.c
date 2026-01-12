@@ -469,6 +469,8 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 
 int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 {
+	uint64_t start_detect = ktime_get_ns();
+	int processed_count = 0;
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	int num_proc = new_db - old_db;
 	int seq;
@@ -491,12 +493,21 @@ int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 		sq->stat.nr_dispatched++;
 		sq->stat.nr_in_flight++;
 		sq->stat.total_io += io_size;
+		processed_count++;
 
 	}
 	sq->stat.nr_dispatch++;
 	sq->stat.max_nr_in_flight = max_t(int, sq->stat.max_nr_in_flight, sq->stat.nr_in_flight);
 
 	latest_db = (old_db + seq) % sq->queue_size;
+
+	uint64_t end_detect = ktime_get_ns();
+	if (end_detect - start_detect > 1000000000) { // > 1s
+		NVMEV_ERROR("SLOW_PATH: nvmev_proc_io_sq took %llu ns! Processed %d reqs. Avg: %llu ns/req\n",
+			    end_detect - start_detect, processed_count,
+			    processed_count ? (end_detect - start_detect)/processed_count : 0);
+	}
+
 	return latest_db;
 }
 
@@ -577,6 +588,7 @@ static int nvmev_kthread_io(void *data)
 {
 	struct nvmev_proc_info *pi = (struct nvmev_proc_info *)data;
 	struct nvmev_ns *ns;
+	uint64_t start_loop, end_loop;
 
 #ifdef PERF_DEBUG
 	static unsigned long long intr_clock[NR_MAX_IO_QUEUE + 1];
@@ -589,6 +601,7 @@ static int nvmev_kthread_io(void *data)
 		   cpu_to_node(smp_processor_id()));
 
 	while (!kthread_should_stop()) {
+		start_loop = ktime_get_ns();
 		unsigned long long curr_nsecs_wall = __get_wallclock();
 		unsigned long long curr_nsecs_local = local_clock();
 		long long delta = curr_nsecs_wall - curr_nsecs_local;
@@ -703,6 +716,10 @@ static int nvmev_kthread_io(void *data)
 			}
 		}
 		cond_resched();
+		end_loop = ktime_get_ns();
+		if (end_loop - start_loop > 2000000000) { // > 2s
+			NVMEV_ERROR("SLOW_PATH: nvmev_kthread_io loop took %llu ns!\n", end_loop - start_loop);
+		}
 	}
 
 	return 0;
