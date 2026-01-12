@@ -112,7 +112,12 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 			} else {
 				NVMEV_ERROR("[%s] No free entry 0x%llx 0x%llx 0x%x\n", __FUNCTION__,
 					    request_time, cur_time, request_time_offs);
-				/* clamp to maximum regulated delay */
+				/* fast-forward: avoid full-ring scan and reset credits */
+				delay += DIV_ROUND_UP(remaining_credits, ch->max_credits);
+				MEMSET(ch->avail_credits, ch->max_credits, NR_CREDIT_ENTRIES);
+				ch->head = 0;
+				ch->valid_len = 0;
+				pos = ch->head;
 				remaining_credits = 0;
 				break;
 			}
