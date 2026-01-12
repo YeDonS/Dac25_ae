@@ -3,6 +3,7 @@
 #include <linux/kthread.h>
 #include <linux/ktime.h>
 #include <linux/highmem.h>
+#include <linux/sched.h>
 #include <linux/sched/clock.h>
 
 #include "nvmev.h"
@@ -15,6 +16,20 @@ struct buffer;
 #endif
 
 #undef PERF_DEBUG
+
+/* Throttle SQ processing to avoid long dispatcher stalls. */
+#ifndef NVMEV_PROC_IO_SQ_MAX_BATCH
+#define NVMEV_PROC_IO_SQ_MAX_BATCH 1024
+#endif
+#ifndef NVMEV_PROC_IO_SQ_BUDGET_NS
+#define NVMEV_PROC_IO_SQ_BUDGET_NS (5ULL * 1000 * 1000)
+#endif
+#ifndef NVMEV_PROC_IO_SQ_RESCHED_EVERY
+#define NVMEV_PROC_IO_SQ_RESCHED_EVERY 64
+#endif
+#ifndef NVMEV_PROC_IO_SQ_TIME_CHECK_EVERY
+#define NVMEV_PROC_IO_SQ_TIME_CHECK_EVERY 32
+#endif
 
 #define PRP_PFN(x) ((unsigned long)((x) >> PAGE_SHIFT))
 
@@ -470,9 +485,13 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 {
 	uint64_t start_detect = ktime_get_ns();
+#if NVMEV_PROC_IO_SQ_BUDGET_NS > 0
+	uint64_t deadline = 0;
+#endif
 	int processed_count = 0;
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	int num_proc = new_db - old_db;
+	int max_proc = 0;
 	int seq;
 	int sq_entry = old_db;
 	int latest_db;
@@ -482,7 +501,15 @@ int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 	if (unlikely(num_proc < 0))
 		num_proc += sq->queue_size;
 
-	for (seq = 0; seq < num_proc; seq++) {
+	max_proc = num_proc;
+	if (NVMEV_PROC_IO_SQ_MAX_BATCH > 0 && max_proc > NVMEV_PROC_IO_SQ_MAX_BATCH)
+		max_proc = NVMEV_PROC_IO_SQ_MAX_BATCH;
+
+#if NVMEV_PROC_IO_SQ_BUDGET_NS > 0
+	deadline = start_detect + NVMEV_PROC_IO_SQ_BUDGET_NS;
+#endif
+
+	for (seq = 0; seq < max_proc; seq++) {
 		size_t io_size;
 		if (!__nvmev_proc_io(sqid, sq_entry, &io_size))
 			break;
@@ -495,11 +522,22 @@ int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 		sq->stat.total_io += io_size;
 		processed_count++;
 
+#if NVMEV_PROC_IO_SQ_RESCHED_EVERY > 0
+		if ((processed_count % NVMEV_PROC_IO_SQ_RESCHED_EVERY) == 0)
+			cond_resched();
+#endif
+
+#if NVMEV_PROC_IO_SQ_BUDGET_NS > 0 && NVMEV_PROC_IO_SQ_TIME_CHECK_EVERY > 0
+		if (deadline &&
+		    (processed_count % NVMEV_PROC_IO_SQ_TIME_CHECK_EVERY) == 0 &&
+		    ktime_get_ns() >= deadline)
+			break;
+#endif
 	}
 	sq->stat.nr_dispatch++;
 	sq->stat.max_nr_in_flight = max_t(int, sq->stat.max_nr_in_flight, sq->stat.nr_in_flight);
 
-	latest_db = (old_db + seq) % sq->queue_size;
+	latest_db = (old_db + processed_count) % sq->queue_size;
 
 	uint64_t end_detect = ktime_get_ns();
 	if (end_detect - start_detect > 1000000000) { // > 1s
