@@ -53,6 +53,10 @@ static void __nvmev_admin_create_cq(int eid, int cq_head)
 
 	nvmev_vdev->cqes[cq->qid] = cq;
 
+	NVMEV_ERROR("CREATE_CQ qid=%u qsize=%u irq_en=%d irq_vec=%u\n",
+		    cmd->cqid, cmd->qsize + 1,
+		    !!(cmd->cq_flags & NVME_CQ_IRQ_ENABLED), cmd->irq_vector);
+
 	dbs_idx = cq->qid * 2 + 1;
 	nvmev_vdev->dbs[dbs_idx] = nvmev_vdev->old_dbs[dbs_idx] = 0;
 
@@ -117,6 +121,8 @@ static void __nvmev_admin_create_sq(int eid, int cq_head)
 	nvmev_vdev->old_dbs[dbs_idx] = 0;
 
 	NVMEV_DEBUG("%s: %d\n", __func__, sq->qid);
+	NVMEV_ERROR("CREATE_SQ qid=%u cqid=%u qsize=%u flags=0x%x\n",
+		    cmd->sqid, cmd->cqid, cmd->qsize + 1, cmd->sq_flags);
 
 	cq_entry(cq_head).command_id = cmd->command_id;
 	cq_entry(cq_head).sq_id = 0;
@@ -436,15 +442,21 @@ static void __nvmev_admin_set_features(int eid, int cq_head)
 	case NVME_FEAT_VOLATILE_WC:
 		break;
 	case NVME_FEAT_NUM_QUEUES: {
-		int num_queue;
+		int req_sq;
+		int req_cq;
 
 		// # of sq in 0-base
-		num_queue = (sq_entry(eid).features.dword11 & 0xFFFF) + 1;
-		nvmev_vdev->nr_sq = min(num_queue, NR_MAX_IO_QUEUE);
+		req_sq = (sq_entry(eid).features.dword11 & 0xFFFF) + 1;
+		nvmev_vdev->nr_sq = min(req_sq, NR_MAX_IO_QUEUE);
 
 		// # of cq in 0-base
-		num_queue = ((sq_entry(eid).features.dword11 >> 16) & 0xFFFF) + 1;
-		nvmev_vdev->nr_cq = min(num_queue, NR_MAX_IO_QUEUE);
+		req_cq = ((sq_entry(eid).features.dword11 >> 16) & 0xFFFF) + 1;
+		nvmev_vdev->nr_cq = min(req_cq, NR_MAX_IO_QUEUE);
+
+		NVMEV_ERROR("NUM_QUEUES req sq=%d cq=%d -> use sq=%u cq=%u msix=%d ts=%u\n",
+			    req_sq, req_cq, nvmev_vdev->nr_sq, nvmev_vdev->nr_cq,
+			    nvmev_vdev->msix_enabled,
+			    nvmev_vdev->msixcap ? nvmev_vdev->msixcap->mxc.ts : 0);
 
 		cq_entry(cq_head).result0 =
 			((nvmev_vdev->nr_cq - 1) << 16 | (nvmev_vdev->nr_sq - 1));
