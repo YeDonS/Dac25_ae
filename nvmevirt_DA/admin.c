@@ -453,10 +453,9 @@ static void __nvmev_admin_set_features(int eid, int cq_head)
 		req_cq = ((sq_entry(eid).features.dword11 >> 16) & 0xFFFF) + 1;
 		nvmev_vdev->nr_cq = min(req_cq, NR_MAX_IO_QUEUE);
 
-		NVMEV_ERROR("NUM_QUEUES req sq=%d cq=%d -> use sq=%u cq=%u msix=%d ts=%u\n",
+		NVMEV_ERROR("NUM_QUEUES req sq=%d cq=%d -> use sq=%u cq=%u msix=%d\n",
 			    req_sq, req_cq, nvmev_vdev->nr_sq, nvmev_vdev->nr_cq,
-			    nvmev_vdev->msix_enabled,
-			    nvmev_vdev->msixcap ? nvmev_vdev->msixcap->mxc.ts : 0);
+			    nvmev_vdev->msix_enabled);
 
 		cq_entry(cq_head).result0 =
 			((nvmev_vdev->nr_cq - 1) << 16 | (nvmev_vdev->nr_sq - 1));
