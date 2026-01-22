@@ -3406,8 +3406,11 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         return true;  Complete with error */
     
           
-    {		            /* 写缓冲不足时返回 BUSY，交给上层重试 */
+    {		            /* 写缓冲不足时短暂重试，避免瞬间满导致失败 */
         uint64_t needed = LBA_TO_BYTE(nr_lba);
+        int wb_retry = 0;
+        const int WB_MAX_RETRIES = 100;    /* 最多重试 100 次 */
+        const int WB_RETRY_US = 1000;      /* 每次等待 1ms */
 
 	if (spp->pgsz) {
 		uint64_t remainder = needed % spp->pgsz;
@@ -3424,13 +3427,22 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		return true; /* Complete with error */
 	}
 
+retry_wb_alloc:
 	allocated_buf_size = buffer_allocate(wbuf, needed);
 	NVMEV_DEBUG("[DEBUG] conv_write: buffer alloc size = %u, needed = %llu\n",
 		    allocated_buf_size, needed);
 	if (allocated_buf_size < needed) {
-		ret->status = NVME_SC_BUSY;
+		if (wb_retry < WB_MAX_RETRIES) {
+			wb_retry++;
+			usleep_range(WB_RETRY_US, WB_RETRY_US + 100);
+			cond_resched();
+			goto retry_wb_alloc;
+		}
+		NVMEV_ERROR("write buffer allocation failed after %d retries (need=%llu)\n",
+			    WB_MAX_RETRIES, needed);
+		ret->status = NVME_SC_WRITE_FAULT;
 		ret->nsecs_target = req->nsecs_start;
-		return true;
+		return true; /* Complete with error */
 	}
    }
 	nsecs_latest = ssd_advance_write_buffer(conv_ftl->ssd, req->nsecs_start, wbuf_needed);
@@ -3694,6 +3706,10 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 		NVMEV_DEBUG("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_write\n");
         if (!conv_write(ns, req, ret))
             return true; /* 出错也返回完成，状态在 ret 内 */
+		if (ret->status != NVME_SC_SUCCESS && printk_ratelimit())
+			NVMEV_ERROR("conv_write status=0x%x sqid=%d opcode=0x%x slba=%llu len=%u\n",
+				    ret->status, req->sq_id, cmd->rw.opcode,
+				    (unsigned long long)cmd->rw.slba, cmd->rw.length + 1);
 		break;
 	case nvme_cmd_read:
 		NVMEV_DEBUG("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_read\n");
