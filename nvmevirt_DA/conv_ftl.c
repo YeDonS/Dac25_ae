@@ -3091,7 +3091,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 				if (access_cnt > avg_reads) {
 					uint64_t migration_done = 0;
 					uint64_t mig_start = ktime_get_ns();
-					NVMEV_ERROR("[REPROMOTION_VERIFY] Hot LPN %llu (Acc:%llu > Avg:%llu) triggering QLC->SLC migration\n", 
+					NVMEV_DEBUG("[REPROMOTION_VERIFY] Hot LPN %llu (Acc:%llu > Avg:%llu) triggering QLC->SLC migration\n", 
 							                               local_lpn, access_cnt, avg_reads);
 
 					migrate_page_to_slc(conv_ftl, local_lpn, &cur_ppa,
@@ -3099,7 +3099,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 					cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
 					conv_ftl->migration_read_path_time_ns +=
 						ktime_get_ns() - mig_start;
-					NVMEV_ERROR("[REPROMOTION_VERIFY] LPN %llu Promoted. Extra Latency: %llu ns\n", 
+					NVMEV_DEBUG("[REPROMOTION_VERIFY] LPN %llu Promoted. Extra Latency: %llu ns\n", 
 							                               local_lpn,ktime_get_ns() - mig_start);
 					conv_ftl->migration_read_path_count++;
 					if (migration_done)
@@ -3177,7 +3177,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 ret->nsecs_target = nsecs_latest;
 	ret->status = NVME_SC_SUCCESS;
-	    NVMEV_ERROR("[READ_VERIFY] LBA Range: %llu + %d. Total Latency: %llu ns\n", 
+	    NVMEV_DEBUG("[READ_VERIFY] LBA Range: %llu + %d. Total Latency: %llu ns\n", 
 			                   cmd->rw.slba, cmd->rw.length, nsecs_latest - nsecs_start);
 	return true;
 }
@@ -3364,6 +3364,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint64_t plba = 0;
 	uint64_t plpn = 0;
 	uint64_t stripe_bytes = 0;
+	uint64_t wbuf_needed = 0;
 //66f1
 
 	struct nand_cmd swr = {
@@ -3405,34 +3406,34 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         return true;  Complete with error */
     
           
-    {		            /* 等待-重试分配写缓冲，避免缓冲区暂满即失败（C90：在块起始声明变量） */
+    {		            /* 写缓冲不足时返回 BUSY，交给上层重试 */
         uint64_t needed = LBA_TO_BYTE(nr_lba);
-       
-	if (spp->pgsz) {
-		            uint64_t remainder = needed % spp->pgsz;
-			                if (remainder)
-						                needed += spp->pgsz - remainder;
-					        }
-       	int wb_retry = 0;
-	const int WB_MAX_RETRIES = 1000; /* 约100ms */
-	const int WB_RETRY_US = 100;
 
-retry_alloc_write_buffer:
+	if (spp->pgsz) {
+		uint64_t remainder = needed % spp->pgsz;
+		if (remainder)
+			needed += spp->pgsz - remainder;
+	}
+
+	wbuf_needed = needed;
+	if (unlikely(needed > wbuf->size)) {
+		NVMEV_ERROR("write buffer too small (need=%llu, size=%zu)\n",
+			    needed, wbuf->size);
+		ret->status = NVME_SC_WRITE_FAULT;
+		ret->nsecs_target = req->nsecs_start;
+		return true; /* Complete with error */
+	}
+
 	allocated_buf_size = buffer_allocate(wbuf, needed);
-	NVMEV_DEBUG("[DEBUG] conv_write: buffer alloc size = %u, needed = %llu\n", allocated_buf_size, needed);
+	NVMEV_DEBUG("[DEBUG] conv_write: buffer alloc size = %u, needed = %llu\n",
+		    allocated_buf_size, needed);
 	if (allocated_buf_size < needed) {
-	    if (wb_retry < WB_MAX_RETRIES) {
-		wb_retry++;
-		udelay(WB_RETRY_US);
-		goto retry_alloc_write_buffer;						   						                }
-	    NVMEV_DEBUG("[DEBUG] conv_write: BUFFER ALLOCATION FAILED after retries (%u < %llu)\n",
-		                        allocated_buf_size, needed);
-	    ret->status = NVME_SC_WRITE_FAULT;
-	    ret->nsecs_target = req->nsecs_start;
-	    return true; /* Complete with error */
-      	}
+		ret->status = NVME_SC_BUSY;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
+	}
    }
-	nsecs_latest = ssd_advance_write_buffer(conv_ftl->ssd, req->nsecs_start, LBA_TO_BYTE(nr_lba));
+	nsecs_latest = ssd_advance_write_buffer(conv_ftl->ssd, req->nsecs_start, wbuf_needed);
 	nsecs_xfer_completed = nsecs_latest;
 
 	swr.stime = nsecs_latest;
