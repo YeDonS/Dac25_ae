@@ -428,6 +428,13 @@ static void update_qlc_latency_zone(struct conv_ftl *conv_ftl, uint64_t lpn, str
 	if (!conv_ftl->qlc_page_wcnt)
 		return;
 
+	/* PPA 边界检查 - 防止越界访问 */
+	if (!valid_ppa(conv_ftl, ppa)) {
+		NVMEV_DEBUG("[update_qlc_latency_zone] Invalid PPA: ch=%d lun=%d blk=%d pg=%d\n",
+			    ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+		return;
+	}
+
 	pg = get_pg(conv_ftl->ssd, ppa);
 	if (!pg)
 		return;
@@ -593,9 +600,14 @@ static const struct file_operations access_inject_fops = {
 
 static inline uint8_t get_qlc_zone_for_read(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-	struct nand_page *pg = get_pg(conv_ftl->ssd, ppa);
+	struct nand_page *pg;
 	uint8_t zone = 0;
 
+	/* PPA 边界检查 - 防止越界访问 */
+	if (!valid_ppa(conv_ftl, ppa))
+		return 0;
+
+	pg = get_pg(conv_ftl->ssd, ppa);
 	if (pg)
 		zone = pg->qlc_latency_zone;
 	if (zone >= QLC_ZONE_COUNT)
@@ -877,6 +889,13 @@ static void set_page_prev_link(struct conv_ftl *conv_ftl, uint64_t lpn,
 {
 	struct nand_page *pg;
 	(void)lpn;
+
+	/* PPA 边界检查 - 防止越界访问 */
+	if (!valid_ppa(conv_ftl, ppa)) {
+		NVMEV_DEBUG("[set_page_prev_link] Invalid PPA: ch=%d lun=%d blk=%d pg=%d\n",
+			    ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+		return;
+	}
 
 	pg = get_pg(conv_ftl->ssd, ppa);
 	if (!pg)
@@ -1724,6 +1743,13 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         return;
     }
     
+    /* 2. PPA 边界检查 - 防止越界访问 */
+    if (!valid_ppa(conv_ftl, ppa)) {
+        NVMEV_ERROR("[mark_page_invalid] Invalid PPA: ch=%d lun=%d blk=%d pg=%d\n",
+                    ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+        return;
+    }
+    
     struct ssdparams *spp = &conv_ftl->ssd->sp;
     struct nand_block *blk;
     struct nand_page *pg;
@@ -1978,10 +2004,18 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct nand_block *blk = get_blk(conv_ftl->ssd, ppa);
+	struct nand_block *blk;
 	struct nand_page *pg = NULL;
 	int i;
 
+	/* PPA 边界检查 - 防止越界访问 */
+	if (!valid_ppa(conv_ftl, ppa)) {
+		NVMEV_ERROR("[mark_block_free] Invalid PPA: ch=%d lun=%d blk=%d pg=%d\n",
+			    ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+		return;
+	}
+
+	blk = get_blk(conv_ftl->ssd, ppa);
 	if (!blk) {
 		NVMEV_ERROR("mark_block_free: failed to locate block ch=%d,lun=%d,blk=%d\n",
 			    ppa->g.ch, ppa->g.lun, ppa->g.blk);
@@ -2009,28 +2043,38 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct convparams *cpp = &conv_ftl->cp;
 	struct ppa new_ppa;
-	uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
-	struct nand_page *old_pg = get_pg(conv_ftl->ssd, old_ppa);
-	uint64_t stored_prev_lpn = old_pg ? old_pg->oob_prev_lpn : INVALID_LPN;
-	uint32_t target_ch = old_ppa->g.ch;
-	uint32_t target_lun = old_ppa->g.lun;
-	uint32_t dies = total_dies(spp);
-	uint32_t src_die = encode_die(spp, old_ppa);
-	struct heat_tracking *ht = &conv_ftl->heat_track;
-	uint64_t old_read_cnt = (ht && ht->access_count && lpn != INVALID_LPN) ?
-		ht->access_count[lpn] : 0;
+	struct nand_page *old_pg;
+	uint64_t stored_prev_lpn;
+	uint32_t target_ch;
+	uint32_t target_lun;
+	uint32_t dies;
+	uint32_t src_die;
+	struct heat_tracking *ht;
+	uint64_t old_read_cnt;
 	bool old_in_slc;
+	uint64_t lpn;
+
+	/* 先检查 PPA 有效性，再访问任何基于 PPA 的数据 */
+	if (!valid_ppa(conv_ftl, old_ppa)) {
+		NVMEV_ERROR("gc_write_page: invalid source PPA ch=%d lun=%d blk=%d pg=%d\n",
+			    old_ppa->g.ch, old_ppa->g.lun, old_ppa->g.blk, old_ppa->g.pg);
+		return 0;
+	}
+
+	lpn = get_rmap_ent(conv_ftl, old_ppa);
+	old_pg = get_pg(conv_ftl->ssd, old_ppa);
+	stored_prev_lpn = old_pg ? old_pg->oob_prev_lpn : INVALID_LPN;
+	target_ch = old_ppa->g.ch;
+	target_lun = old_ppa->g.lun;
+	dies = total_dies(spp);
+	src_die = encode_die(spp, old_ppa);
+	ht = &conv_ftl->heat_track;
+	old_read_cnt = (ht && ht->access_count && lpn != INVALID_LPN) ?
+		ht->access_count[lpn] : 0;
 /* int prev_die_log = -1;
  	struct ppa prev_ppa = { .ppa = UNMAPPED_PPA };
 */
 	NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
-
-	if (!valid_ppa(conv_ftl, old_ppa)) {
-		NVMEV_ERROR("gc_write_page: invalid source PPA ch=%d lun=%d blk=%d pg=%d, clearing lpn=%llu\n",
-			    old_ppa->g.ch, old_ppa->g.lun, old_ppa->g.blk, old_ppa->g.pg, lpn);
-		clear_lpn_mapping(conv_ftl, lpn);
-		return 0;
-	}
 
 	if (lpn != INVALID_LPN) {
 		if (conv_ftl->global_read_sum >= old_read_cnt)
@@ -2265,6 +2309,14 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 		    victim.line->ipc, victim.line->vpc);
 
 	conv_ftl->wfc.credits_to_refill = victim.line->ipc;
+
+	/* PPA 边界检查 - 防止越界访问 */
+	if (!valid_ppa(conv_ftl, &ppa)) {
+		NVMEV_ERROR("[do_gc] Invalid victim PPA: ch=%d lun=%d blk=%d\n",
+			    ppa.g.ch, ppa.g.lun, ppa.g.blk);
+		return -1;
+	}
+
 	{
 		struct nand_block *victim_blk = get_blk(conv_ftl->ssd, &ppa);
 		if (victim_blk)
@@ -2279,6 +2331,14 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 		struct nand_page *pg_iter = NULL;
 
 		ppa.g.pg = pg;
+
+		/* PPA 边界检查 - 防止越界访问 */
+		if (!valid_ppa(conv_ftl, &ppa)) {
+			NVMEV_ERROR("[do_gc] Invalid PPA in loop: ch=%d lun=%d blk=%d pg=%d\n",
+				    ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
+			continue;
+		}
+
 		pg_iter = get_pg(conv_ftl->ssd, &ppa);
 
 		/* 如果页面有效，就把它搬走 */
@@ -2424,6 +2484,13 @@ retry_get_page:
 	ppa.g.blk = wp->blk;
 	ppa.g.pl = wp->pl;
 
+	/* PPA 边界检查 - 防止越界访问 */
+	if (!valid_ppa(conv_ftl, &ppa)) {
+		NVMEV_ERROR("[get_new_slc_page] Invalid PPA: ch=%d lun=%d blk=%d pg=%d\n",
+			    ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
+		return (struct ppa){ .ppa = UNMAPPED_PPA };
+	}
+
 	pg = get_pg(conv_ftl->ssd, &ppa);
 	if (!pg)
 		return (struct ppa){ .ppa = UNMAPPED_PPA };
@@ -2552,6 +2619,13 @@ retry_gc_get_page:
 	ppa.g.pg = wp->pg;
 	ppa.g.blk = wp->blk;
 	ppa.g.pl = wp->pl;
+
+	/* PPA 边界检查 - 防止越界访问 */
+	if (!valid_ppa(conv_ftl, &ppa)) {
+		NVMEV_ERROR("[get_gc_slc_page] Invalid PPA: ch=%d lun=%d blk=%d pg=%d\n",
+			    ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
+		return (struct ppa){ .ppa = UNMAPPED_PPA };
+	}
 
 	pg = get_pg(conv_ftl->ssd, &ppa);
 	if (!pg)
@@ -2769,6 +2843,10 @@ static int qlc_try_allocate_zone(struct conv_ftl *conv_ftl, struct write_pointer
 		candidate.g.blk = wp->blk;
 		candidate.g.pg = pg_idx;
 		candidate.g.pl = 0;
+
+		/* PPA 边界检查 - 防止越界访问 */
+		if (!valid_ppa(conv_ftl, &candidate))
+			continue;
 
 		page = get_pg(conv_ftl->ssd, &candidate);
 		if (!page)
