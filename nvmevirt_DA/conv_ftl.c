@@ -204,7 +204,7 @@ static inline uint32_t pick_locked_qlc_page_type(struct conv_ftl *conv_ftl, bool
 }
 
 /* 前向声明以避免隐式声明错误 */
-static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn);
+static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn);
 static inline bool mapped_ppa(struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *slc_ppa);
@@ -305,7 +305,7 @@ static inline bool should_gc_qlc_high(struct conv_ftl *conv_ftl)
 	collect_qlc_stats(conv_ftl, &qlc_stats);
 	return qlc_stats.free <= conv_ftl->qlc_gc_free_thres_high;
 }
-static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
+static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
 	unsigned seq;
 	struct ppa entry;
@@ -386,7 +386,7 @@ static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	return pgidx;
 }
 
-static inline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa)
+static noinline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	uint64_t pgidx = ppa2pgidx(conv_ftl, ppa);
 	unsigned seq;
@@ -2099,6 +2099,13 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 */
 	NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
 
+	if (stored_prev_lpn != INVALID_LPN && !valid_lpn(conv_ftl, stored_prev_lpn)) {
+		NVMEV_WARN("gc_write_page: bad prev_lpn=%llu (ppa ch=%d lun=%d blk=%d pg=%d status=%d), drop prev link\n",
+			   stored_prev_lpn, old_ppa->g.ch, old_ppa->g.lun, old_ppa->g.blk,
+			   old_ppa->g.pg, old_pg ? old_pg->status : -1);
+		stored_prev_lpn = INVALID_LPN;
+	}
+
 	if (!valid_ppa(conv_ftl, old_ppa)) {
 		NVMEV_ERROR("gc_write_page: invalid source PPA ch=%d lun=%d blk=%d pg=%d, clearing lpn=%llu\n",
 			    old_ppa->g.ch, old_ppa->g.lun, old_ppa->g.blk, old_ppa->g.pg, lpn);
@@ -3012,6 +3019,13 @@ static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	spin_lock_irqsave(&conv_ftl->qlc_zone_lock, mig_flags);
 	zone_hint = pick_locked_qlc_page_type(conv_ftl, read_cnt >= migration_avg);
 	spin_unlock_irqrestore(&conv_ftl->qlc_zone_lock, mig_flags);
+
+	if (stored_prev_lpn != INVALID_LPN && !valid_lpn(conv_ftl, stored_prev_lpn)) {
+		NVMEV_WARN("migrate_page_to_qlc: bad prev_lpn=%llu (ppa ch=%d lun=%d blk=%d pg=%d status=%d), drop prev link\n",
+			   stored_prev_lpn, slc_ppa->g.ch, slc_ppa->g.lun, slc_ppa->g.blk,
+			   slc_ppa->g.pg, pg ? pg->status : -1);
+		stored_prev_lpn = INVALID_LPN;
+	}
 
 	if (stored_prev_lpn != INVALID_LPN) {
 		prev_ppa = get_maptbl_ent(conv_ftl, stored_prev_lpn);
