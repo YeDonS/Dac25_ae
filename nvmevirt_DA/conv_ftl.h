@@ -5,6 +5,7 @@
 
 #include <linux/types.h>
 #include <linux/spinlock.h>
+#include <linux/seqlock.h>
 #include <linux/atomic.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
@@ -85,6 +86,7 @@ struct conv_ftl {
 	struct convparams cp;
 	struct ppa *maptbl; /* page level mapping table */
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
+	seqlock_t maptbl_lock; /* serialize maptbl/rmap updates with low-overhead readers */
 	struct write_flow_control wfc;
 	//66f1 - 删除了冲突的旧 line_mgmt 结构
 	uint32_t lunpointer;
