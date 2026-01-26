@@ -42,6 +42,23 @@ struct nvmev_cmd_debug {
 
 static DEFINE_PER_CPU(struct nvmev_cmd_debug, nvmev_last_cmd);
 
+struct nvmev_maptbl_debug {
+	const char *site;
+	u64 lpn;
+};
+
+static DEFINE_PER_CPU(struct nvmev_maptbl_debug, nvmev_last_maptbl);
+
+static inline void nvmev_set_maptbl_site(const char *site, u64 lpn)
+{
+	struct nvmev_maptbl_debug *dbg = this_cpu_ptr(&nvmev_last_maptbl);
+
+	if (dbg) {
+		dbg->site = site;
+		dbg->lpn = lpn;
+	}
+}
+
 static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn);
 
 static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn);
@@ -338,6 +355,7 @@ static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lp
 	if (unlikely(lpn >= conv_ftl->ssd->sp.tt_pgs)) {
 		if (printk_ratelimit()) {
 			struct nvmev_cmd_debug *dbg = this_cpu_ptr(&nvmev_last_cmd);
+			struct nvmev_maptbl_debug *md = this_cpu_ptr(&nvmev_last_maptbl);
 
 			NVMEV_ERROR("get_maptbl_ent: lpn out of range lpn=%llu tt_pgs=%lu\n",
 				    lpn, conv_ftl->ssd->sp.tt_pgs);
@@ -345,6 +363,10 @@ static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lp
 				    __builtin_return_address(0));
 			NVMEV_ERROR("get_maptbl_ent: pid=%d comm=%s cpu=%d\n",
 				    current->pid, current->comm, raw_smp_processor_id());
+			if (md && md->site) {
+				NVMEV_ERROR("get_maptbl_ent: callsite=%s lpn=%llu\n",
+					    md->site, md->lpn);
+			}
 			if (dbg && dbg->valid) {
 				NVMEV_ERROR("get_maptbl_ent: last_cmd opcode=0x%x nsid=%u slba=%llu len=%u sqid=%d ts=%llu\n",
 					    dbg->opcode, dbg->nsid, dbg->slba, dbg->len,
@@ -3158,6 +3180,18 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 	NVMEV_ASSERT(conv_ftls);
 	NVMEV_DEBUG("conv_read: start_lpn=%lld, len=%lld, end_lpn=%lld", start_lpn, nr_lba, end_lpn);
+	if (unlikely(nr_parts == 0)) {
+		NVMEV_ERROR("conv_read: nr_parts=0\n");
+		ret->status = NVME_SC_INTERNAL;
+		ret->nsecs_target = nsecs_start;
+		return true;
+	}
+	if (unlikely(nr_lba == 0 || lba > U64_MAX - (nr_lba - 1))) {
+		NVMEV_ERROR("conv_read: LBA overflow lba=%llu nr_lba=%llu\n", lba, nr_lba);
+		ret->status = NVME_SC_LBA_RANGE;
+		ret->nsecs_target = nsecs_start;
+		return true;
+	}
     if ((end_lpn / nr_parts) >= spp->tt_pgs) {
         NVMEV_ERROR("conv_read: lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
                     start_lpn, spp->tt_pgs);
@@ -3179,6 +3213,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
 		xfer_size = 0;
+		nvmev_set_maptbl_site("conv_read.prev_ppa_init", start_lpn / nr_parts);
 		prev_ppa = get_maptbl_ent(conv_ftl, start_lpn / nr_parts);
 		prev_lpn = start_lpn / nr_parts;
 		has_avg = calc_global_avg_reads(conv_ftl, &avg_reads);
@@ -3190,6 +3225,13 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			struct ppa cur_ppa;
 
 			local_lpn = lpn / nr_parts;
+			if (unlikely(local_lpn >= conv_ftl->ssd->sp.tt_pgs)) {
+				NVMEV_ERROR("conv_read: BAD local_lpn=%llu lpn=%llu start_lpn=%llu end_lpn=%llu nr_parts=%u\n",
+					    local_lpn, lpn, start_lpn, end_lpn, nr_parts);
+				dump_stack();
+				continue;
+			}
+			nvmev_set_maptbl_site("conv_read.cur_ppa", local_lpn);
 			cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
 			if (!mapped_ppa(&cur_ppa) || !valid_ppa(conv_ftl, &cur_ppa)) {
 				NVMEV_DEBUG("lpn 0x%llx not mapped to valid ppa\n", local_lpn);
@@ -3565,7 +3607,19 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 //66f1
 
 	NVMEV_DEBUG("[DEBUG] conv_write: start_lpn=%lld, len=%lld, end_lpn=%lld, nr_parts=%u, tt_pgs=%ld\n", 
-	           start_lpn, nr_lba, end_lpn, nr_parts, spp->tt_pgs);
+		           start_lpn, nr_lba, end_lpn, nr_parts, spp->tt_pgs);
+	if (unlikely(nr_parts == 0)) {
+		NVMEV_ERROR("conv_write: nr_parts=0\n");
+		ret->status = NVME_SC_INTERNAL;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
+	}
+	if (unlikely(nr_lba == 0 || lba > U64_MAX - (nr_lba - 1))) {
+		NVMEV_ERROR("conv_write: LBA overflow lba=%llu nr_lba=%llu\n", lba, nr_lba);
+		ret->status = NVME_SC_LBA_RANGE;
+		ret->nsecs_target = req->nsecs_start;
+		return true;
+	}
     if ((end_lpn / nr_parts) >= spp->tt_pgs) {
         NVMEV_DEBUG("[DEBUG] conv_write: LPN RANGE CHECK FAILED - lpn passed FTL range(start_lpn=%lld,tt_pgs=%ld)\n",
                     start_lpn, spp->tt_pgs);
@@ -3636,12 +3690,21 @@ retry_wb_alloc:
 
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
+		if (unlikely(local_lpn >= conv_ftl->ssd->sp.tt_pgs)) {
+			NVMEV_ERROR("BAD local_lpn=%llu lpn=%llu start_lpn=%llu end_lpn=%llu nr_parts=%u slba=%llu len=%u\n",
+				    local_lpn, lpn, start_lpn, end_lpn, nr_parts,
+				    cmd->rw.slba, cmd->rw.length + 1);
+			dump_stack();
+			return true;
+		}
 		prev_link_lpn = INVALID_LPN;
 		if (local_lpn > 0) {
+			nvmev_set_maptbl_site("conv_write.prev_tmp", local_lpn - 1);
 			struct ppa prev_tmp = get_maptbl_ent(conv_ftl, local_lpn - 1);
 			if (mapped_ppa(&prev_tmp) && valid_ppa(conv_ftl, &prev_tmp))
 				prev_link_lpn = local_lpn - 1;
 		}
+		nvmev_set_maptbl_site("conv_write.ppa", local_lpn);
 		ppa = get_maptbl_ent(conv_ftl, local_lpn); // Check whether the given LPN has been written before
 		if (mapped_ppa(&ppa)) {
 			/* update old page information first */
@@ -3662,6 +3725,12 @@ retry_wb_alloc:
 			{
 				uint64_t p_local_lpn = plpn / nr_parts;
 				struct conv_ftl* p_conv_ftl = &conv_ftls[plpn % nr_parts];
+				if (unlikely(p_local_lpn >= p_conv_ftl->ssd->sp.tt_pgs)) {
+					NVMEV_ERROR("BAD p_local_lpn=%llu plpn=%llu nr_parts=%u slba=%llu pslba=%llu\n",
+						    p_local_lpn, plpn, nr_parts, cmd->rw.slba, cmd->rw.pslba);
+					dump_stack();
+				}
+				nvmev_set_maptbl_site("conv_write.append_ppa", p_local_lpn);
 				ppa = get_maptbl_ent(p_conv_ftl,p_local_lpn); 
 				if (mapped_ppa(&ppa)) {		
 					uint32_t originlun = conv_ftl->lunpointer;
@@ -3676,6 +3745,7 @@ retry_wb_alloc:
 			}
 			else if (bOverwrite)
 			{				
+				nvmev_set_maptbl_site("conv_write.overwrite_ppa", local_lpn);
 				ppa = get_maptbl_ent(conv_ftl,local_lpn); 
 				if (mapped_ppa(&ppa)) {
 					uint32_t originlun = conv_ftl->lunpointer;
