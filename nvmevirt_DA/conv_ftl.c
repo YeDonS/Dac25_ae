@@ -5,6 +5,9 @@
 #include <linux/ktime.h>
 #include <linux/delay.h>
 #include <linux/atomic.h>
+#include <linux/percpu.h>
+#include <linux/sched.h>
+#include <linux/smp.h>
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/string.h>
@@ -26,6 +29,18 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			      struct buffer *write_buffer, unsigned int buffs_to_release);
 
 #define RECENT_WRITE_GUARD_PCT 10U
+
+struct nvmev_cmd_debug {
+	bool valid;
+	u8 opcode;
+	u32 nsid;
+	u64 slba;
+	u32 len;
+	int sqid;
+	u64 ts;
+};
+
+static DEFINE_PER_CPU(struct nvmev_cmd_debug, nvmev_last_cmd);
 
 static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn);
 
@@ -322,8 +337,21 @@ static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lp
 	}
 	if (unlikely(lpn >= conv_ftl->ssd->sp.tt_pgs)) {
 		if (printk_ratelimit()) {
+			struct nvmev_cmd_debug *dbg = this_cpu_ptr(&nvmev_last_cmd);
+
 			NVMEV_ERROR("get_maptbl_ent: lpn out of range lpn=%llu tt_pgs=%lu\n",
 				    lpn, conv_ftl->ssd->sp.tt_pgs);
+			NVMEV_ERROR("get_maptbl_ent: caller=%pS\n",
+				    __builtin_return_address(0));
+			NVMEV_ERROR("get_maptbl_ent: pid=%d comm=%s cpu=%d\n",
+				    current->pid, current->comm, raw_smp_processor_id());
+			if (dbg && dbg->valid) {
+				NVMEV_ERROR("get_maptbl_ent: last_cmd opcode=0x%x nsid=%u slba=%llu len=%u sqid=%d ts=%llu\n",
+					    dbg->opcode, dbg->nsid, dbg->slba, dbg->len,
+					    dbg->sqid, dbg->ts);
+			} else {
+				NVMEV_ERROR("get_maptbl_ent: last_cmd unavailable\n");
+			}
 			dump_stack();
 		}
 		return (struct ppa){ .ppa = UNMAPPED_PPA };
@@ -3823,6 +3851,7 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 {
     /* C90: declarations must precede statements */
     struct nvme_command *cmd;
+    struct nvmev_cmd_debug *dbg;
     
     NVMEV_DEBUG("[DEBUG] conv_proc_nvme_io_cmd: Function entry\n");
     
@@ -3837,6 +3866,17 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
     }
     
     cmd = req->cmd;
+
+	dbg = this_cpu_ptr(&nvmev_last_cmd);
+	if (dbg) {
+		dbg->valid = true;
+		dbg->opcode = cmd->common.opcode;
+		dbg->nsid = cmd->common.nsid;
+		dbg->slba = cmd->rw.slba;
+		dbg->len = cmd->rw.length + 1;
+		dbg->sqid = req->sq_id;
+		dbg->ts = local_clock();
+	}
 	NVMEV_ASSERT(ns->csi == NVME_CSI_NVM);
 
 	NVMEV_DEBUG("[DEBUG] conv_proc_nvme_io_cmd: Processing opcode %d (%s)\n", 

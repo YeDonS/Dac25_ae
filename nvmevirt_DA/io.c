@@ -465,6 +465,31 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	static unsigned long long counter = 0;
 #endif
 
+	/* SQE sanity check to catch poisoned/overwritten commands */
+	if (unlikely(cmd->rw.opcode == nvme_cmd_read ||
+		     cmd->rw.opcode == nvme_cmd_write ||
+		     cmd->rw.opcode == nvme_cmd_zone_append)) {
+		uint64_t slba = cmd->rw.slba;
+		uint32_t len = cmd->rw.length + 1;
+		uint64_t max_lba = ns->size >> 9;
+		bool poisoned = (slba == 0xd6d6d6d6d6d6d6dULL) ||
+				(slba == 0x0d6d6d6d6d6d6e6dULL);
+		bool out_of_range = (slba >= max_lba) ||
+				    ((slba + len) > max_lba) ||
+				    (slba > (1ULL << 48));
+		if (unlikely(poisoned || out_of_range)) {
+			if (printk_ratelimit()) {
+				NVMEV_ERROR("BAD SQE: opcode=0x%x nsid=%u slba=%llu len=%u sqid=%d sqe=%p\n",
+					    cmd->common.opcode, cmd->common.nsid, slba, len,
+					    sqid, cmd);
+				print_hex_dump(KERN_ERR, "nvmev sqe: ",
+					       DUMP_PREFIX_OFFSET, 16, 1,
+					       cmd, sizeof(*cmd), true);
+				dump_stack();
+			}
+		}
+	}
+
 	if (!ns->proc_io_cmd(ns, &req, &ret)) {
 		if (printk_ratelimit())
 			NVMEV_ERROR("proc_io_cmd failed sqid=%d sqe=%d opcode=0x%x slba=%llu len=%u\n",
