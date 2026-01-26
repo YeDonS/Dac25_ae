@@ -3564,6 +3564,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint64_t lpn;
 	uint64_t local_lpn;
 	uint32_t nr_parts = ns->nr_parts;
+	uint64_t max_lba = ns->size >> 9;
 
 	uint64_t nsecs_latest;
 	uint64_t nsecs_xfer_completed;
@@ -3572,7 +3573,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint32_t xfer_size = 0;  /* 声明缺失的变量 */
 //66f1
 	uint16_t bOverwrite = (cmd->rw.control & NVME_RW_OVERWRITE) ? 1 : 0;
-	uint16_t bAppend = (cmd->rw.control & NVME_RW_APPEND) ? 1 : 0;
+	uint16_t bAppend = 0;
+	bool is_append_opcode = (cmd->rw.opcode == nvme_cmd_zone_append);
 
 	uint64_t plba = 0;
 	uint64_t plpn = 0;
@@ -3594,12 +3596,22 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
 	};
 //66f1
-	if (bAppend)
-	{
+	if (is_append_opcode)
+		bAppend = 1;
+
+	if (bAppend) {
 		plba = cmd->rw.pslba;
 		plpn = plba / spp->secs_per_pg;
-		//NVMEV_ERROR("[NVMEVIRT]_AP, plba = %llu\n", plba);
-	}	
+		if (unlikely(plba >= max_lba)) {
+			if (printk_ratelimit()) {
+				NVMEV_ERROR("conv_write: BAD pslba=%llu (slba=%llu len=%u sqid=%d), disable append\n",
+					    plba, cmd->rw.slba, cmd->rw.length + 1, req->sq_id);
+			}
+			bAppend = 0;
+			plba = 0;
+			plpn = 0;
+		}
+	}
 	if (bOverwrite)
 	{
 		//NVMEV_ERROR("[NVMEVIRT]_OW\n");
