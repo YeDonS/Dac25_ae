@@ -307,6 +307,9 @@ static inline bool should_gc_qlc_high(struct conv_ftl *conv_ftl)
 }
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
+	unsigned seq;
+	struct ppa entry;
+
 	if (unlikely(!conv_ftl || !conv_ftl->maptbl || !conv_ftl->ssd)) {
 		if (printk_ratelimit()) {
 			NVMEV_ERROR("get_maptbl_ent: bad state conv_ftl=%p maptbl=%p ssd=%p lpn=%llu\n",
@@ -321,10 +324,15 @@ static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
 		if (printk_ratelimit()) {
 			NVMEV_ERROR("get_maptbl_ent: lpn out of range lpn=%llu tt_pgs=%lu\n",
 				    lpn, conv_ftl->ssd->sp.tt_pgs);
+			dump_stack();
 		}
 		return (struct ppa){ .ppa = UNMAPPED_PPA };
 	}
-	return conv_ftl->maptbl[lpn];
+	do {
+		seq = read_seqbegin(&conv_ftl->maptbl_lock);
+		entry = conv_ftl->maptbl[lpn];
+	} while (read_seqretry(&conv_ftl->maptbl_lock, seq));
+	return entry;
 }
 
 static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
@@ -340,7 +348,9 @@ static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struc
 		return;
 	}
 	NVMEV_ASSERT(lpn < conv_ftl->ssd->sp.tt_pgs);
+	write_seqlock(&conv_ftl->maptbl_lock);
 	conv_ftl->maptbl[lpn] = *ppa;
+	write_sequnlock(&conv_ftl->maptbl_lock);
 }
 
 static inline void clear_lpn_mapping(struct conv_ftl *conv_ftl, uint64_t lpn)
@@ -379,8 +389,14 @@ static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
 static inline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	uint64_t pgidx = ppa2pgidx(conv_ftl, ppa);
+	unsigned seq;
+	uint64_t lpn;
 
-	return conv_ftl->rmap[pgidx];
+	do {
+		seq = read_seqbegin(&conv_ftl->maptbl_lock);
+		lpn = conv_ftl->rmap[pgidx];
+	} while (read_seqretry(&conv_ftl->maptbl_lock, seq));
+	return lpn;
 }
 
 /* set rmap[page_no(ppa)] -> lpn */
@@ -388,7 +404,9 @@ static inline void set_rmap_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 {
 	uint64_t pgidx = ppa2pgidx(conv_ftl, ppa);
 
+	write_seqlock(&conv_ftl->maptbl_lock);
 	conv_ftl->rmap[pgidx] = lpn;
+	write_sequnlock(&conv_ftl->maptbl_lock);
 }
 
 static bool calc_global_avg_reads(struct conv_ftl *conv_ftl, uint64_t *avg_out)
@@ -1392,6 +1410,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->cp = *cpp;
 
 	conv_ftl->ssd = ssd;
+	seqlock_init(&conv_ftl->maptbl_lock);
 	conv_ftl->slc_pgs_per_blk = ssd->sp.pgs_per_blk;
 	conv_ftl->qlc_pgs_per_blk = conv_ftl->slc_pgs_per_blk * QLC_BLOCK_CAPACITY_FACTOR;
 	conv_ftl->debug_access_count = NULL;
@@ -1757,6 +1776,8 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	struct heat_tracking *ht = &conv_ftl->heat_track;
 	uint64_t lpn = INVALID_LPN;
 	uint64_t read_cnt = 0;
+	bool in_slc;
+	bool invalidated = false;
 
     /* 更新页和块的状态 (这部分不涉及共享数据结构，可以在锁外完成) */
     pg = get_pg(conv_ftl->ssd, ppa);
@@ -1774,44 +1795,9 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
                    pg->status, ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
         return;
     }
-    
-	pg->status = PG_INVALID;
-	pg->oob_prev_lpn = INVALID_LPN;
-
-	lpn = get_rmap_ent(conv_ftl, ppa);
-	if (lpn != INVALID_LPN && ht && ht->access_count)
-		read_cnt = ht->access_count[lpn];
-
-	if (conv_ftl->global_read_sum >= read_cnt)
-		conv_ftl->global_read_sum -= read_cnt;
-	else
-		conv_ftl->global_read_sum = 0;
-
-	if (lpn != INVALID_LPN && conv_ftl->global_valid_pg_cnt > 0)
-		conv_ftl->global_valid_pg_cnt--;
-
-    blk = get_blk(conv_ftl->ssd, ppa);
-    if (!blk) {
-        NVMEV_ERROR("[mark_page_invalid] Failed to get block for ppa ch=%d,lun=%d,blk=%d,pg=%d\n",
-                   ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
-        return;
-    }
-    
-	{
-		uint32_t max_pgs = blk->is_qlc ? conv_ftl->qlc_pgs_per_blk : spp->pgs_per_blk;
-
-		NVMEV_ASSERT(blk->ipc >= 0 && blk->ipc < max_pgs);
-		blk->ipc++;
-		if (blk->vpc > 0) {
-			blk->vpc--;
-		} else {
-			NVMEV_ERROR("blk->vpc already 0 before decrement, blk=%d\n", ppa->g.blk);
-			/* Don't return here, continue with line management updates */
-		}
-	}
 
     /* 2. 根据介质类型，进入完全独立的原子操作块 */
-    bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
+    in_slc = is_slc_block(conv_ftl, ppa->g.blk);
     if (in_slc) {
         uint32_t die = encode_die(spp, ppa);
         struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
@@ -1824,6 +1810,18 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         }
 
 	spin_lock(&conv_ftl->slc_lock); // --- SLC 加锁 ---
+	/* 双重检查，避免并发重复失效 */
+	if (pg->status == PG_INVALID) {
+		spin_unlock(&conv_ftl->slc_lock);
+		return;
+	}
+	if (pg->status != PG_VALID) {
+		spin_unlock(&conv_ftl->slc_lock);
+		return;
+	}
+	pg->status = PG_INVALID;
+	pg->oob_prev_lpn = INVALID_LPN;
+	invalidated = true;
 	slc_apply_line_invalid(lm, ppa->g.blk, spp);
 	spin_unlock(&conv_ftl->slc_lock); // --- SLC 解锁 ---
 
@@ -1834,17 +1832,6 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		uint32_t start_blk = conv_ftl->slc_blks_per_pl;
 		uint32_t idx;
 		bool was_full_line = false;
-		if (lpn != INVALID_LPN) {
-			unsigned long flags;
-			spin_lock_irqsave(&conv_ftl->qlc_zone_lock, flags);
-			if (conv_ftl->qlc_resident_page_cnt > 0)
-				conv_ftl->qlc_resident_page_cnt--;
-			if (conv_ftl->qlc_resident_read_sum >= read_cnt)
-				conv_ftl->qlc_resident_read_sum -= read_cnt;
-			else
-				conv_ftl->qlc_resident_read_sum = 0;
-			spin_unlock_irqrestore(&conv_ftl->qlc_zone_lock, flags);
-		}
         
         /* QLC 边界检查 (在加锁前) */
         if (!lm || !lm->lines) {
@@ -1865,6 +1852,18 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         }
 
         spin_lock(&conv_ftl->qlc_lock); // --- QLC 加锁 ---
+		/* 双重检查，避免并发重复失效 */
+		if (pg->status == PG_INVALID) {
+			spin_unlock(&conv_ftl->qlc_lock);
+			return;
+		}
+		if (pg->status != PG_VALID) {
+			spin_unlock(&conv_ftl->qlc_lock);
+			return;
+		}
+		pg->status = PG_INVALID;
+		pg->oob_prev_lpn = INVALID_LPN;
+		invalidated = true;
 
         line = &lm->lines[idx];
         
@@ -1888,6 +1887,54 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
         spin_unlock(&conv_ftl->qlc_lock); // --- QLC 解锁 ---
     }
+
+	if (!invalidated)
+		return;
+
+	lpn = get_rmap_ent(conv_ftl, ppa);
+	if (lpn != INVALID_LPN && ht && ht->access_count)
+		read_cnt = ht->access_count[lpn];
+
+	if (conv_ftl->global_read_sum >= read_cnt)
+		conv_ftl->global_read_sum -= read_cnt;
+	else
+		conv_ftl->global_read_sum = 0;
+
+	if (lpn != INVALID_LPN && conv_ftl->global_valid_pg_cnt > 0)
+		conv_ftl->global_valid_pg_cnt--;
+
+	if (!in_slc && lpn != INVALID_LPN) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&conv_ftl->qlc_zone_lock, flags);
+		if (conv_ftl->qlc_resident_page_cnt > 0)
+			conv_ftl->qlc_resident_page_cnt--;
+		if (conv_ftl->qlc_resident_read_sum >= read_cnt)
+			conv_ftl->qlc_resident_read_sum -= read_cnt;
+		else
+			conv_ftl->qlc_resident_read_sum = 0;
+		spin_unlock_irqrestore(&conv_ftl->qlc_zone_lock, flags);
+	}
+
+    blk = get_blk(conv_ftl->ssd, ppa);
+    if (!blk) {
+        NVMEV_ERROR("[mark_page_invalid] Failed to get block for ppa ch=%d,lun=%d,blk=%d,pg=%d\n",
+                   ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+        return;
+    }
+
+	{
+		uint32_t max_pgs = blk->is_qlc ? conv_ftl->qlc_pgs_per_blk : spp->pgs_per_blk;
+
+		NVMEV_ASSERT(blk->ipc >= 0 && blk->ipc < max_pgs);
+		blk->ipc++;
+		if (blk->vpc > 0) {
+			blk->vpc--;
+		} else {
+			NVMEV_ERROR("blk->vpc already 0 before decrement, blk=%d\n", ppa->g.blk);
+			/* Don't return here, continue with line management updates */
+		}
+	}
 }
 
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -3059,6 +3106,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	uint32_t nr_parts = ns->nr_parts;
 
 	struct ppa prev_ppa;
+	uint64_t prev_lpn = INVALID_LPN;
 	struct nand_cmd srd = {
 		.type = USER_IO,
 		.cmd = NAND_READ,
@@ -3090,6 +3138,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
 		xfer_size = 0;
 		prev_ppa = get_maptbl_ent(conv_ftl, start_lpn / nr_parts);
+		prev_lpn = start_lpn / nr_parts;
 		has_avg = calc_global_avg_reads(conv_ftl, &avg_reads);
 		ht = &conv_ftl->heat_track;
 
@@ -3111,9 +3160,9 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			/* 更新热数据跟踪信息 */
 			update_heat_info(conv_ftl, local_lpn, true);
 
-			if (!is_slc_block(conv_ftl, cur_ppa.g.blk) && has_avg &&
-			    ht && ht->access_count) {
-				uint64_t access_cnt = ht->access_count[local_lpn];
+				if (!is_slc_block(conv_ftl, cur_ppa.g.blk) && has_avg &&
+				    ht && ht->access_count) {
+					uint64_t access_cnt = ht->access_count[local_lpn];
 
 				if (access_cnt > avg_reads) {
 					uint64_t migration_done = 0;
@@ -3131,30 +3180,112 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 					conv_ftl->migration_read_path_count++;
 					if (migration_done)
 						nsecs_latest = max(nsecs_latest, migration_done);
+					}
 				}
-			}
 
-			// aggregate read io in same flash page
-			if (mapped_ppa(&prev_ppa) &&
-			    is_same_flash_page(conv_ftl, cur_ppa, prev_ppa)) {
+				{
+					struct nand_page *pg_chk;
+
+					/* [CRITICAL FIX] 防止 GC 在我们读之前的瞬间释放了该页 */
+					if (mapped_ppa(&cur_ppa)) {
+						pg_chk = get_pg(conv_ftl->ssd, &cur_ppa);
+						if (!pg_chk || pg_chk->status == PG_FREE ||
+						    pg_chk->status == PG_INVALID) {
+							NVMEV_WARN("Race detected! LPN %llu PPA ch%d-blk%d was freed by GC while reading. Retrying.\n",
+								   local_lpn, cur_ppa.g.ch, cur_ppa.g.blk);
+							cur_ppa.ppa = UNMAPPED_PPA;
+							prev_ppa.ppa = UNMAPPED_PPA;
+							prev_lpn = INVALID_LPN;
+							continue;
+						}
+					}
+				}
+
+				// aggregate read io in same flash page
+				if (mapped_ppa(&prev_ppa) &&
+				    is_same_flash_page(conv_ftl, cur_ppa, prev_ppa)) {
 				xfer_size += spp->pgsz;
 				continue;
 			}
 
 			if (xfer_size > 0) {
+				bool issue_prev = true;
+				struct ppa refreshed;
+
+				if (prev_lpn == INVALID_LPN) {
+					issue_prev = false;
+				} else {
+					refreshed = get_maptbl_ent(conv_ftl, prev_lpn);
+					if (!mapped_ppa(&refreshed) || !valid_ppa(conv_ftl, &refreshed)) {
+						issue_prev = false;
+					} else {
+						prev_ppa = refreshed;
+					}
+				}
+
 				/* 根据页面位置调整读延迟 */
 				uint64_t original_stime = srd.stime;
 				
-				/* 检查页面是否在 SLC 或 QLC 中 */
+				if (issue_prev) {
+					/* 检查页面是否在 SLC 或 QLC 中 */
+					if (is_slc_block(conv_ftl, prev_ppa.g.blk)) {
+						/* SLC 读延迟 - 使用原有的延迟参数 */
+						if (xfer_size == 4096) {
+							srd.stime += spp->pg_4kb_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
+						} else {
+							srd.stime += spp->pg_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
+						}
+					} else {
+						/* QLC 读延迟 - 使用动态区域 */
+						uint8_t zone = get_qlc_zone_for_read(conv_ftl, &prev_ppa);
+						if (xfer_size == 4096) {
+							srd.stime += spp->qlc_pg_4kb_rd_lat[zone];
+						} else {
+							srd.stime += spp->qlc_pg_rd_lat[zone];
+						}
+					}
+					
+					srd.xfer_size = xfer_size;
+					srd.ppa = &prev_ppa;
+					nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
+					nsecs_latest = max(nsecs_completed, nsecs_latest);
+				}
+				
+				srd.stime = original_stime;  /* 恢复原始时间 */
+			}
+
+			xfer_size = spp->pgsz;
+			prev_ppa = cur_ppa;
+			prev_lpn = local_lpn;
+		}
+
+		// issue remaining io
+		if (xfer_size > 0) {
+			bool issue_prev = true;
+			struct ppa refreshed;
+
+			if (prev_lpn == INVALID_LPN) {
+				issue_prev = false;
+			} else {
+				refreshed = get_maptbl_ent(conv_ftl, prev_lpn);
+				if (!mapped_ppa(&refreshed) || !valid_ppa(conv_ftl, &refreshed)) {
+					issue_prev = false;
+				} else {
+					prev_ppa = refreshed;
+				}
+			}
+
+			/* 根据页面位置调整读延迟 */
+			if (issue_prev) {
 				if (is_slc_block(conv_ftl, prev_ppa.g.blk)) {
-					/* SLC 读延迟 - 使用原有的延迟参数 */
+					/* SLC 读延迟 */
 					if (xfer_size == 4096) {
 						srd.stime += spp->pg_4kb_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
 					} else {
 						srd.stime += spp->pg_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
 					}
 				} else {
-					/* QLC 读延迟 - 使用动态区域 */
+					/* QLC 读延迟 */
 					uint8_t zone = get_qlc_zone_for_read(conv_ftl, &prev_ppa);
 					if (xfer_size == 4096) {
 						srd.stime += spp->qlc_pg_4kb_rd_lat[zone];
@@ -3167,38 +3298,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 				srd.ppa = &prev_ppa;
 				nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
 				nsecs_latest = max(nsecs_completed, nsecs_latest);
-				
-				srd.stime = original_stime;  /* 恢复原始时间 */
 			}
-
-			xfer_size = spp->pgsz;
-			prev_ppa = cur_ppa;
-		}
-
-		// issue remaining io
-		if (xfer_size > 0) {
-			/* 根据页面位置调整读延迟 */
-			if (is_slc_block(conv_ftl, prev_ppa.g.blk)) {
-				/* SLC 读延迟 */
-				if (xfer_size == 4096) {
-					srd.stime += spp->pg_4kb_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-				} else {
-					srd.stime += spp->pg_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-				}
-			} else {
-				/* QLC 读延迟 */
-				uint8_t zone = get_qlc_zone_for_read(conv_ftl, &prev_ppa);
-				if (xfer_size == 4096) {
-					srd.stime += spp->qlc_pg_4kb_rd_lat[zone];
-				} else {
-					srd.stime += spp->qlc_pg_rd_lat[zone];
-				}
-			}
-			
-			srd.xfer_size = xfer_size;
-			srd.ppa = &prev_ppa;
-			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
-			nsecs_latest = max(nsecs_completed, nsecs_latest);
 		}
 	}
 
@@ -3378,10 +3478,12 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint64_t end_lpn = (lba + nr_lba - 1) / spp->secs_per_pg;
 
 	uint64_t lpn;
+	uint64_t local_lpn;
 	uint32_t nr_parts = ns->nr_parts;
 
 	uint64_t nsecs_latest;
 	uint64_t nsecs_xfer_completed;
+	uint64_t nsecs_completed = 0;
 	uint32_t allocated_buf_size;
 	uint32_t xfer_size = 0;  /* 声明缺失的变量 */
 //66f1
@@ -3392,7 +3494,14 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint64_t plpn = 0;
 	uint64_t stripe_bytes = 0;
 	uint64_t wbuf_needed = 0;
+	uint64_t prev_link_lpn = INVALID_LPN;
 //66f1
+
+	struct ppa ppa;
+	struct line_pool_stats slc_stats;
+	struct line_pool_stats slc_stats_tail;
+	uint32_t slc_free_lines;
+	uint32_t slc_used_lines;
 
 	struct nand_cmd swr = {
 		.type = USER_IO,
@@ -3437,7 +3546,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         uint64_t needed = LBA_TO_BYTE(nr_lba);
         int wb_retry = 0;
         const int WB_MAX_RETRIES = 100;    /* 最多重试 100 次 */
-        const int WB_RETRY_US = 1000;      /* 每次等待 1ms */
+        const int WB_RETRY_US = 1000000;      /* 每次等待 1ms */
 
 	if (spp->pgsz) {
 		uint64_t remainder = needed % spp->pgsz;
@@ -3476,13 +3585,6 @@ retry_wb_alloc:
 	nsecs_xfer_completed = nsecs_latest;
 
 	swr.stime = nsecs_latest;
-
-	/* 移动所有变量声明到循环开头，符合 C90 标准 */
-	uint64_t local_lpn;
-	uint64_t nsecs_completed = 0;
-    struct ppa ppa;
-	uint64_t prev_link_lpn = INVALID_LPN;
-    //struct ppa old_ppa = { .ppa = UNMAPPED_PPA };  /* 用于迁移检查 */
     
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
 		        /* 调试：检查是否进入了写入循环 */
@@ -3543,12 +3645,11 @@ retry_wb_alloc:
 
         /* 修改：所有新写入都先写到 SLC（不直接写 QLC） */
         /* 每次写入都检查SLC状态并触发迁移 */
-        struct line_pool_stats slc_stats;
         collect_slc_stats(conv_ftl, &slc_stats);
-        uint32_t slc_free_lines = slc_stats.free;
+        slc_free_lines = slc_stats.free;
         
         /* 检查SLC使用率是否超过高水位线，触发后台迁移 */
-        uint32_t slc_used_lines = slc_stats.total - slc_free_lines;
+        slc_used_lines = slc_stats.total - slc_free_lines;
         NVMEV_DEBUG("[DEBUG] SLC status: free_lines=%u, used_lines=%u, high_watermark=%u, total=%u\n", 
                    slc_free_lines, slc_used_lines, conv_ftl->slc_high_watermark, slc_stats.total);
         if (slc_used_lines >= conv_ftl->slc_high_watermark) {
@@ -3646,12 +3747,11 @@ retry_wb_alloc:
 		update_heat_info(conv_ftl, local_lpn, false);
 		conv_ftl->heat_track.last_access_time[local_lpn] = __get_ioclock(conv_ftl->ssd);
 		
-		
-		/* 检查是否需要触发后台迁移 */
-		struct line_pool_stats slc_stats_tail;
-		collect_slc_stats(conv_ftl, &slc_stats_tail);
-		if (slc_stats_tail.free < 2) {
-			/* SLC 空间不足，需要迁移一些冷数据到 QLC */
+
+			/* 检查是否需要触发后台迁移 */
+			collect_slc_stats(conv_ftl, &slc_stats_tail);
+			if (slc_stats_tail.free < 2) {
+				/* SLC 空间不足，需要迁移一些冷数据到 QLC */
 			NVMEV_DEBUG("SLC space low, triggering migration\n");
 			/* 这里可以实现更复杂的后台迁移策略 */
 		}
