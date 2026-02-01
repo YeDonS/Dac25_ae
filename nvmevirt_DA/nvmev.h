@@ -5,6 +5,9 @@
 
 #include <linux/pci.h>
 #include <linux/msi.h>
+#include <linux/atomic.h>
+#include <linux/compiler.h>
+#include <linux/wait.h>
 #include <asm/apic.h>
 
 #include "nvme.h"
@@ -74,6 +77,9 @@ struct nvmev_submission_queue {
 	struct nvmev_sq_stat stat;
 
 	struct nvme_command __iomem **sq;
+	atomic_t refcnt;
+	wait_queue_head_t ref_wait;
+	bool deleting;
 };
 
 struct nvmev_completion_queue {
@@ -145,6 +151,7 @@ struct nvmev_proc_table {
 
 	int sq_entry;
 	unsigned int command_id;
+	struct nvmev_submission_queue *sq_ptr;
 
 	unsigned long long nsecs_start;
 	unsigned long long nsecs_target;
@@ -167,6 +174,27 @@ struct nvmev_proc_table {
 
 	unsigned int next, prev;
 };
+
+static inline bool nvmev_sq_try_get(struct nvmev_submission_queue *sq)
+{
+	if (unlikely(!sq))
+		return false;
+	if (unlikely(READ_ONCE(sq->deleting)))
+		return false;
+	atomic_inc(&sq->refcnt);
+	if (unlikely(READ_ONCE(sq->deleting))) {
+		if (atomic_dec_and_test(&sq->refcnt))
+			wake_up_all(&sq->ref_wait);
+		return false;
+	}
+	return true;
+}
+
+static inline void nvmev_sq_put(struct nvmev_submission_queue *sq)
+{
+	if (atomic_dec_and_test(&sq->refcnt))
+		wake_up_all(&sq->ref_wait);
+}
 
 struct nvmev_proc_info {
 	struct nvmev_proc_table *proc_table;

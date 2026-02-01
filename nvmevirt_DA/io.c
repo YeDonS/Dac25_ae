@@ -37,9 +37,8 @@ static inline unsigned long long __get_wallclock(void)
 	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
 }
 
-static unsigned int __do_perform_io(int sqid, int sq_entry)
+static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid, int sq_entry)
 {
-	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	if (unlikely(!sq || !sq->sq)) {
 		NVMEV_ERROR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
 		return 0;
@@ -107,9 +106,8 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 static u64 paddr_list[513] = {
 	0,
 }; // Not using index 0 to make max index == num_prp
-static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
+static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq, int sqid, int sq_entry)
 {
-	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	if (unlikely(!sq || !sq->sq)) {
 		NVMEV_ERROR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
 		return 0;
@@ -206,11 +204,9 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 	return length;
 }
 
-static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long long nsecs_start,
-			     struct nvmev_result *ret)
+static bool __enqueue_io_req(struct nvmev_submission_queue *sq, int sqid, int cqid, int sq_entry,
+			     unsigned long long nsecs_start, struct nvmev_result *ret)
 {
-	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
-
 	unsigned int proc_turn = __get_io_worker(sqid);
 	struct nvmev_proc_info *pi = &nvmev_vdev->proc_info[proc_turn];
 	unsigned int entry = pi->free_seq;
@@ -218,7 +214,7 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 	if (pi->proc_table[entry].next >= NR_MAX_PARALLEL_IO) {
 		WARN_ON_ONCE("IO queue is almost full");
 		pi->free_seq = entry;
-		return;
+		return false;
 	}
 
 	if (++proc_turn == nvmev_vdev->config.nr_io_cpu)
@@ -232,10 +228,12 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 		    ret->nsecs_target - nsecs_start);
 
 	/////////////////////////////////
+	atomic_inc(&sq->refcnt);
 	pi->proc_table[entry].sqid = sqid;
 	pi->proc_table[entry].cqid = cqid;
 	pi->proc_table[entry].sq_entry = sq_entry;
 	pi->proc_table[entry].command_id = sq_entry(sq_entry).common.command_id;
+	pi->proc_table[entry].sq_ptr = sq;
 	pi->proc_table[entry].nsecs_start = nsecs_start;
 	pi->proc_table[entry].nsecs_enqueue = local_clock();
 	pi->proc_table[entry].nsecs_target = ret->nsecs_target;
@@ -281,6 +279,7 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 			pi->proc_table[curr].next = entry;
 		}
 	}
+	return true;
 }
 
 void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
@@ -316,6 +315,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 	pi->proc_table[entry].next = -1;
 
 	pi->proc_table[entry].writeback_cmd = true;
+	pi->proc_table[entry].sq_ptr = NULL;
 	pi->proc_table[entry].buffs_to_release = buffs_to_release;
 	pi->proc_table[entry].write_buffer = (void *)write_buffer;
 	mb(); /* IO worker shall see the updated pi at once */
@@ -409,8 +409,13 @@ static void __reclaim_completed_reqs(void)
 static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
-	if (unlikely(!sq || !sq->sq)) {
+	if (unlikely(!sq || !nvmev_sq_try_get(sq))) {
 		NVMEV_ERROR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
+		return false;
+	}
+	if (unlikely(!sq->sq)) {
+		NVMEV_ERROR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
+		nvmev_sq_put(sq);
 		return false;
 	}
 	unsigned long long nsecs_start = __get_wallclock();
@@ -451,7 +456,11 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	prev_clock2 = local_clock();
 #endif
 
-	__enqueue_io_req(sqid, sq->cqid, sq_entry, nsecs_start, &ret);
+	if (!__enqueue_io_req(sq, sqid, sq->cqid, sq_entry, nsecs_start, &ret)) {
+		nvmev_sq_put(sq);
+		return false;
+	}
+	nvmev_sq_put(sq);
 
 #ifdef PERF_DEBUG
 	prev_clock3 = local_clock();
@@ -487,13 +496,15 @@ int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 	int sq_entry = old_db;
 	int latest_db;
 
-	if (unlikely(!sq))
+	if (unlikely(!sq || !nvmev_sq_try_get(sq)))
 		return old_db;
 	if (unlikely(num_proc < 0))
 		num_proc += sq->queue_size;
 
 	for (seq = 0; seq < num_proc; seq++) {
 		size_t io_size;
+		if (unlikely(READ_ONCE(sq->deleting)))
+			break;
 		if (!__nvmev_proc_io(sqid, sq_entry, &io_size))
 			break;
 
@@ -509,6 +520,7 @@ int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 	sq->stat.max_nr_in_flight = max_t(int, sq->stat.max_nr_in_flight, sq->stat.nr_in_flight);
 
 	latest_db = (old_db + seq) % sq->queue_size;
+	nvmev_sq_put(sq);
 	return latest_db;
 }
 
@@ -536,8 +548,9 @@ void nvmev_proc_io_cq(int cqid, int new_db, int old_db)
 		uint16_t sqid = cq_entry(i).sq_id;
 		if (sqid <= NR_MAX_IO_QUEUE) {
 			struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
-			if (likely(sq)) {
+			if (likely(sq && nvmev_sq_try_get(sq))) {
 				sq->stat.nr_in_flight--;
+				nvmev_sq_put(sq);
 			} else {
 				NVMEV_ERROR("[%s] sq null (cqid=%d idx=%d sqid=%u)\n",
 					     __FUNCTION__, cqid, i, sqid);
@@ -632,21 +645,20 @@ static int nvmev_kthread_io(void *data)
 				if (pe->writeback_cmd) {
 					;
 				} else if (io_using_dma) {
-					__do_perform_io_using_dma(pe->sqid, pe->sq_entry);
+					__do_perform_io_using_dma(pe->sq_ptr, pe->sqid, pe->sq_entry);
 				} else {
 #if (BASE_SSD == KV_PROTOTYPE)
-						struct nvmev_submission_queue *sq =
-							nvmev_vdev->sqes[pe->sqid];
+						struct nvmev_submission_queue *sq = pe->sq_ptr;
 						ns = &nvmev_vdev->ns[0];
 						if (sq && sq->sq &&
 						    ns->identify_io_cmd(ns, sq_entry(pe->sq_entry))) {
 							pe->result0 = ns->perform_io_cmd(
 								ns, &sq_entry(pe->sq_entry), &(pe->status));
 						} else {
-						__do_perform_io(pe->sqid, pe->sq_entry);
+						__do_perform_io(pe->sq_ptr, pe->sqid, pe->sq_entry);
 					}
 #endif
-					__do_perform_io(pe->sqid, pe->sq_entry);
+					__do_perform_io(pe->sq_ptr, pe->sqid, pe->sq_entry);
 				}
 
 #ifdef PERF_DEBUG
@@ -667,6 +679,10 @@ static int nvmev_kthread_io(void *data)
 #endif
 				} else {
 					__fill_cq_result(pe);
+					if (pe->sq_ptr) {
+						nvmev_sq_put(pe->sq_ptr);
+						pe->sq_ptr = NULL;
+					}
 				}
 
 				NVMEV_DEBUG("%s: completed %u, %d %d %d\n", pi->thread_name, curr,

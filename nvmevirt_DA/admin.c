@@ -103,6 +103,9 @@ static void __nvmev_admin_create_sq(int eid, int cq_head)
 
 	sq->sq_priority = cmd->sq_flags & 0xFFFE;
 	sq->queue_size = cmd->qsize + 1;
+	atomic_set(&sq->refcnt, 1);
+	init_waitqueue_head(&sq->ref_wait);
+	sq->deleting = false;
 
 	/* TODO Physically non-contiguous prp list */
 	sq->phys_contig = (cmd->sq_flags & NVME_QUEUE_PHYS_CONTIG) ? true : false;
@@ -139,9 +142,15 @@ static void __nvmev_admin_delete_sq(int eid, int cq_head)
 	qid = sq_entry(eid).delete_queue.qid;
 
 	sq = nvmev_vdev->sqes[qid];
+	if (sq) {
+		WRITE_ONCE(sq->deleting, true);
+		smp_mb();
+	}
 	nvmev_vdev->sqes[qid] = NULL;
 
 	if (sq) {
+		nvmev_sq_put(sq);
+		wait_event(sq->ref_wait, atomic_read(&sq->refcnt) == 0);
 		kfree(sq->sq);
 		kfree(sq);
 	}
