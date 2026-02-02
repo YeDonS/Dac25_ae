@@ -23,6 +23,9 @@ struct buffer;
 
 extern bool io_using_dma;
 
+#define NVMEV_IO_LOG(string, args...) NVMEV_INFO("io: " string, ##args)
+#define NVMEV_IO_ERR(string, args...) NVMEV_ERROR("io: " string, ##args)
+
 static inline unsigned int __get_io_worker(int sqid)
 {
 #ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
@@ -40,7 +43,7 @@ static inline unsigned long long __get_wallclock(void)
 static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid, int sq_entry)
 {
 	if (unlikely(!sq || !sq->sq)) {
-		NVMEV_ERROR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
+		NVMEV_IO_ERR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
 		return 0;
 	}
 	size_t offset;
@@ -50,6 +53,13 @@ static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid,
 	u64 paddr;
 	u64 *paddr_list = NULL;
 	size_t nsid = sq_entry(sq_entry).rw.nsid - 1; // 0-based
+
+	NVMEV_IO_LOG("perform_io: sqid=%d sq_entry=%d opcode=0x%x nsid=%zu slba=%llu len=%u prp1=0x%llx prp2=0x%llx\n",
+		     sqid, sq_entry, sq_entry(sq_entry).rw.opcode, nsid,
+		     (unsigned long long)sq_entry(sq_entry).rw.slba,
+		     sq_entry(sq_entry).rw.length + 1,
+		     (unsigned long long)sq_entry(sq_entry).rw.prp1,
+		     (unsigned long long)sq_entry(sq_entry).rw.prp2);
 
 	offset = sq_entry(sq_entry).rw.slba << 9;
 	length = (sq_entry(sq_entry).rw.length + 1) << 9;
@@ -109,7 +119,7 @@ static u64 paddr_list[513] = {
 static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq, int sqid, int sq_entry)
 {
 	if (unlikely(!sq || !sq->sq)) {
-		NVMEV_ERROR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
+		NVMEV_IO_ERR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
 		return 0;
 	}
 	size_t offset;
@@ -121,6 +131,13 @@ static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq,
 	u64 *tmp_paddr_list = NULL;
 	size_t io_size;
 	size_t mem_offs = 0;
+
+	NVMEV_IO_LOG("perform_io_dma: sqid=%d sq_entry=%d opcode=0x%x slba=%llu len=%u prp1=0x%llx prp2=0x%llx\n",
+		     sqid, sq_entry, sq_entry(sq_entry).rw.opcode,
+		     (unsigned long long)sq_entry(sq_entry).rw.slba,
+		     sq_entry(sq_entry).rw.length + 1,
+		     (unsigned long long)sq_entry(sq_entry).rw.prp1,
+		     (unsigned long long)sq_entry(sq_entry).rw.prp2);
 
 	offset = sq_entry(sq_entry).rw.slba << 9;
 	length = (sq_entry(sq_entry).rw.length + 1) << 9;
@@ -214,6 +231,8 @@ static bool __enqueue_io_req(struct nvmev_submission_queue *sq, int sqid, int cq
 	if (pi->proc_table[entry].next >= NR_MAX_PARALLEL_IO) {
 		WARN_ON_ONCE("IO queue is almost full");
 		pi->free_seq = entry;
+		NVMEV_IO_ERR("enqueue: queue full sqid=%d cqid=%d entry=%u\n",
+			     sqid, cqid, entry);
 		return false;
 	}
 
@@ -223,9 +242,10 @@ static bool __enqueue_io_req(struct nvmev_submission_queue *sq, int sqid, int cq
 	pi->free_seq = pi->proc_table[entry].next;
 	BUG_ON(pi->free_seq >= NR_MAX_PARALLEL_IO);
 
-	NVMEV_DEBUG("%s/%u[%d], sq %d cq %d, entry %d %llu + %llu\n", pi->thread_name, entry,
-		    sq_entry(sq_entry).rw.opcode, sqid, cqid, sq_entry, nsecs_start,
-		    ret->nsecs_target - nsecs_start);
+	NVMEV_IO_LOG("enqueue: worker=%s entry=%u opcode=0x%x sqid=%d cqid=%d sq_entry=%d cid=%u nsecs_start=%llu target_delta=%llu status=0x%x\n",
+		     pi->thread_name, entry, sq_entry(sq_entry).rw.opcode, sqid, cqid, sq_entry,
+		     sq_entry(sq_entry).common.command_id,
+		     nsecs_start, ret->nsecs_target - nsecs_start, ret->status);
 
 	/////////////////////////////////
 	atomic_inc(&sq->refcnt);
@@ -410,11 +430,11 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	if (unlikely(!sq || !nvmev_sq_try_get(sq))) {
-		NVMEV_ERROR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
+		NVMEV_IO_ERR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
 		return false;
 	}
 	if (unlikely(!sq->sq)) {
-		NVMEV_ERROR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
+		NVMEV_IO_ERR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
 		nvmev_sq_put(sq);
 		return false;
 	}
@@ -437,6 +457,12 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 		.status = NVME_SC_SUCCESS,
 	};
 
+	NVMEV_IO_LOG("io req: sqid=%d cqid=%d sq_entry=%d opcode=0x%x cid=%u nsid=%u slba=%llu len=%u prp1=0x%llx prp2=0x%llx\n",
+		     sqid, sq->cqid, sq_entry, cmd->common.opcode,
+		     cmd->common.command_id, cmd->common.nsid,
+		     (unsigned long long)cmd->rw.slba, cmd->rw.length + 1,
+		     (unsigned long long)cmd->rw.prp1, (unsigned long long)cmd->rw.prp2);
+
 #ifdef PERF_DEBUG
 	unsigned long long prev_clock = local_clock();
 	unsigned long long prev_clock2 = 0;
@@ -452,11 +478,17 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 		return false;
 	*io_size = (sq_entry(sq_entry).rw.length + 1) << 9;
 
+	NVMEV_IO_LOG("io proc done: sqid=%d sq_entry=%d cid=%u status=0x%x nsecs_target=%llu io_size=%zu\n",
+		     sqid, sq_entry, cmd->common.command_id, ret.status,
+		     ret.nsecs_target, *io_size);
+
 #ifdef PERF_DEBUG
 	prev_clock2 = local_clock();
 #endif
 
 	if (!__enqueue_io_req(sq, sqid, sq->cqid, sq_entry, nsecs_start, &ret)) {
+		NVMEV_IO_ERR("enqueue failed: sqid=%d sq_entry=%d cid=%u\n",
+			     sqid, sq_entry, cmd->common.command_id);
 		nvmev_sq_put(sq);
 		return false;
 	}
@@ -501,10 +533,16 @@ int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 	if (unlikely(num_proc < 0))
 		num_proc += sq->queue_size;
 
+	NVMEV_IO_LOG("io sq: sqid=%d old_db=%d new_db=%d num_proc=%d qsize=%d\n",
+		     sqid, old_db, new_db, num_proc, sq->queue_size);
+
 	for (seq = 0; seq < num_proc; seq++) {
 		size_t io_size;
-		if (unlikely(READ_ONCE(sq->deleting)))
+		if (unlikely(READ_ONCE(sq->deleting))) {
+			NVMEV_IO_ERR("io sq: sqid=%d deleting set, stop at sq_entry=%d\n",
+				     sqid, sq_entry);
 			break;
+		}
 		if (!__nvmev_proc_io(sqid, sq_entry, &io_size))
 			break;
 
@@ -543,9 +581,16 @@ void nvmev_proc_io_cq(int cqid, int new_db, int old_db)
 	if (unlikely(new_db < 0 || new_db >= cq->queue_size))
 		new_db = old_db;
 
+	NVMEV_IO_LOG("io cq: cqid=%d old_db=%d new_db=%d qsize=%d cq_tail=%d\n",
+		     cqid, old_db, new_db, cq->queue_size, cq->cq_tail);
+
 	i = old_db;
 	while (i != new_db) {
 		uint16_t sqid = cq_entry(i).sq_id;
+		NVMEV_IO_LOG("io cq reap: cqid=%d idx=%d sqid=%u cid=%u status=0x%x\n",
+			     cqid, i, sqid,
+			     cq_entry(i).command_id,
+			     cq_entry(i).status >> 1);
 		if (sqid <= NR_MAX_IO_QUEUE) {
 			struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 			if (likely(sq && nvmev_sq_try_get(sq))) {
@@ -581,10 +626,13 @@ static void __fill_cq_result(struct nvmev_proc_table *proc_entry)
 	int cq_head;
 
 	if (unlikely(!cq)) {
-		NVMEV_ERROR("%s: cq[%d] is NULL (queue deleted?)\n", __func__, cqid);
+		NVMEV_IO_ERR("%s: cq[%d] is NULL (queue deleted?)\n", __func__, cqid);
 		return;
 	}
 	cq_head = cq->cq_head;
+
+	NVMEV_IO_LOG("fill cqe: cqid=%d cq_head=%d phase=%d sqid=%d sq_entry=%d cid=%u status=0x%x result0=0x%x result1=0x%x\n",
+		     cqid, cq_head, cq->phase, sqid, sq_entry, command_id, status, result0, result1);
 
 	spin_lock(&cq->entry_lock);
 	cq_entry(cq_head).command_id = command_id;
@@ -667,8 +715,9 @@ static int nvmev_kthread_io(void *data)
 #endif
 				pe->is_copied = true;
 
-				NVMEV_DEBUG("%s: copied %u, %d %d %d\n", pi->thread_name, curr,
-					    pe->sqid, pe->cqid, pe->sq_entry);
+				NVMEV_IO_LOG("io copied: worker=%s entry=%u sqid=%d cqid=%d sq_entry=%d cid=%u\n",
+					     pi->thread_name, curr, pe->sqid, pe->cqid,
+					     pe->sq_entry, pe->command_id);
 			}
 
 			if (pe->nsecs_target <= curr_nsecs) {
@@ -685,8 +734,9 @@ static int nvmev_kthread_io(void *data)
 					}
 				}
 
-				NVMEV_DEBUG("%s: completed %u, %d %d %d\n", pi->thread_name, curr,
-					    pe->sqid, pe->cqid, pe->sq_entry);
+				NVMEV_IO_LOG("io completed: worker=%s entry=%u sqid=%d cqid=%d sq_entry=%d cid=%u status=0x%x\n",
+					     pi->thread_name, curr, pe->sqid, pe->cqid,
+					     pe->sq_entry, pe->command_id, pe->status);
 
 #ifdef PERF_DEBUG
 				pe->nsecs_cq_filled = local_clock() + delta;
@@ -720,6 +770,8 @@ static int nvmev_kthread_io(void *data)
 					prev_clock = local_clock();
 #endif
 					cq->interrupt_ready = false;
+					NVMEV_IO_LOG("irq: cqid=%d vector=%d cq_head=%d phase=%d\n",
+						     qidx, cq->irq_vector, cq->cq_head, cq->phase);
 					nvmev_signal_irq(cq->irq_vector);
 
 #ifdef PERF_DEBUG
