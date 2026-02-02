@@ -20,25 +20,31 @@
  * - Guards overflow on addr+len
  * - Returns NULL on any check failure so callers can bail early
  */
-static inline phys_addr_t nvmev_dma_to_phys(dma_addr_t dma)
+static inline bool nvmev_dma_to_phys(dma_addr_t dma, phys_addr_t *phys_out)
 {
 #ifdef CONFIG_IOMMU_API
 	struct iommu_domain *domain;
 
 	if (nvmev_vdev && nvmev_vdev->pdev) {
 		domain = iommu_get_domain_for_dev(&nvmev_vdev->pdev->dev);
-		if (domain)
-			return iommu_iova_to_phys(domain, dma);
+		if (domain) {
+			phys_addr_t phys = iommu_iova_to_phys(domain, dma);
+			if (!phys && dma)
+				return false;
+			*phys_out = phys;
+			return true;
+		}
 	}
 #endif
-	return (phys_addr_t)dma;
+	*phys_out = (phys_addr_t)dma;
+	return true;
 }
 
 static inline void *nvmev_prp_address_offset(u64 prp, unsigned int page_off, size_t len)
 {
 	dma_addr_t dma, dma_end;
 	phys_addr_t phys;
-	u64 phys_end, mem_start, mem_end;
+	u64 phys_end;
 	struct page *page;
 	void *kaddr;
 
@@ -52,17 +58,11 @@ static inline void *nvmev_prp_address_offset(u64 prp, unsigned int page_off, siz
 	if (len == 0 || dma_end < dma)
 		return NULL;
 
-	phys = nvmev_dma_to_phys(dma);
+	if (!nvmev_dma_to_phys(dma, &phys))
+		return NULL;
 	phys_end = phys + len - 1;
 	if (phys_end < phys)
 		return NULL;
-
-	if (nvmev_vdev->config.memmap_size) {
-		mem_start = nvmev_vdev->config.memmap_start;
-		mem_end = mem_start + nvmev_vdev->config.memmap_size - 1;
-		if (phys < mem_start || phys_end > mem_end)
-			return NULL;
-	}
 
 	if (!pfn_valid(phys >> PAGE_SHIFT))
 		return NULL;
