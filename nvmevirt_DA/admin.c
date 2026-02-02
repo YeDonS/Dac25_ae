@@ -13,16 +13,32 @@
 
 #include <linux/mm.h> /* for pfn_valid, page_address */
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 
 /* Safe PRP translation:
  * - Translates DMA addr -> phys (IOMMU aware)
  * - Guards overflow on addr+len
  * - Returns NULL on any check failure so callers can bail early
  */
+static inline phys_addr_t nvmev_dma_to_phys(dma_addr_t dma)
+{
+#ifdef CONFIG_IOMMU_API
+	struct iommu_domain *domain;
+
+	if (nvmev_vdev && nvmev_vdev->pdev) {
+		domain = iommu_get_domain_for_dev(&nvmev_vdev->pdev->dev);
+		if (domain)
+			return iommu_iova_to_phys(domain, dma);
+	}
+#endif
+	return (phys_addr_t)dma;
+}
+
 static inline void *nvmev_prp_address_offset(u64 prp, unsigned int page_off, size_t len)
 {
 	dma_addr_t dma, dma_end;
 	phys_addr_t phys;
+	u64 phys_end, mem_start, mem_end;
 	struct page *page;
 	void *kaddr;
 
@@ -36,7 +52,17 @@ static inline void *nvmev_prp_address_offset(u64 prp, unsigned int page_off, siz
 	if (len == 0 || dma_end < dma)
 		return NULL;
 
-	phys = dma_to_phys(&nvmev_vdev->pdev->dev, dma);
+	phys = nvmev_dma_to_phys(dma);
+	phys_end = phys + len - 1;
+	if (phys_end < phys)
+		return NULL;
+
+	if (nvmev_vdev->config.memmap_size) {
+		mem_start = nvmev_vdev->config.memmap_start;
+		mem_end = mem_start + nvmev_vdev->config.memmap_size - 1;
+		if (phys < mem_start || phys_end > mem_end)
+			return NULL;
+	}
 
 	if (!pfn_valid(phys >> PAGE_SHIFT))
 		return NULL;
