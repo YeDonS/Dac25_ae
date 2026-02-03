@@ -340,6 +340,7 @@ static inline uint32_t pick_locked_qlc_page_type(struct conv_ftl *conv_ftl, bool
 /* 前向声明以避免隐式声明错误 */
 static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn);
 static inline bool mapped_ppa(struct ppa *ppa);
+static inline bool valid_ppa(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *slc_ppa);
 static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *qlc_ppa,
@@ -1003,12 +1004,14 @@ static bool pop_victim_from_pool(struct conv_ftl *conv_ftl, struct victim_candid
 		struct line_mgmt *array = conv_ftl->slc_lunlm;
 		spinlock_t *lock = &conv_ftl->slc_lock;
 		uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+		uint32_t die;
+		struct line_mgmt *lm;
 
 		if (!array || die_count == 0)
 			return false;
 
-		uint32_t die = cand->die % die_count;
-		struct line_mgmt *lm = &array[die];
+		die = cand->die % die_count;
+		lm = &array[die];
 
 		spin_lock(lock);
 		if (!lm->victim_line_cnt || pqueue_peek(lm->victim_line_pq) != cand->line) {
