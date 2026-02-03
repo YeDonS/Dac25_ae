@@ -6,6 +6,9 @@
 #include <linux/moduleparam.h>
 #include <linux/hashtable.h>
 #include <linux/spinlock.h>
+#include <linux/mm.h>
+#include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <linux/sched/clock.h>
 
 #include "nvmev.h"
@@ -60,6 +63,46 @@ static inline unsigned int __get_io_worker(int sqid)
 static inline unsigned long long __get_wallclock(void)
 {
 	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
+}
+
+static inline bool nvmev_dma_to_phys(dma_addr_t dma, phys_addr_t *phys_out)
+{
+#ifdef CONFIG_IOMMU_API
+	struct iommu_domain *domain;
+
+	if (nvmev_vdev && nvmev_vdev->pdev) {
+		domain = iommu_get_domain_for_dev(&nvmev_vdev->pdev->dev);
+		if (domain) {
+			phys_addr_t phys = iommu_iova_to_phys(domain, dma);
+			if (!phys && dma)
+				return false;
+			*phys_out = phys;
+			return true;
+		}
+	}
+#endif
+	*phys_out = (phys_addr_t)dma;
+	return true;
+}
+
+static inline bool nvmev_dma_to_phys_checked(dma_addr_t dma, phys_addr_t *phys_out)
+{
+	if (!nvmev_dma_to_phys(dma, phys_out))
+		return false;
+	if (!pfn_valid((*phys_out) >> PAGE_SHIFT))
+		return false;
+	return true;
+}
+
+static inline u64 *nvmev_map_prp_list(dma_addr_t dma, void **base_out)
+{
+	phys_addr_t phys;
+
+	if (!nvmev_dma_to_phys_checked(dma, &phys))
+		return NULL;
+
+	*base_out = kmap_atomic(pfn_to_page(phys >> PAGE_SHIFT));
+	return (u64 *)((char *)(*base_out) + (phys & PAGE_OFFSET_MASK));
 }
 
 static void nvmev_prp_mark_pfn(u64 pfn, u16 sqid, u16 cid)
@@ -127,6 +170,8 @@ static void nvmev_prp_track_cmd(struct nvmev_submission_queue *sq, int sqid, int
 	int prp2_offs = 0;
 	u64 paddr;
 	u64 *paddr_list = NULL;
+	void *list_base = NULL;
+	phys_addr_t phys;
 	u16 cid;
 
 	if (!nvmev_prp_track || !sq || !sq->sq)
@@ -149,22 +194,32 @@ static void nvmev_prp_track_cmd(struct nvmev_submission_queue *sq, int sqid, int
 		} else if (prp_offs == 2) {
 			paddr = cmd->rw.prp2;
 			if (remaining > PAGE_SIZE) {
-				paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
-					     (paddr & PAGE_OFFSET_MASK);
+				paddr_list = nvmev_map_prp_list(paddr, &list_base);
+				if (!paddr_list) {
+					NVMEV_IO_ERR("prp list map fail: sqid=%d cid=%u prp2=0x%llx\n",
+						     sqid, cid, (unsigned long long)paddr);
+					break;
+				}
 				paddr = paddr_list[prp2_offs++];
 			}
 		} else {
 			paddr = paddr_list[prp2_offs++];
 		}
 
+		if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
+			NVMEV_IO_ERR("prp map fail: sqid=%d cid=%u prp=0x%llx\n",
+				     sqid, cid, (unsigned long long)paddr);
+			break;
+		}
+
 		if (add)
-			nvmev_prp_mark_pfn(PRP_PFN(paddr), sqid, cid);
+			nvmev_prp_mark_pfn(phys >> PAGE_SHIFT, sqid, cid);
 		else
-			nvmev_prp_unmark_pfn(PRP_PFN(paddr));
+			nvmev_prp_unmark_pfn(phys >> PAGE_SHIFT);
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
-		if (paddr & PAGE_OFFSET_MASK) {
-			mem_offs = paddr & PAGE_OFFSET_MASK;
+		if (phys & PAGE_OFFSET_MASK) {
+			mem_offs = phys & PAGE_OFFSET_MASK;
 			if (io_size + mem_offs > PAGE_SIZE)
 				io_size = PAGE_SIZE - mem_offs;
 		}
@@ -172,8 +227,8 @@ static void nvmev_prp_track_cmd(struct nvmev_submission_queue *sq, int sqid, int
 		remaining -= io_size;
 	}
 
-	if (paddr_list != NULL)
-		kunmap_atomic(paddr_list);
+	if (list_base != NULL)
+		kunmap_atomic(list_base);
 }
 
 static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid, int sq_entry)
@@ -188,6 +243,8 @@ static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid,
 	int prp2_offs = 0;
 	u64 paddr;
 	u64 *paddr_list = NULL;
+	void *list_base = NULL;
+	phys_addr_t phys;
 	size_t nsid = sq_entry(sq_entry).rw.nsid - 1; // 0-based
 
 	NVMEV_IO_LOG("perform_io: sqid=%d sq_entry=%d opcode=0x%x nsid=%zu slba=%llu len=%u prp1=0x%llx prp2=0x%llx\n",
@@ -214,20 +271,29 @@ static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid,
 		} else if (prp_offs == 2) {
 			paddr = sq_entry(sq_entry).rw.prp2;
 			if (remaining > PAGE_SIZE) {
-				paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
-					     (paddr & PAGE_OFFSET_MASK);
+				paddr_list = nvmev_map_prp_list(paddr, &list_base);
+				if (!paddr_list) {
+					NVMEV_IO_ERR("prp list map fail: sqid=%d sq_entry=%d prp2=0x%llx\n",
+						     sqid, sq_entry, (unsigned long long)paddr);
+					break;
+				}
 				paddr = paddr_list[prp2_offs++];
 			}
 		} else {
 			paddr = paddr_list[prp2_offs++];
 		}
 
-		vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
+		if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
+			NVMEV_IO_ERR("prp map fail: sqid=%d sq_entry=%d prp=0x%llx\n",
+				     sqid, sq_entry, (unsigned long long)paddr);
+			break;
+		}
+		vaddr = kmap_atomic(pfn_to_page(phys >> PAGE_SHIFT));
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
 
-		if (paddr & PAGE_OFFSET_MASK) {
-			mem_offs = paddr & PAGE_OFFSET_MASK;
+		if (phys & PAGE_OFFSET_MASK) {
+			mem_offs = phys & PAGE_OFFSET_MASK;
 			if (io_size + mem_offs > PAGE_SIZE)
 				io_size = PAGE_SIZE - mem_offs;
 		}
@@ -245,8 +311,8 @@ static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid,
 		offset += io_size;
 	}
 
-	if (paddr_list != NULL)
-		kunmap_atomic(paddr_list);
+	if (list_base != NULL)
+		kunmap_atomic(list_base);
 
 	return length;
 }
@@ -267,6 +333,8 @@ static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq,
 	int num_prps = 0;
 	u64 paddr;
 	u64 *tmp_paddr_list = NULL;
+	void *list_base = NULL;
+	phys_addr_t phys;
 	size_t io_size;
 	size_t mem_offs = 0;
 
@@ -290,16 +358,38 @@ static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq,
 
 		prp_offs++;
 		if (prp_offs == 1) {
-			paddr_list[prp_offs] = sq_entry(sq_entry).rw.prp1;
-		} else if (prp_offs == 2) {
-			paddr_list[prp_offs] = sq_entry(sq_entry).rw.prp2;
-			if (remaining > PAGE_SIZE) {
-				tmp_paddr_list = kmap_atomic_pfn(PRP_PFN(paddr_list[prp_offs])) +
-						 (paddr_list[prp_offs] & PAGE_OFFSET_MASK);
-				paddr_list[prp_offs] = tmp_paddr_list[prp2_offs++];
+			paddr = sq_entry(sq_entry).rw.prp1;
+			if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
+				NVMEV_IO_ERR("prp map fail: sqid=%d sq_entry=%d prp1=0x%llx\n",
+					     sqid, sq_entry, (unsigned long long)paddr);
+				break;
 			}
+			paddr_list[prp_offs] = phys;
+		} else if (prp_offs == 2) {
+			paddr = sq_entry(sq_entry).rw.prp2;
+			if (remaining > PAGE_SIZE) {
+				tmp_paddr_list = nvmev_map_prp_list(paddr, &list_base);
+				if (!tmp_paddr_list) {
+					NVMEV_IO_ERR("prp list map fail: sqid=%d sq_entry=%d prp2=0x%llx\n",
+						     sqid, sq_entry, (unsigned long long)paddr);
+					break;
+				}
+				paddr = tmp_paddr_list[prp2_offs++];
+			}
+			if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
+				NVMEV_IO_ERR("prp map fail: sqid=%d sq_entry=%d prp2=0x%llx\n",
+					     sqid, sq_entry, (unsigned long long)paddr);
+				break;
+			}
+			paddr_list[prp_offs] = phys;
 		} else {
-			paddr_list[prp_offs] = tmp_paddr_list[prp2_offs++];
+			paddr = tmp_paddr_list[prp2_offs++];
+			if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
+				NVMEV_IO_ERR("prp map fail: sqid=%d sq_entry=%d prp=0x%llx\n",
+					     sqid, sq_entry, (unsigned long long)paddr);
+				break;
+			}
+			paddr_list[prp_offs] = phys;
 		}
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
@@ -314,8 +404,8 @@ static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq,
 	}
 	num_prps = prp_offs;
 
-	if (tmp_paddr_list != NULL)
-		kunmap_atomic(tmp_paddr_list);
+	if (list_base != NULL)
+		kunmap_atomic(list_base);
 
 	remaining = length;
 	prp_offs = 1;
