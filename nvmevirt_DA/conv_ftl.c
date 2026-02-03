@@ -16,6 +16,9 @@
 #include <linux/ctype.h>
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
+#include <linux/hashtable.h>
+#include <linux/spinlock.h>
+#include <linux/moduleparam.h>
 /* kthread/waitqueue no longer needed (threads removed) */
 
 #include "nvmev.h"
@@ -25,6 +28,26 @@
 #ifndef NVMEV_WARN
 #define NVMEV_WARN(fmt, ...) pr_warn("[nvmev] " fmt, ##__VA_ARGS__)
 #endif
+
+#define NVMEV_LPN_HASH_BITS 12
+struct nvmev_lpn_inflight {
+	struct hlist_node hnode;
+	u64 lpn;
+	u32 count;
+	u16 last_cid;
+	u16 last_sqid;
+};
+
+static DEFINE_HASHTABLE(nvmev_lpn_ht, NVMEV_LPN_HASH_BITS);
+static DEFINE_SPINLOCK(nvmev_lpn_lock);
+static bool nvmev_lpn_track = true;
+module_param_named(lpn_track, nvmev_lpn_track, bool, 0644);
+MODULE_PARM_DESC(lpn_track, "Detect concurrent writes to same LPN (default on)");
+
+static unsigned long long nvmev_ftl_slow_ns;
+module_param_named(ftl_slow_ns, nvmev_ftl_slow_ns, ullong, 0644);
+MODULE_PARM_DESC(ftl_slow_ns, "Log FTL command time if above threshold (ns), 0 disables");
+
 void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			      struct buffer *write_buffer, unsigned int buffs_to_release);
 
@@ -39,6 +62,85 @@ struct nvmev_cmd_debug {
 	int sqid;
 	u64 ts;
 };
+
+static void nvmev_lpn_mark(u64 lpn, u16 sqid, u16 cid)
+{
+	struct nvmev_lpn_inflight *entry;
+	unsigned long flags;
+
+	spin_lock_irqsave(&nvmev_lpn_lock, flags);
+	hash_for_each_possible(nvmev_lpn_ht, entry, hnode, lpn) {
+		if (entry->lpn == lpn) {
+			entry->count++;
+			if (printk_ratelimit()) {
+				NVMEV_ERROR("lpn overlap: lpn=%llu prev sqid=%u cid=%u new sqid=%u cid=%u count=%u\n",
+					    lpn, entry->last_sqid, entry->last_cid, sqid, cid,
+					    entry->count);
+			}
+			entry->last_sqid = sqid;
+			entry->last_cid = cid;
+			spin_unlock_irqrestore(&nvmev_lpn_lock, flags);
+			return;
+		}
+	}
+	spin_unlock_irqrestore(&nvmev_lpn_lock, flags);
+
+	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	if (!entry)
+		return;
+	entry->lpn = lpn;
+	entry->count = 1;
+	entry->last_sqid = sqid;
+	entry->last_cid = cid;
+
+	spin_lock_irqsave(&nvmev_lpn_lock, flags);
+	hash_add(nvmev_lpn_ht, &entry->hnode, lpn);
+	spin_unlock_irqrestore(&nvmev_lpn_lock, flags);
+}
+
+static void nvmev_lpn_unmark(u64 lpn)
+{
+	struct nvmev_lpn_inflight *entry;
+	unsigned long flags;
+
+	spin_lock_irqsave(&nvmev_lpn_lock, flags);
+	hash_for_each_possible(nvmev_lpn_ht, entry, hnode, lpn) {
+		if (entry->lpn == lpn) {
+			if (entry->count > 1) {
+				entry->count--;
+				spin_unlock_irqrestore(&nvmev_lpn_lock, flags);
+				return;
+			}
+			hash_del(&entry->hnode);
+			spin_unlock_irqrestore(&nvmev_lpn_lock, flags);
+			kfree(entry);
+			return;
+		}
+	}
+	spin_unlock_irqrestore(&nvmev_lpn_lock, flags);
+}
+
+static void nvmev_lpn_mark_range(u64 start_lpn, u64 end_lpn, u16 sqid, u16 cid)
+{
+	u64 lpn;
+
+	if (!nvmev_lpn_track)
+		return;
+
+	for (lpn = start_lpn; lpn <= end_lpn; lpn++)
+		nvmev_lpn_mark(lpn, sqid, cid);
+}
+
+static void nvmev_lpn_unmark_range(u64 start_lpn, u64 end_lpn)
+{
+	u64 lpn;
+
+	if (!nvmev_lpn_track)
+		return;
+
+	for (lpn = start_lpn; lpn <= end_lpn; lpn++)
+		nvmev_lpn_unmark(lpn);
+}
 
 static DEFINE_PER_CPU(struct nvmev_cmd_debug, nvmev_last_cmd);
 
@@ -520,7 +622,12 @@ static void update_qlc_latency_zone(struct conv_ftl *conv_ftl, uint64_t lpn, str
 	uint64_t avg_reads;
 	uint8_t zone;
 
-	if (!conv_ftl->qlc_page_wcnt)
+	if (!conv_ftl || !conv_ftl->qlc_page_wcnt)
+		return;
+
+	if (!valid_ppa(conv_ftl, ppa))
+		return;
+	if (lpn >= conv_ftl->ssd->sp.tt_pgs)
 		return;
 
 	pg = get_pg(conv_ftl->ssd, ppa);
@@ -1819,6 +1926,12 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         NVMEV_ERROR("[mark_page_invalid] Invalid parameters.\n");
         return;
     }
+
+    if (!valid_ppa(conv_ftl, ppa)) {
+        NVMEV_ERROR("[mark_page_invalid] Invalid PPA: ch=%d, lun=%d, blk=%d, pg=%d\n",
+                   ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+        return;
+    }
     
     struct ssdparams *spp = &conv_ftl->ssd->sp;
     struct nand_block *blk;
@@ -1831,6 +1944,11 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
     /* 更新页和块的状态 (这部分不涉及共享数据结构，可以在锁外完成) */
     pg = get_pg(conv_ftl->ssd, ppa);
+    if (!pg) {
+        NVMEV_ERROR("[mark_page_invalid] Failed to get page for ppa ch=%d,lun=%d,blk=%d,pg=%d\n",
+                   ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
+        return;
+    }
     
     /* 检查页面状态，如果已经无效则直接返回 */
     if (pg->status == PG_INVALID) {
@@ -3934,6 +4052,12 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
     /* C90: declarations must precede statements */
     struct nvme_command *cmd;
     struct nvmev_cmd_debug *dbg;
+	struct conv_ftl *conv_ftls;
+	struct ssdparams *spp;
+	unsigned long long ftl_start;
+	unsigned long long ftl_dur;
+	u64 start_lpn = 0;
+	u64 end_lpn = 0;
     
     NVMEV_DEBUG("[DEBUG] conv_proc_nvme_io_cmd: Function entry\n");
     
@@ -3948,6 +4072,9 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
     }
     
     cmd = req->cmd;
+	ftl_start = local_clock();
+	conv_ftls = (struct conv_ftl *)ns->ftls;
+	spp = conv_ftls ? &conv_ftls[0].ssd->sp : NULL;
 
 	dbg = this_cpu_ptr(&nvmev_last_cmd);
 	if (dbg) {
@@ -3967,8 +4094,13 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 	switch (cmd->common.opcode) {
 	case nvme_cmd_write:
 		NVMEV_DEBUG("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_write\n");
+		if (spp) {
+			start_lpn = cmd->rw.slba / spp->secs_per_pg;
+			end_lpn = (cmd->rw.slba + cmd->rw.length) / spp->secs_per_pg;
+			nvmev_lpn_mark_range(start_lpn, end_lpn, req->sq_id, cmd->common.command_id);
+		}
         if (!conv_write(ns, req, ret))
-            return true; /* 出错也返回完成，状态在 ret 内 */
+            goto out; /* 出错也返回完成，状态在 ret 内 */
 		if (ret->status != NVME_SC_SUCCESS && printk_ratelimit())
 			NVMEV_ERROR("conv_write status=0x%x sqid=%d opcode=0x%x slba=%llu len=%u\n",
 				    ret->status, req->sq_id, cmd->rw.opcode,
@@ -3977,7 +4109,7 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 	case nvme_cmd_read:
 		NVMEV_DEBUG("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_read\n");
         if (!conv_read(ns, req, ret))
-            return true; /* 出错也返回完成，状态在 ret 内 */
+            goto out; /* 出错也返回完成，状态在 ret 内 */
 		break;
 	case nvme_cmd_flush:
 		NVMEV_DEBUG("[DEBUG] conv_proc_nvme_io_cmd: Calling conv_flush\n");
@@ -3987,6 +4119,20 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 		NVMEV_DEBUG("[DEBUG] conv_proc_nvme_io_cmd: Unimplemented command: %s(%d)\n", 
 			   nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
 		break;
+	}
+
+out:
+	if (spp && cmd->common.opcode == nvme_cmd_write)
+		nvmev_lpn_unmark_range(start_lpn, end_lpn);
+
+	if (nvmev_ftl_slow_ns) {
+		ftl_dur = local_clock() - ftl_start;
+		if (ftl_dur > nvmev_ftl_slow_ns && printk_ratelimit()) {
+			NVMEV_ERROR("ftl slow: sqid=%d cid=%u opcode=0x%x nsid=%u slba=%llu len=%u dur_ns=%llu\n",
+				    req->sq_id, cmd->common.command_id, cmd->common.opcode,
+				    cmd->common.nsid, (unsigned long long)cmd->rw.slba,
+				    cmd->rw.length + 1, ftl_dur);
+		}
 	}
 
 	return true;

@@ -33,9 +33,7 @@ struct channel_model {
 	uint32_t max_credits;
 	uint32_t command_credits;
 	uint32_t xfer_lat; /*XKB NAND CH transfer time in nanoseconds*/
-
-	spinlock_t lock; /* Protect concurrent access */
-	credit_t *avail_credits;
+	credit_t avail_credits[NR_CREDIT_ENTRIES];
 };
 
 #define BANDWIDTH_TO_TX_TIME(MB_S) (((UNIT_XFER_SIZE)*NS_PER_SEC(1)) / (MB(MB_S)))
@@ -43,5 +41,5 @@ struct channel_model {
 	(MB(MB_S) * UNIT_TIME_INTERVAL / NS_PER_SEC(1) / UNIT_XFER_SIZE * UNIT_XFER_CREDITS)
 
 uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64_t length);
-int chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/);
+void chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/);
 #endif

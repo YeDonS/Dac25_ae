@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include "nvmev.h"
+#include "pci.h"
 #include "conv_ftl.h"
 #if 0  // Force disabled ZNS support
 #include "zns_ftl.h"

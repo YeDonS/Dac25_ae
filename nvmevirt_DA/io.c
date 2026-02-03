@@ -3,6 +3,9 @@
 #include <linux/kthread.h>
 #include <linux/ktime.h>
 #include <linux/highmem.h>
+#include <linux/moduleparam.h>
+#include <linux/hashtable.h>
+#include <linux/spinlock.h>
 #include <linux/sched/clock.h>
 
 #include "nvmev.h"
@@ -23,8 +26,27 @@ struct buffer;
 
 extern bool io_using_dma;
 
-#define NVMEV_IO_LOG(string, args...) NVMEV_INFO("io: " string, ##args)
+#define NVMEV_IO_LOG(string, args...) NVMEV_DEBUG("io: " string, ##args)
 #define NVMEV_IO_ERR(string, args...) NVMEV_ERROR("io: " string, ##args)
+
+static unsigned long long nvmev_io_slow_ns;
+module_param_named(io_slow_ns, nvmev_io_slow_ns, ullong, 0644);
+MODULE_PARM_DESC(io_slow_ns, "Log io cmd processing time if above threshold (ns), 0 disables");
+
+#define NVMEV_PRP_HASH_BITS 12
+struct nvmev_prp_inflight {
+	struct hlist_node hnode;
+	u64 pfn;
+	u32 count;
+	u16 last_cid;
+	u16 last_sqid;
+};
+
+static DEFINE_HASHTABLE(nvmev_prp_ht, NVMEV_PRP_HASH_BITS);
+static DEFINE_SPINLOCK(nvmev_prp_lock);
+static bool nvmev_prp_track = true;
+module_param_named(prp_track, nvmev_prp_track, bool, 0644);
+MODULE_PARM_DESC(prp_track, "Detect concurrent writes to same PRP page (default on)");
 
 static inline unsigned int __get_io_worker(int sqid)
 {
@@ -38,6 +60,120 @@ static inline unsigned int __get_io_worker(int sqid)
 static inline unsigned long long __get_wallclock(void)
 {
 	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
+}
+
+static void nvmev_prp_mark_pfn(u64 pfn, u16 sqid, u16 cid)
+{
+	struct nvmev_prp_inflight *entry;
+	unsigned long flags;
+
+	spin_lock_irqsave(&nvmev_prp_lock, flags);
+	hash_for_each_possible(nvmev_prp_ht, entry, hnode, pfn) {
+		if (entry->pfn == pfn) {
+			entry->count++;
+			if (printk_ratelimit()) {
+				NVMEV_IO_ERR("prp overlap: pfn=0x%llx prev sqid=%u cid=%u new sqid=%u cid=%u count=%u\n",
+					     pfn, entry->last_sqid, entry->last_cid, sqid, cid,
+					     entry->count);
+			}
+			entry->last_sqid = sqid;
+			entry->last_cid = cid;
+			spin_unlock_irqrestore(&nvmev_prp_lock, flags);
+			return;
+		}
+	}
+	spin_unlock_irqrestore(&nvmev_prp_lock, flags);
+
+	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	if (!entry)
+		return;
+	entry->pfn = pfn;
+	entry->count = 1;
+	entry->last_sqid = sqid;
+	entry->last_cid = cid;
+
+	spin_lock_irqsave(&nvmev_prp_lock, flags);
+	hash_add(nvmev_prp_ht, &entry->hnode, pfn);
+	spin_unlock_irqrestore(&nvmev_prp_lock, flags);
+}
+
+static void nvmev_prp_unmark_pfn(u64 pfn)
+{
+	struct nvmev_prp_inflight *entry;
+	unsigned long flags;
+
+	spin_lock_irqsave(&nvmev_prp_lock, flags);
+	hash_for_each_possible(nvmev_prp_ht, entry, hnode, pfn) {
+		if (entry->pfn == pfn) {
+			if (entry->count > 1) {
+				entry->count--;
+				spin_unlock_irqrestore(&nvmev_prp_lock, flags);
+				return;
+			}
+			hash_del(&entry->hnode);
+			spin_unlock_irqrestore(&nvmev_prp_lock, flags);
+			kfree(entry);
+			return;
+		}
+	}
+	spin_unlock_irqrestore(&nvmev_prp_lock, flags);
+}
+
+static void nvmev_prp_track_cmd(struct nvmev_submission_queue *sq, int sqid, int sq_entry, bool add)
+{
+	struct nvme_command *cmd;
+	size_t remaining;
+	int prp_offs = 0;
+	int prp2_offs = 0;
+	u64 paddr;
+	u64 *paddr_list = NULL;
+	u16 cid;
+
+	if (!nvmev_prp_track || !sq || !sq->sq)
+		return;
+
+	cmd = &sq_entry(sq_entry);
+	if (cmd->rw.opcode != nvme_cmd_write && cmd->rw.opcode != nvme_cmd_zone_append)
+		return;
+
+	cid = cmd->common.command_id;
+	remaining = (cmd->rw.length + 1) << 9;
+
+	while (remaining) {
+		size_t io_size;
+		size_t mem_offs = 0;
+
+		prp_offs++;
+		if (prp_offs == 1) {
+			paddr = cmd->rw.prp1;
+		} else if (prp_offs == 2) {
+			paddr = cmd->rw.prp2;
+			if (remaining > PAGE_SIZE) {
+				paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
+					     (paddr & PAGE_OFFSET_MASK);
+				paddr = paddr_list[prp2_offs++];
+			}
+		} else {
+			paddr = paddr_list[prp2_offs++];
+		}
+
+		if (add)
+			nvmev_prp_mark_pfn(PRP_PFN(paddr), sqid, cid);
+		else
+			nvmev_prp_unmark_pfn(PRP_PFN(paddr));
+
+		io_size = min_t(size_t, remaining, PAGE_SIZE);
+		if (paddr & PAGE_OFFSET_MASK) {
+			mem_offs = paddr & PAGE_OFFSET_MASK;
+			if (io_size + mem_offs > PAGE_SIZE)
+				io_size = PAGE_SIZE - mem_offs;
+		}
+
+		remaining -= io_size;
+	}
+
+	if (paddr_list != NULL)
+		kunmap_atomic(paddr_list);
 }
 
 static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid, int sq_entry)
@@ -60,6 +196,8 @@ static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid,
 		     sq_entry(sq_entry).rw.length + 1,
 		     (unsigned long long)sq_entry(sq_entry).rw.prp1,
 		     (unsigned long long)sq_entry(sq_entry).rw.prp2);
+
+	nvmev_prp_track_cmd(sq, sqid, sq_entry, true);
 
 	offset = sq_entry(sq_entry).rw.slba << 9;
 	length = (sq_entry(sq_entry).rw.length + 1) << 9;
@@ -138,6 +276,8 @@ static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq,
 		     sq_entry(sq_entry).rw.length + 1,
 		     (unsigned long long)sq_entry(sq_entry).rw.prp1,
 		     (unsigned long long)sq_entry(sq_entry).rw.prp2);
+
+	nvmev_prp_track_cmd(sq, sqid, sq_entry, true);
 
 	offset = sq_entry(sq_entry).rw.slba << 9;
 	length = (sq_entry(sq_entry).rw.length + 1) << 9;
@@ -456,6 +596,8 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 		.nsecs_target = nsecs_start,
 		.status = NVME_SC_SUCCESS,
 	};
+	unsigned long long proc_start;
+	unsigned long long proc_dur;
 
 	NVMEV_IO_LOG("io req: sqid=%d cqid=%d sq_entry=%d opcode=0x%x cid=%u nsid=%u slba=%llu len=%u prp1=0x%llx prp2=0x%llx\n",
 		     sqid, sq->cqid, sq_entry, cmd->common.opcode,
@@ -474,8 +616,15 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	static unsigned long long counter = 0;
 #endif
 
+	proc_start = local_clock();
 	if (!ns->proc_io_cmd(ns, &req, &ret))
 		return false;
+	proc_dur = local_clock() - proc_start;
+	if (nvmev_io_slow_ns && proc_dur > nvmev_io_slow_ns) {
+		NVMEV_IO_LOG("io slow: sqid=%d sq_entry=%d cid=%u opcode=0x%x nsid=%u dur_ns=%llu\n",
+			     sqid, sq_entry, cmd->common.command_id, cmd->common.opcode,
+			     cmd->common.nsid, proc_dur);
+	}
 	*io_size = (sq_entry(sq_entry).rw.length + 1) << 9;
 
 	NVMEV_IO_LOG("io proc done: sqid=%d sq_entry=%d cid=%u status=0x%x nsecs_target=%llu io_size=%zu\n",
@@ -623,6 +772,7 @@ static void __fill_cq_result(struct nvmev_proc_table *proc_entry)
 	unsigned int result1 = proc_entry->result1;
 
 	struct nvmev_completion_queue *cq = nvmev_vdev->cqes[cqid];
+	struct nvmev_submission_queue *sq = proc_entry->sq_ptr;
 	int cq_head;
 
 	if (unlikely(!cq)) {
@@ -633,6 +783,9 @@ static void __fill_cq_result(struct nvmev_proc_table *proc_entry)
 
 	NVMEV_IO_LOG("fill cqe: cqid=%d cq_head=%d phase=%d sqid=%d sq_entry=%d cid=%u status=0x%x result0=0x%x result1=0x%x\n",
 		     cqid, cq_head, cq->phase, sqid, sq_entry, command_id, status, result0, result1);
+
+	if (sq && sq->sq)
+		nvmev_prp_track_cmd(sq, sqid, sq_entry, false);
 
 	spin_lock(&cq->entry_lock);
 	cq_entry(cq_head).command_id = command_id;
@@ -648,6 +801,7 @@ static void __fill_cq_result(struct nvmev_proc_table *proc_entry)
 	}
 
 	cq->cq_head = cq_head;
+	wmb();
 	cq->interrupt_ready = true;
 	spin_unlock(&cq->entry_lock);
 }
@@ -772,6 +926,7 @@ static int nvmev_kthread_io(void *data)
 					cq->interrupt_ready = false;
 					NVMEV_IO_LOG("irq: cqid=%d vector=%d cq_head=%d phase=%d\n",
 						     qidx, cq->irq_vector, cq->cq_head, cq->phase);
+					wmb();
 					nvmev_signal_irq(cq->irq_vector);
 
 #ifdef PERF_DEBUG
