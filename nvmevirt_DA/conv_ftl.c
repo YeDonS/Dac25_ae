@@ -3775,7 +3775,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         uint64_t needed = LBA_TO_BYTE(nr_lba);
         int wb_retry = 0;
         const int WB_MAX_RETRIES = 100;    /* 最多重试 100 次 */
-        const int WB_RETRY_US = 1000000;      /* 每次等待 1ms */
+        const int WB_RETRY_US = 10000000;      /* 每次等待 1ms */
 
 	if (spp->pgsz) {
 		uint64_t remainder = needed % spp->pgsz;
