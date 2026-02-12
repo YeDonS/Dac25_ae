@@ -601,40 +601,46 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 			}
 		}
 
-		/* read: then data transfer through channel */
-		chnl_stime = nand_etime;
+		if (ncmd->type == GC_IO) {
+			/* GC/迁移：跳过通道模型，仅保留 NAND 延迟 */
+			lun->next_lun_avail_time = nand_etime;
+			completed_time = nand_etime;
+		} else {
+			/* read: then data transfer through channel */
+			chnl_stime = nand_etime;
 
-		while (remaining) {
-			xfer_size = min(remaining, (uint64_t)spp->max_ch_xfer_size);
-			chnl_etime = chmodel_request(ch->perf_model, chnl_stime, xfer_size);
+			while (remaining) {
+				xfer_size = min(remaining, (uint64_t)spp->max_ch_xfer_size);
+				chnl_etime = chmodel_request(ch->perf_model, chnl_stime, xfer_size);
 
-			if (ncmd->interleave_pci_dma) { /* overlap pci transfer with nand ch transfer*/
-				completed_time = ssd_advance_pcie(ssd, chnl_etime, xfer_size);
-			} else {
-				completed_time = chnl_etime;
+				if (ncmd->interleave_pci_dma) {
+					completed_time = ssd_advance_pcie(ssd, chnl_etime, xfer_size);
+				} else {
+					completed_time = chnl_etime;
+				}
+
+				remaining -= xfer_size;
+				chnl_stime = chnl_etime;
 			}
 
-			remaining -= xfer_size;
-			chnl_stime = chnl_etime;
+			lun->next_lun_avail_time = chnl_etime;
 		}
-
-		lun->next_lun_avail_time = chnl_etime;
 		break;
 
 	case NAND_WRITE:
-		/* write: transfer data through channel first */
-		chnl_stime = max(lun->next_lun_avail_time, cmd_stime);
+		if (ncmd->type == GC_IO) {
+			/* GC/迁移：跳过通道模型，仅保留 NAND 延迟 */
+			nand_stime = max(lun->next_lun_avail_time, cmd_stime);
+		} else {
+			/* write: transfer data through channel first */
+			chnl_stime = max(lun->next_lun_avail_time, cmd_stime);
+			chnl_etime = chmodel_request(ch->perf_model, chnl_stime, ncmd->xfer_size);
+			nand_stime = chnl_etime;
+		}
 
-		chnl_etime = chmodel_request(ch->perf_model, chnl_stime, ncmd->xfer_size);
-
-		/* write: then do NAND program */
-		nand_stime = chnl_etime;
-		
 		if (is_qlc) {
-			/* QLC 写延迟（比 SLC 慢约 4 倍） */
 			nand_etime = nand_stime + spp->qlc_pg_wr_lat;
 		} else {
-			/* SLC 写延迟 */
 			nand_etime = nand_stime + spp->pg_wr_lat;
 		}
 		
