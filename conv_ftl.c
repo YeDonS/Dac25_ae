@@ -3475,6 +3475,14 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 					conv_ftl->migration_read_path_count++;
 					if (migration_done)
 						nsecs_latest = max(nsecs_latest, migration_done);
+
+					printk_ratelimited(KERN_INFO
+						"[COLD_MIG_PROBE] mig lpn=%llu acc=%llu avg=%llu mig_sim_done=%llu rd_sim_start=%llu wall_ns=%llu total_mig=%llu\n",
+						local_lpn, access_cnt, avg_reads,
+						migration_done,
+						nsecs_start,
+						(uint64_t)(ktime_get_ns() - mig_start),
+						conv_ftl->migration_read_path_count);
 					}
 				}
 
@@ -3601,6 +3609,12 @@ ret->nsecs_target = nsecs_latest;
 	ret->status = NVME_SC_SUCCESS;
 	    NVMEV_DEBUG("[READ_VERIFY] LBA Range: %llu + %d. Total Latency: %llu ns\n", 
 			                   cmd->rw.slba, cmd->rw.length, nsecs_latest - nsecs_start);
+
+	printk_ratelimited(KERN_INFO
+		"[COLD_RD_PROBE] lba=%llu nr_lba=%llu sim_lat_ns=%llu total_mig_in_read=%llu\n",
+		lba, nr_lba, nsecs_latest - nsecs_start,
+		conv_ftl->migration_read_path_count);
+
 	return true;
 }
 
