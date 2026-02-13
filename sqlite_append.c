@@ -1223,7 +1223,6 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 	}
 
 	for (unsigned int iter = 0; iter < runs; ++iter) {
-		drop_page_cache();
 		double start = monotonic_sec();
 
 		for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
@@ -1232,6 +1231,9 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 			sqlite3_stmt *stmt = NULL;
 			int rc;
 			double tbl_start, tbl_end;
+
+			/* drop cache before each table for independent cold measurement */
+			drop_page_cache();
 
 			build_table_name(table_name, sizeof(table_name), tbl);
 			snprintf(sql, sizeof(sql),
