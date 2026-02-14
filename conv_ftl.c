@@ -716,6 +716,41 @@ static const struct file_operations access_count_fops = {
 	.release = single_release,
 };
 
+static int page_tier_show(struct seq_file *m, void *v)
+{
+	struct conv_ftl *conv_ftl = m->private;
+	struct ssdparams *spp;
+	uint64_t lpn;
+
+	(void)v;
+
+	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->page_in_slc)
+		return 0;
+
+	spp = &conv_ftl->ssd->sp;
+	for (lpn = 0; lpn < spp->tt_pgs; lpn++) {
+		struct ppa ppa = get_maptbl_ent(conv_ftl, lpn);
+		if (!mapped_ppa(&ppa) || !valid_ppa(conv_ftl, &ppa))
+			continue;
+		seq_printf(m, "%llu %u\n", lpn, conv_ftl->page_in_slc[lpn] ? 1 : 0);
+	}
+
+	return 0;
+}
+
+static int page_tier_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, page_tier_show, inode->i_private);
+}
+
+static const struct file_operations page_tier_fops = {
+	.owner = THIS_MODULE,
+	.open = page_tier_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int access_inject_open(struct inode *inode, struct file *file)
 {
 	pr_info("access_inject_open: inode=%p private=%p\n", inode, inode->i_private);
@@ -1598,6 +1633,8 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->slc_pgs_per_blk = ssd->sp.pgs_per_blk;
 	conv_ftl->qlc_pgs_per_blk = conv_ftl->slc_pgs_per_blk * QLC_BLOCK_CAPACITY_FACTOR;
 	conv_ftl->debug_access_count = NULL;
+	conv_ftl->debug_access_inject = NULL;
+	conv_ftl->debug_page_tier = NULL;
 
 	conv_ftl->die_count = total_dies(&ssd->sp);
 	if (!conv_ftl->die_count)
@@ -1740,6 +1777,9 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		conv_ftl->debug_access_inject =
 			debugfs_create_file("access_inject", 0200, parent,
 					    conv_ftl, &access_inject_fops);
+		conv_ftl->debug_page_tier =
+			debugfs_create_file("page_tier", 0440, parent,
+					    conv_ftl, &page_tier_fops);
 	}
 
 	return;
@@ -1754,6 +1794,7 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		conv_ftl->debug_dir = NULL;
 		conv_ftl->debug_access_count = NULL;
 		conv_ftl->debug_access_inject = NULL;
+		conv_ftl->debug_page_tier = NULL;
 	} else {
 		if (conv_ftl->debug_access_count) {
 			debugfs_remove(conv_ftl->debug_access_count);
@@ -1762,6 +1803,10 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		if (conv_ftl->debug_access_inject) {
 			debugfs_remove(conv_ftl->debug_access_inject);
 			conv_ftl->debug_access_inject = NULL;
+		}
+		if (conv_ftl->debug_page_tier) {
+			debugfs_remove(conv_ftl->debug_page_tier);
+			conv_ftl->debug_page_tier = NULL;
 		}
 	}
 	

@@ -5,6 +5,8 @@
 
 #include <linux/types.h>
 #include <linux/spinlock.h>
+#include <linux/seqlock.h>
+#include <linux/atomic.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "ssd.h"
@@ -67,6 +69,7 @@ struct write_flow_control {
 struct heat_tracking {
 	uint64_t *access_count;     /* 每个 LPN 的访问计数 */
 	uint64_t *last_access_time; /* 每个 LPN 的最后访问时间 */
+	uint64_t *write_epoch;      /* 最近写入序号 */
 	uint32_t migration_threshold; /* 迁移阈值 */
 };
 
@@ -83,36 +86,39 @@ struct conv_ftl {
 	struct convparams cp;
 	struct ppa *maptbl; /* page level mapping table */
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
-	struct write_pointer wp;
-	struct write_pointer gc_wp;
+	seqlock_t maptbl_lock; /* serialize maptbl/rmap updates with low-overhead readers */
 	struct write_flow_control wfc;
 	//66f1 - 删除了冲突的旧 line_mgmt 结构
 	uint32_t lunpointer;
+	uint32_t die_count;
 
 	/* SLC/QLC 混合存储相关字段 */
 	bool *is_slc_block;          /* 标记块是否为 SLC */
 	uint32_t slc_blks_per_pl;    /* 每个 plane 的 SLC 块数 */
 	uint32_t qlc_blks_per_pl;    /* 每个 plane 的 QLC 块数 */
+	uint32_t slc_pgs_per_blk;    /* SLC block 的页数 */
+	uint32_t qlc_pgs_per_blk;    /* QLC block 的页数（可为 SLC 的多倍） */
 	
-	/* SLC 写指针 - 使用 DA (Die Affinity) */
+	struct line_mgmt slc_lm;              /* legacy aggregated view (unused in DA path) */
+	struct line_mgmt *slc_lunlm;          /* per-die SLC line pools */
+	struct write_pointer *slc_lunwp;
+	struct write_pointer *gc_slc_lunwp;
 	struct write_pointer slc_wp;
-	struct line_mgmt slc_lm;
+	struct write_pointer gc_wp;
 	
-	/* QLC 写指针 - 使用多区域并发 */
-	struct write_pointer qlc_wp;              /* 单一 QLC 写指针（用户IO） */
-	struct write_pointer qlc_gc_wp;           /* 单一 QLC GC 写指针 */
-	struct line_mgmt qlc_lm;                  /* QLC line 管理 */
+	struct line_mgmt *qlc_lunlm;          /* per-die QLC line pools */
+	struct write_pointer *qlc_lunwp;      /* per-die QLC write pointers */
+	struct write_pointer *gc_qlc_lunwp;   /* per-die QLC GC write pointers */
 	uint32_t qlc_zone_offsets[QLC_ZONE_COUNT];/* 每个zone在block中的起始页 */
 	uint32_t qlc_zone_limits[QLC_ZONE_COUNT]; /* 每个zone允许写入的页数 */
 	uint32_t qlc_zone_rr_cursor;             /* 无机制版本：线性填充所用的轮询游标 */
-	uint32_t *qlc_die_pg;                    /* QLC 写指针：每 die 页计数 */
-	uint32_t *qlc_gc_die_pg;                 /* QLC GC 写指针：每 die 页计数 */
-	uint32_t qlc_die_pg_size;
+	struct write_pointer qlc_wp;
+	struct write_pointer qlc_gc_wp;
 
 	uint32_t slc_gc_free_thres_high;
-	uint32_t slc_gc_free_thres_low;
 	uint32_t qlc_gc_free_thres_high;
-	uint32_t qlc_gc_free_thres_low;
+	uint32_t slc_target_watermark;        /* 迁移目标水位线（高水位触发后回落到此值） */
+	uint32_t slc_repromote_guard_lines;   /* QLC->SLC 回迁的安全预留行数 */
 
 	/* 热数据跟踪和迁移管理 */
 	struct heat_tracking heat_track;
@@ -131,12 +137,22 @@ struct conv_ftl {
 	spinlock_t qlc_zone_lock;    /* 保护 QLC 区域统计 */
 	uint64_t qlc_migration_read_sum;   /* 迁移页累计读次数 */
 	uint64_t qlc_migration_page_cnt;   /* 迁移页数量 */
+	uint64_t global_read_sum;         /* 全局有效页读次数总和 */
+	uint64_t global_valid_pg_cnt;     /* 全局有效页总数 */
+	uint64_t migration_read_path_count;    /* 读路径触发迁移次数 */
+	uint64_t migration_read_path_time_ns;  /* 读路径迁移耗时累计 */
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
 	uint64_t migration_cnt;      /* 迁移计数 */
+	uint64_t total_host_writes;  /* 总写入块数 */
+	atomic64_t slc_resident_page_cnt; /* 当前驻留在 SLC 的页面数 */
+	atomic_t slc_recover_lock;        /* 序列化 SLC 回收 */
+	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
+	struct dentry *debug_access_inject; /* debugfs entry for counter injection */
+	struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
 	
 	/* 初始化状态标记 */
 	bool maptbl_initialized;     /* 映射表是否初始化成功 */
@@ -159,9 +175,6 @@ struct conv_ftl {
 	
 	/* 水位线控制 - 基于剩余空间数量 */
 	uint32_t slc_high_watermark;             /* SLC 高水位线: 剩余空间低于此值时触发迁移 */
-	uint32_t slc_low_watermark;              /* SLC 低水位线: 剩余空间高于此值时停止迁移 */
-	uint32_t gc_high_watermark;              /* GC 高水位线: 总剩余空间低于此值时触发GC */
-	uint32_t gc_low_watermark;               /* GC 低水位线: 总剩余空间高于此值时停止GC */
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
@@ -171,5 +184,7 @@ void conv_remove_namespace(struct nvmev_ns *ns);
 
 bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 			   struct nvmev_result *ret);
+
+void nvmev_debugfs_cleanup_root(void);
 
 #endif
