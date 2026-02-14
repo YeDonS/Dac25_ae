@@ -13,10 +13,10 @@ fi
 
 ZIPF_ALPHA=${ZIPF_ALPHA:-1.2}
 ZIPF_SEED=${ZIPF_SEED:-42}
-EXP_LAMBDA=${EXP_LAMBDA:-0.0008}
+EXP_LAMBDA=${EXP_LAMBDA:-0.0000005}
 EXP_SEED=${EXP_SEED:-4242}
-NORMAL_MEAN=${NORMAL_MEAN:--1}
-NORMAL_STDDEV=${NORMAL_STDDEV:-400}
+NORMAL_MEAN=${NORMAL_MEAN:-5000}
+NORMAL_STDDEV=${NORMAL_STDDEV:-800}
 NORMAL_SEED=${NORMAL_SEED:-314159}
 SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
 SQLITE_TRACE_DIR=${SQLITE_TRACE_DIR:-}
@@ -38,11 +38,11 @@ drop_caches() {
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 }
 
-run_normal_suite() {
+run_exp_suite() {
     local tag="fragment_on"
     local trace_dir="${SQLITE_TRACE_DIR:-${RESULT_FOLDER%/}/sqlite_traces}"
     local trace_base="${trace_dir%/}"
-    local trace_normal="${trace_base}/sqlite_trace_${tag}_normal.trace"
+    local trace_exp="${trace_base}/sqlite_trace_${tag}_exp.trace"
     local layout_meta="${RESULT_FOLDER%/}/sqlite_layout_${tag}.meta"
     local strict_args=()
 
@@ -66,7 +66,7 @@ run_normal_suite() {
         --page-tier-path "$SQLITE_PAGE_TIER_PATH" \
         --access-count-path "$SQLITE_ACCESS_COUNT_PATH" \
         --ftl-host-page-bytes "$SQLITE_FTL_HOST_PAGE_BYTES" \
-        --distribution normal \
+        --distribution exp \
         --zipf-seed "$ZIPF_SEED" \
         --exp-seed "$EXP_SEED" \
         --normal-seed "$NORMAL_SEED" \
@@ -79,8 +79,8 @@ run_normal_suite() {
         "${strict_args[@]}" \
         >"./$RESULT_FOLDER/sqlite_${tag}_init.txt"
 
-    if [[ ! -f "$trace_normal" ]]; then
-        echo "Trace file not found: $trace_normal" >&2
+    if [[ ! -f "$trace_exp" ]]; then
+        echo "Trace file not found: $trace_exp" >&2
         source resetdevice.sh
         exit 1
     fi
@@ -94,5 +94,5 @@ run_normal_suite() {
 }
 
 ./disablemeta.sh
-run_normal_suite
+run_exp_suite
 ./enablemeta.sh

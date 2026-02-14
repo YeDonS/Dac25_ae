@@ -18,10 +18,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#endif
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -55,8 +61,9 @@
 #define MAX_TABLE_NAME           64
 #define NORMAL_MEAN_SENTINEL     (-1.0)
 #define NORMAL_STDDEV_SENTINEL   (-1.0)
-#define DEFAULT_FTL_HOST_PAGE_BYTES (32768ULL)
+#define DEFAULT_FTL_HOST_PAGE_BYTES (4096ULL)
 #define DEFAULT_PAGE_TIER_PATH      "/sys/kernel/debug/nvmev/ftl0/page_tier"
+#define DEFAULT_ACCESS_COUNT_PATH   "/sys/kernel/debug/nvmev/ftl0/access_count"
 #define STR1_LEN                 65536
 #define STR2_LEN                 65536
 #define STR3_LEN                 65536
@@ -99,6 +106,7 @@ static const struct option long_opts[] = {
 	{"strict-cold-per-select", no_argument, NULL, 1014},
 	{"page-tier-path", required_argument, NULL, 1015},
 	{"ftl-host-page-bytes", required_argument, NULL, 1016},
+	{"access-count-path", required_argument, NULL, 1017},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -154,6 +162,7 @@ struct workload_options {
 	bool strict_cold_per_select;
 	const char *page_tier_path;
 	unsigned long long ftl_host_page_bytes;
+	const char *access_count_path;
 };
 
 struct zipf_sampler {
@@ -198,6 +207,17 @@ struct table_state {
 struct page_tier_entry {
 	unsigned long long lpn;
 	unsigned int in_slc;
+};
+
+struct file_extent {
+	unsigned long long logical;
+	unsigned long long physical;
+	unsigned long long length;
+};
+
+struct access_count_entry {
+	unsigned long long lpn;
+	unsigned long long count;
 };
 
 static void join_path(char *dst, size_t len, const char *dir, const char *leaf);
@@ -281,6 +301,7 @@ static void usage(const char *prog)
 		"                 [--interleave-rows N] [--interleave-reads N]\n"
 		"                 [--strict-cold-per-select]\n"
 		"                 [--page-tier-path PATH] [--ftl-host-page-bytes N]\n"
+		"                 [--access-count-path PATH]\n"
 		"                 [--zipf-seed S] [--exp-seed S] [--normal-seed S]\n"
 		"                 [--tag NAME] [--trace-dir DIR]\n"
 		"  %s --mode read --distribution zipf|exp|uniform|normal|sequential\n"
@@ -339,6 +360,18 @@ static int cmp_tier_entry_lpn(const void *a, const void *b)
 {
 	const struct page_tier_entry *ea = a;
 	const struct page_tier_entry *eb = b;
+
+	if (ea->lpn < eb->lpn)
+		return -1;
+	if (ea->lpn > eb->lpn)
+		return 1;
+	return 0;
+}
+
+static int cmp_access_entry_lpn(const void *a, const void *b)
+{
+	const struct access_count_entry *ea = a;
+	const struct access_count_entry *eb = b;
 
 	if (ea->lpn < eb->lpn)
 		return -1;
@@ -1435,21 +1468,316 @@ static bool lookup_page_tier(const struct page_tier_entry *entries, size_t count
 	return true;
 }
 
-static int write_table_tier_csv(const char *path, sqlite3 *db,
+static int load_access_count_entries(const char *path, struct access_count_entry **entries_out,
+				     size_t *count_out)
+{
+	FILE *fp;
+	struct access_count_entry *entries = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+	char line[128];
+
+	if (entries_out)
+		*entries_out = NULL;
+	if (count_out)
+		*count_out = 0;
+	if (!path || !*path)
+		return 0;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		unsigned long long lpn;
+		unsigned long long acc;
+		struct access_count_entry *tmp;
+
+		if (sscanf(line, "%llu %llu", &lpn, &acc) != 2)
+			continue;
+
+		if (count == cap) {
+			size_t new_cap = cap ? cap * 2 : 4096;
+			tmp = realloc(entries, new_cap * sizeof(*entries));
+			if (!tmp) {
+				free(entries);
+				fclose(fp);
+				return -ENOMEM;
+			}
+			entries = tmp;
+			cap = new_cap;
+		}
+
+		entries[count].lpn = lpn;
+		entries[count].count = acc;
+		count++;
+	}
+
+	fclose(fp);
+	if (!entries || count == 0) {
+		free(entries);
+		return 0;
+	}
+
+	qsort(entries, count, sizeof(*entries), cmp_access_entry_lpn);
+	size_t unique = 1;
+	for (size_t i = 1; i < count; ++i) {
+		if (entries[i].lpn != entries[unique - 1].lpn)
+			entries[unique++] = entries[i];
+		else
+			entries[unique - 1] = entries[i];
+	}
+
+	if (entries_out)
+		*entries_out = entries;
+	else
+		free(entries);
+	if (count_out)
+		*count_out = unique;
+	return 0;
+}
+
+static bool lookup_access_count(const struct access_count_entry *entries, size_t count,
+				unsigned long long lpn, unsigned long long *acc_out)
+{
+	size_t lo = 0;
+	size_t hi = count;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (entries[mid].lpn < lpn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	if (lo >= count || entries[lo].lpn != lpn)
+		return false;
+	if (acc_out)
+		*acc_out = entries[lo].count;
+	return true;
+}
+
+static unsigned long long percentile_u64_from_sorted(const unsigned long long *vals, size_t count,
+						      double p)
+{
+	if (!vals || count == 0)
+		return 0ULL;
+	if (p <= 0.0)
+		return vals[0];
+	if (p >= 1.0)
+		return vals[count - 1];
+
+	size_t idx = (size_t)floor((double)(count - 1) * p);
+	if (idx >= count)
+		idx = count - 1;
+	return vals[idx];
+}
+
+static int append_lpn_value(unsigned long long lpn, unsigned long long **lpn_vec,
+			    size_t *lpn_count, size_t *lpn_cap)
+{
+	if (!lpn_vec || !lpn_count || !lpn_cap)
+		return -EINVAL;
+
+	if (*lpn_count == *lpn_cap) {
+		size_t new_cap = *lpn_cap ? (*lpn_cap * 2) : 4096;
+		unsigned long long *tmp = realloc(*lpn_vec, new_cap * sizeof(**lpn_vec));
+
+		if (!tmp)
+			return -ENOMEM;
+
+		*lpn_vec = tmp;
+		*lpn_cap = new_cap;
+	}
+
+	(*lpn_vec)[(*lpn_count)++] = lpn;
+	return 0;
+}
+
+static int append_lpn_range(unsigned long long lpn_start, unsigned long long lpn_end,
+			    unsigned long long **lpn_vec, size_t *lpn_count, size_t *lpn_cap)
+{
+	for (unsigned long long lpn = lpn_start; lpn <= lpn_end; ++lpn) {
+		int rc = append_lpn_value(lpn, lpn_vec, lpn_count, lpn_cap);
+		if (rc != 0)
+			return rc;
+	}
+
+	return 0;
+}
+
+static int load_file_extents(const char *path, struct file_extent **extents_out,
+			     size_t *extent_count_out)
+{
+#if defined(__linux__) && defined(FS_IOC_FIEMAP)
+	int fd = -1;
+	struct fiemap *fm = NULL;
+	struct file_extent *extents = NULL;
+	size_t extent_count = 0;
+	uint32_t cap = 4096;
+	int rc = -1;
+
+	if (extents_out)
+		*extents_out = NULL;
+	if (extent_count_out)
+		*extent_count_out = 0;
+	if (!path || !*path)
+		return -EINVAL;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+
+	while (1) {
+		size_t bytes = sizeof(*fm) + (size_t)cap * sizeof(struct fiemap_extent);
+		bool done = false;
+
+		free(fm);
+		fm = calloc(1, bytes);
+		if (!fm) {
+			rc = -ENOMEM;
+			goto out;
+		}
+
+		fm->fm_start = 0;
+		fm->fm_length = ~0ULL;
+		fm->fm_flags = FIEMAP_FLAG_SYNC;
+		fm->fm_extent_count = cap;
+
+		if (ioctl(fd, FS_IOC_FIEMAP, fm) < 0) {
+			rc = -errno;
+			goto out;
+		}
+
+		extent_count = fm->fm_mapped_extents;
+		if (extent_count == 0) {
+			rc = 0;
+			goto out;
+		}
+
+		if (extent_count < cap)
+			done = true;
+		if (!done && (fm->fm_extents[extent_count - 1].fe_flags & FIEMAP_EXTENT_LAST))
+			done = true;
+
+		if (done)
+			break;
+
+		if (cap >= (1U << 20)) {
+			rc = -E2BIG;
+			goto out;
+		}
+		cap *= 2;
+	}
+
+	extents = calloc(extent_count, sizeof(*extents));
+	if (!extents) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	for (size_t i = 0; i < extent_count; ++i) {
+		extents[i].logical = fm->fm_extents[i].fe_logical;
+		extents[i].physical = fm->fm_extents[i].fe_physical;
+		extents[i].length = fm->fm_extents[i].fe_length;
+	}
+
+	if (extents_out)
+		*extents_out = extents;
+	else
+		free(extents);
+	extents = NULL;
+	if (extent_count_out)
+		*extent_count_out = extent_count;
+	rc = 0;
+
+out:
+	free(extents);
+	free(fm);
+	if (fd >= 0)
+		close(fd);
+	return rc;
+#else
+	(void)path;
+	if (extents_out)
+		*extents_out = NULL;
+	if (extent_count_out)
+		*extent_count_out = 0;
+	return -ENOTSUP;
+#endif
+}
+
+static int append_file_range_lpns(const struct file_extent *extents, size_t extent_count,
+				  size_t *cursor_io, unsigned long long file_byte_start,
+				  unsigned long long file_byte_end,
+				  unsigned long long host_page_bytes,
+				  unsigned long long **lpn_vec,
+				  size_t *lpn_count, size_t *lpn_cap)
+{
+	unsigned long long pos = file_byte_start;
+	size_t cursor;
+
+	if (!extents || extent_count == 0 || !cursor_io || !host_page_bytes)
+		return -EINVAL;
+
+	cursor = *cursor_io;
+	while (pos <= file_byte_end) {
+		while (cursor < extent_count) {
+			unsigned long long ex_end = extents[cursor].logical + extents[cursor].length;
+			if (ex_end <= pos)
+				cursor++;
+			else
+				break;
+		}
+
+		if (cursor >= extent_count)
+			return -ENOENT;
+		if (extents[cursor].logical > pos)
+			return -ENOENT;
+
+		unsigned long long local_off = pos - extents[cursor].logical;
+		unsigned long long ex_remain = extents[cursor].length - local_off;
+		unsigned long long need = file_byte_end - pos + 1ULL;
+		unsigned long long take = ex_remain < need ? ex_remain : need;
+		unsigned long long phys_start = extents[cursor].physical + local_off;
+		unsigned long long phys_end = phys_start + take - 1ULL;
+		unsigned long long lpn_start = phys_start / host_page_bytes;
+		unsigned long long lpn_end = phys_end / host_page_bytes;
+		int rc = append_lpn_range(lpn_start, lpn_end, lpn_vec, lpn_count, lpn_cap);
+		if (rc != 0)
+			return rc;
+
+		pos += take;
+	}
+
+	*cursor_io = cursor;
+	return 0;
+}
+
+static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *db,
 				const struct dataset_layout *layout,
 				const double *cold_per_table,
 				const struct page_tier_entry *tiers, size_t tier_count,
+				const struct access_count_entry *access_entries,
+				size_t access_entry_count,
 				unsigned long long host_page_bytes)
 {
 	FILE *fp = NULL;
 	sqlite3_stmt *stmt = NULL;
 	sqlite3_stmt *pragma_stmt = NULL;
+	struct file_extent *extents = NULL;
+	size_t extent_count = 0;
 	unsigned int page_size = 4096;
 	unsigned long long *lpn_vec = NULL;
+	unsigned long long *acc_vec = NULL;
 	size_t lpn_cap = 0;
+	size_t acc_cap = 0;
+	bool use_fiemap = false;
+	unsigned long long fiemap_fallback_pages = 0;
 	int rc;
 
-	if (!path || !*path || !db || !layout)
+	if (!path || !path[0] || !db_path || !db_path[0] || !db || !layout)
 		return 0;
 
 	if (host_page_bytes == 0)
@@ -1462,7 +1790,9 @@ static int write_table_tier_csv(const char *path, sqlite3 *db,
 	}
 
 	fprintf(fp,
-		"table_id,table_name,db_pages,distinct_ftl_lpn,slc_lpn,qlc_lpn,unknown_lpn,slc_ratio_known,cold_time_sec,cold_throughput_mb_s\n");
+		"table_id,table_name,db_pages,distinct_ftl_lpn,slc_lpn,qlc_lpn,unknown_lpn,"
+		"acc_mean,acc_p50,acc_p90,acc_p99,acc_max,acc_missing_lpn,"
+		"slc_ratio_known,cold_time_sec,cold_throughput_mb_s\n");
 
 	rc = sqlite3_prepare_v2(db, "PRAGMA page_size;", -1, &pragma_stmt, NULL);
 	if (rc == SQLITE_OK && sqlite3_step(pragma_stmt) == SQLITE_ROW) {
@@ -1473,9 +1803,19 @@ static int write_table_tier_csv(const char *path, sqlite3 *db,
 	if (pragma_stmt)
 		sqlite3_finalize(pragma_stmt);
 
-	rc = sqlite3_prepare_v2(db, "SELECT pageno FROM dbstat WHERE name = ?;", -1, &stmt, NULL);
+	rc = load_file_extents(db_path, &extents, &extent_count);
+	if (rc == 0 && extent_count > 0) {
+		use_fiemap = true;
+	} else {
+		fprintf(stderr,
+			"FIEMAP unavailable for %s (rc=%d), fallback to logical offset mapping\n",
+			db_path, rc);
+	}
+
+	rc = sqlite3_prepare_v2(db, "SELECT pageno FROM dbstat WHERE name = ? ORDER BY pageno;", -1, &stmt, NULL);
 	if (rc != SQLITE_OK) {
 		fprintf(stderr, "prepare dbstat failed: %s\n", sqlite3_errmsg(db));
+		free(extents);
 		fclose(fp);
 		return -1;
 	}
@@ -1483,10 +1823,18 @@ static int write_table_tier_csv(const char *path, sqlite3 *db,
 	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
 		char table_name[MAX_TABLE_NAME];
 		size_t lpn_count = 0;
+		size_t acc_count = 0;
+		size_t extent_cursor = 0;
 		unsigned long long db_pages = 0;
 		unsigned long long slc_lpn = 0;
 		unsigned long long qlc_lpn = 0;
 		unsigned long long unknown_lpn = 0;
+		unsigned long long acc_sum = 0;
+		unsigned long long acc_p50 = 0;
+		unsigned long long acc_p90 = 0;
+		unsigned long long acc_p99 = 0;
+		unsigned long long acc_max = 0;
+		unsigned long long acc_missing_lpn = 0;
 
 		build_table_name(table_name, sizeof(table_name), tbl);
 		sqlite3_reset(stmt);
@@ -1495,34 +1843,39 @@ static int write_table_tier_csv(const char *path, sqlite3 *db,
 
 		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
 			int pageno = sqlite3_column_int(stmt, 0);
-			unsigned long long byte_start;
-			unsigned long long byte_end;
+			unsigned long long file_byte_start;
+			unsigned long long file_byte_end;
 			unsigned long long lpn_start;
 			unsigned long long lpn_end;
+			int map_rc;
 
 			if (pageno <= 0)
 				continue;
 
 			db_pages++;
-			byte_start = (unsigned long long)(pageno - 1) * (unsigned long long)page_size;
-			byte_end = byte_start + (unsigned long long)page_size - 1ULL;
-			lpn_start = byte_start / host_page_bytes;
-			lpn_end = byte_end / host_page_bytes;
+			file_byte_start = (unsigned long long)(pageno - 1) * (unsigned long long)page_size;
+			file_byte_end = file_byte_start + (unsigned long long)page_size - 1ULL;
 
-			for (unsigned long long lpn = lpn_start; lpn <= lpn_end; ++lpn) {
-				if (lpn_count == lpn_cap) {
-					size_t new_cap = lpn_cap ? lpn_cap * 2 : 4096;
-					unsigned long long *tmp = realloc(lpn_vec, new_cap * sizeof(*lpn_vec));
-					if (!tmp) {
-						free(lpn_vec);
-						sqlite3_finalize(stmt);
-						fclose(fp);
-						return -ENOMEM;
-					}
-					lpn_vec = tmp;
-					lpn_cap = new_cap;
-				}
-				lpn_vec[lpn_count++] = lpn;
+			if (use_fiemap) {
+				map_rc = append_file_range_lpns(extents, extent_count, &extent_cursor,
+								file_byte_start, file_byte_end,
+								host_page_bytes,
+								&lpn_vec, &lpn_count, &lpn_cap);
+				if (map_rc == 0)
+					continue;
+
+				fiemap_fallback_pages++;
+			}
+
+			lpn_start = file_byte_start / host_page_bytes;
+			lpn_end = file_byte_end / host_page_bytes;
+			map_rc = append_lpn_range(lpn_start, lpn_end, &lpn_vec, &lpn_count, &lpn_cap);
+			if (map_rc != 0) {
+				free(lpn_vec);
+				sqlite3_finalize(stmt);
+				free(extents);
+				fclose(fp);
+				return map_rc;
 			}
 		}
 
@@ -1530,6 +1883,7 @@ static int write_table_tier_csv(const char *path, sqlite3 *db,
 			fprintf(stderr, "dbstat step failed for %s: %s\n", table_name, sqlite3_errmsg(db));
 			free(lpn_vec);
 			sqlite3_finalize(stmt);
+			free(extents);
 			fclose(fp);
 			return -1;
 		}
@@ -1544,8 +1898,23 @@ static int write_table_tier_csv(const char *path, sqlite3 *db,
 			lpn_count = unique;
 		}
 
+		if (lpn_count > acc_cap) {
+			unsigned long long *tmp = realloc(acc_vec, lpn_count * sizeof(*acc_vec));
+			if (!tmp) {
+				free(lpn_vec);
+				free(acc_vec);
+				sqlite3_finalize(stmt);
+				free(extents);
+				fclose(fp);
+				return -ENOMEM;
+			}
+			acc_vec = tmp;
+			acc_cap = lpn_count;
+		}
+
 		for (size_t i = 0; i < lpn_count; ++i) {
 			unsigned int in_slc = 0;
+			unsigned long long acc = 0;
 			if (tiers && tier_count > 0 && lookup_page_tier(tiers, tier_count, lpn_vec[i], &in_slc)) {
 				if (in_slc)
 					slc_lpn++;
@@ -1554,23 +1923,51 @@ static int write_table_tier_csv(const char *path, sqlite3 *db,
 			} else {
 				unknown_lpn++;
 			}
+
+			if (access_entries && access_entry_count > 0 &&
+			    lookup_access_count(access_entries, access_entry_count, lpn_vec[i], &acc)) {
+				/* value is set via lookup */
+			} else {
+				acc_missing_lpn++;
+				acc = 0;
+			}
+
+			acc_vec[acc_count++] = acc;
+			acc_sum += acc;
+		}
+
+		if (acc_count > 0) {
+			qsort(acc_vec, acc_count, sizeof(*acc_vec), cmp_u64_asc);
+			acc_p50 = percentile_u64_from_sorted(acc_vec, acc_count, 0.50);
+			acc_p90 = percentile_u64_from_sorted(acc_vec, acc_count, 0.90);
+			acc_p99 = percentile_u64_from_sorted(acc_vec, acc_count, 0.99);
+			acc_max = acc_vec[acc_count - 1];
 		}
 
 		double known = (double)(slc_lpn + qlc_lpn);
 		double slc_ratio = known > 0.0 ? (double)slc_lpn / known : 0.0;
+		double acc_mean = acc_count > 0 ? (double)acc_sum / (double)acc_count : 0.0;
 		double cold_time = cold_per_table ? cold_per_table[tbl] : 0.0;
 		double tbl_bytes_mb = (double)layout->rows_per_table[tbl] * ROW_PAYLOAD_BYTES /
 				      (1024.0 * 1024.0);
 		double cold_tp = cold_time > 0.0 ? tbl_bytes_mb / cold_time : 0.0;
 
-		fprintf(fp, "%u,%s,%llu,%zu,%llu,%llu,%llu,%.9f,%.9f,%.2f\n",
+		fprintf(fp, "%u,%s,%llu,%zu,%llu,%llu,%llu,%.9f,%llu,%llu,%llu,%llu,%llu,%.9f,%.9f,%.2f\n",
 			tbl, table_name, db_pages, lpn_count, slc_lpn, qlc_lpn, unknown_lpn,
+			acc_mean, acc_p50, acc_p90, acc_p99, acc_max, acc_missing_lpn,
 			slc_ratio, cold_time, cold_tp);
 	}
 
 	free(lpn_vec);
+	free(acc_vec);
 	sqlite3_finalize(stmt);
+	free(extents);
 	fclose(fp);
+	if (fiemap_fallback_pages > 0) {
+		fprintf(stderr,
+			"table_tier used logical fallback for %llu pages (fiemap gaps/errors)\n",
+			fiemap_fallback_pages);
+	}
 	return 0;
 }
 
@@ -1712,6 +2109,8 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	double *cold_per_table = NULL;
 	struct page_tier_entry *tier_entries = NULL;
 	size_t tier_entry_count = 0;
+	struct access_count_entry *access_entries = NULL;
+	size_t access_entry_count = 0;
 	unsigned int *heat = NULL;
 	bool txn_active = false;
 	int rc = -1;
@@ -1880,13 +2279,21 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		tier_entries = NULL;
 		tier_entry_count = 0;
 	}
-	if (write_table_tier_csv(table_tier_path, db, layout, cold_per_table,
+	if (load_access_count_entries(opts->access_count_path,
+				      &access_entries, &access_entry_count) != 0) {
+		fprintf(stderr, "Failed to load access count map %s, continue without acc stats\n",
+			opts->access_count_path ? opts->access_count_path : "(null)");
+		access_entries = NULL;
+		access_entry_count = 0;
+	}
+	if (write_table_tier_csv(table_tier_path, db_path, db, layout, cold_per_table,
 				 tier_entries, tier_entry_count,
+				 access_entries, access_entry_count,
 				 opts->ftl_host_page_bytes) != 0) {
 		fprintf(stderr, "Failed to write table tier stats %s\n", table_tier_path);
 	} else {
-		printf("[sqlite_init] table_tier=%s page_tier_entries=%zu\n",
-		       table_tier_path, tier_entry_count);
+		printf("[sqlite_init] table_tier=%s page_tier_entries=%zu access_entries=%zu\n",
+		       table_tier_path, tier_entry_count, access_entry_count);
 	}
 
 	report_cold_tail_latency(layout, tables, table_latency, table_read_ops);
@@ -1920,7 +2327,8 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 
 out:
 	if (heat)
-	free(heat);
+		free(heat);
+	free(access_entries);
 	free(tier_entries);
 	free(cold_per_table);
 	free(read_plan);
@@ -2620,9 +3028,10 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->reads_explicit = false;
 	opts->interleave_rows = DEFAULT_INTERLEAVE_ROWS;
 	opts->init_reads_per_event = DEFAULT_READS_PER_EVENT;
-	opts->strict_cold_per_select = false;
+	opts->strict_cold_per_select = true;
 	opts->page_tier_path = DEFAULT_PAGE_TIER_PATH;
 	opts->ftl_host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
+	opts->access_count_path = DEFAULT_ACCESS_COUNT_PATH;
 
 	while ((c = getopt_long(argc, argv, "m:d:r:a:l:s:o:H:M:S:Uh", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -2734,6 +3143,9 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			opts->ftl_host_page_bytes = parse_size_arg(optarg);
 			if (opts->ftl_host_page_bytes == 0)
 				opts->ftl_host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
+			break;
+		case 1017:
+			opts->access_count_path = optarg;
 			break;
 		case 'h':
 		default:
