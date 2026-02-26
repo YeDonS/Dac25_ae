@@ -3503,31 +3503,36 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 				if (!is_slc_block(conv_ftl, cur_ppa.g.blk) && has_avg &&
 				    ht && ht->access_count) {
 					uint64_t access_cnt = ht->access_count[local_lpn];
+					uint64_t promote_th = avg_reads + (avg_reads >> 1);
 
-				if (access_cnt > avg_reads) {
-					uint64_t migration_done = 0;
-					uint64_t mig_start = ktime_get_ns();
-					NVMEV_DEBUG("[REPROMOTION_VERIFY] Hot LPN %llu (Acc:%llu > Avg:%llu) triggering QLC->SLC migration\n", 
-							                               local_lpn, access_cnt, avg_reads);
+					/* Saturate in case avg_reads + avg_reads/2 overflows. */
+					if (promote_th < avg_reads)
+						promote_th = ~0ULL;
 
-					migrate_page_to_slc(conv_ftl, local_lpn, &cur_ppa,
-							    &migration_done);
-					cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
-					conv_ftl->migration_read_path_time_ns +=
-						ktime_get_ns() - mig_start;
-					NVMEV_DEBUG("[REPROMOTION_VERIFY] LPN %llu Promoted. Extra Latency: %llu ns\n", 
-							                               local_lpn,ktime_get_ns() - mig_start);
-					conv_ftl->migration_read_path_count++;
-					if (migration_done)
-						nsecs_latest = max(nsecs_latest, migration_done);
+					if (access_cnt > promote_th) {
+						uint64_t migration_done = 0;
+						uint64_t mig_start = ktime_get_ns();
+						NVMEV_DEBUG("[REPROMOTION_VERIFY] Hot LPN %llu (Acc:%llu > 1.5xAvg:%llu) triggering QLC->SLC migration\n",
+							    local_lpn, access_cnt, promote_th);
 
-					printk_ratelimited(KERN_INFO
-						"[COLD_MIG_PROBE] mig lpn=%llu acc=%llu avg=%llu mig_sim_done=%llu rd_sim_start=%llu wall_ns=%llu total_mig=%llu\n",
-						local_lpn, access_cnt, avg_reads,
-						migration_done,
-						nsecs_start,
-						(uint64_t)(ktime_get_ns() - mig_start),
-						conv_ftl->migration_read_path_count);
+						migrate_page_to_slc(conv_ftl, local_lpn, &cur_ppa,
+								    &migration_done);
+						cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
+						conv_ftl->migration_read_path_time_ns +=
+							ktime_get_ns() - mig_start;
+						NVMEV_DEBUG("[REPROMOTION_VERIFY] LPN %llu Promoted. Extra Latency: %llu ns\n",
+							    local_lpn, ktime_get_ns() - mig_start);
+						conv_ftl->migration_read_path_count++;
+						if (migration_done)
+							nsecs_latest = max(nsecs_latest, migration_done);
+
+						printk_ratelimited(KERN_INFO
+							"[COLD_MIG_PROBE] mig lpn=%llu acc=%llu th=%llu avg=%llu mig_sim_done=%llu rd_sim_start=%llu wall_ns=%llu total_mig=%llu\n",
+							local_lpn, access_cnt, promote_th, avg_reads,
+							migration_done,
+							nsecs_start,
+							(uint64_t)(ktime_get_ns() - mig_start),
+							conv_ftl->migration_read_path_count);
 					}
 				}
 

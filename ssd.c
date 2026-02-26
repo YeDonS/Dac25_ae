@@ -527,6 +527,10 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 
     int c = ncmd->cmd;
     uint64_t cmd_stime = (ncmd->stime == 0) ? safe_now : ncmd->stime;
+
+    /* Skip NAND latency entirely for GC/migration I/O */
+    if (ncmd->type == GC_IO)
+        return cmd_stime;
 	uint64_t nand_stime, nand_etime;
 	uint64_t chnl_stime, chnl_etime;
 	uint64_t remaining, xfer_size, completed_time;

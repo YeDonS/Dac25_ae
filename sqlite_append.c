@@ -107,6 +107,7 @@ static const struct option long_opts[] = {
 	{"page-tier-path", required_argument, NULL, 1015},
 	{"ftl-host-page-bytes", required_argument, NULL, 1016},
 	{"access-count-path", required_argument, NULL, 1017},
+	{"direct-io", no_argument, NULL, 1018},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -163,6 +164,7 @@ struct workload_options {
 	const char *page_tier_path;
 	unsigned long long ftl_host_page_bytes;
 	const char *access_count_path;
+	bool direct_io;
 };
 
 struct zipf_sampler {
@@ -282,6 +284,219 @@ static void drop_page_cache(void)
 	fclose(fp);
 }
 
+/* ================================================================
+ * O_DIRECT VFS wrapper — bypasses OS page cache so every read()
+ * reaches the block device (NVMeVirt FTL), making access_count
+ * accurately reflect the application-level Zipf heat pattern.
+ * ================================================================ */
+
+#define DIO_VFS_NAME "direct_io"
+#define DIO_ALIGN    4096
+
+struct dio_file {
+	sqlite3_file base;
+	sqlite3_file *pBase;
+	sqlite3_io_methods io;
+	int direct_fd;
+};
+
+static sqlite3_vfs g_dio_vfs;
+
+/* ---------- io_methods delegates ---------- */
+
+static int dio_close(sqlite3_file *f)
+{
+	struct dio_file *p = (struct dio_file *)f;
+	int rc;
+
+	if (p->direct_fd >= 0) {
+		close(p->direct_fd);
+		p->direct_fd = -1;
+	}
+	rc = p->pBase->pMethods->xClose(p->pBase);
+	p->base.pMethods = NULL;
+	return rc;
+}
+
+static int dio_read(sqlite3_file *f, void *zBuf, int iAmt, sqlite3_int64 iOfst)
+{
+	struct dio_file *p = (struct dio_file *)f;
+	void *abuf;
+	ssize_t n;
+	sqlite3_int64 aligned_start;
+	size_t aligned_len, skip, avail;
+
+	if (p->direct_fd < 0 || iAmt <= 0)
+		goto fallback;
+
+	aligned_start = iOfst & ~((sqlite3_int64)(DIO_ALIGN - 1));
+	skip = (size_t)(iOfst - aligned_start);
+	aligned_len = ((skip + (size_t)iAmt + DIO_ALIGN - 1) / DIO_ALIGN) * DIO_ALIGN;
+
+	if (posix_memalign(&abuf, DIO_ALIGN, aligned_len) != 0)
+		goto fallback;
+
+	n = pread(p->direct_fd, abuf, aligned_len, (off_t)aligned_start);
+	if (n < 0) {
+		free(abuf);
+		goto fallback;
+	}
+	if ((size_t)n < skip + (size_t)iAmt) {
+		avail = (size_t)n > skip ? (size_t)n - skip : 0;
+		if (avail > 0)
+			memcpy(zBuf, (char *)abuf + skip, avail);
+		memset((char *)zBuf + avail, 0, (size_t)iAmt - avail);
+		free(abuf);
+		return SQLITE_IOERR_SHORT_READ;
+	}
+
+	memcpy(zBuf, (char *)abuf + skip, (size_t)iAmt);
+	free(abuf);
+	return SQLITE_OK;
+
+fallback:
+	return p->pBase->pMethods->xRead(p->pBase, zBuf, iAmt, iOfst);
+}
+
+static int dio_write(sqlite3_file *f, const void *b, int n, sqlite3_int64 o)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xWrite(p->pBase, b, n, o); }
+
+static int dio_truncate(sqlite3_file *f, sqlite3_int64 s)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xTruncate(p->pBase, s); }
+
+static int dio_sync(sqlite3_file *f, int fl)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xSync(p->pBase, fl); }
+
+static int dio_file_size(sqlite3_file *f, sqlite3_int64 *ps)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xFileSize(p->pBase, ps); }
+
+static int dio_lock(sqlite3_file *f, int lv)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xLock(p->pBase, lv); }
+
+static int dio_unlock(sqlite3_file *f, int lv)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xUnlock(p->pBase, lv); }
+
+static int dio_check_reserved(sqlite3_file *f, int *pr)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xCheckReservedLock(p->pBase, pr); }
+
+static int dio_file_control(sqlite3_file *f, int op, void *pa)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xFileControl(p->pBase, op, pa); }
+
+static int dio_sector_size(sqlite3_file *f)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xSectorSize(p->pBase); }
+
+static int dio_device_chars(sqlite3_file *f)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xDeviceCharacteristics(p->pBase); }
+
+static int dio_shm_map(sqlite3_file *f, int pg, int sz, int ext, void volatile **pp)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xShmMap(p->pBase, pg, sz, ext, pp); }
+
+static int dio_shm_lock(sqlite3_file *f, int off, int n, int fl)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xShmLock(p->pBase, off, n, fl); }
+
+static void dio_shm_barrier(sqlite3_file *f)
+{ struct dio_file *p = (struct dio_file *)f; p->pBase->pMethods->xShmBarrier(p->pBase); }
+
+static int dio_shm_unmap(sqlite3_file *f, int del)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xShmUnmap(p->pBase, del); }
+
+static int dio_fetch(sqlite3_file *f, sqlite3_int64 ofst, int amt, void **pp)
+{
+	struct dio_file *p = (struct dio_file *)f;
+	if (p->direct_fd >= 0) {
+		*pp = NULL;
+		return SQLITE_OK;
+	}
+	return p->pBase->pMethods->xFetch(p->pBase, ofst, amt, pp);
+}
+
+static int dio_unfetch(sqlite3_file *f, sqlite3_int64 ofst, void *ptr)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xUnfetch(p->pBase, ofst, ptr); }
+
+/* ---------- VFS xOpen ---------- */
+
+static int dio_open(sqlite3_vfs *pVfs, const char *zName, sqlite3_file *pFile,
+		    int flags, int *pOutFlags)
+{
+	struct dio_file *p = (struct dio_file *)pFile;
+	sqlite3_vfs *pOrig = (sqlite3_vfs *)pVfs->pAppData;
+	const sqlite3_io_methods *base_m;
+	int rc;
+
+	memset(p, 0, sizeof(*p));
+	p->pBase = (sqlite3_file *)((char *)p + sizeof(struct dio_file));
+	p->direct_fd = -1;
+
+	rc = pOrig->xOpen(pOrig, zName, p->pBase, flags, pOutFlags);
+	if (rc != SQLITE_OK) {
+		p->base.pMethods = NULL;
+		return rc;
+	}
+
+	base_m = p->pBase->pMethods;
+	if (!base_m) {
+		p->base.pMethods = NULL;
+		return SQLITE_OK;
+	}
+
+	memset(&p->io, 0, sizeof(p->io));
+	p->io.iVersion    = base_m->iVersion;
+	p->io.xClose      = dio_close;
+	p->io.xRead       = dio_read;
+	p->io.xWrite      = dio_write;
+	p->io.xTruncate   = dio_truncate;
+	p->io.xSync       = dio_sync;
+	p->io.xFileSize   = dio_file_size;
+	p->io.xLock       = dio_lock;
+	p->io.xUnlock     = dio_unlock;
+	p->io.xCheckReservedLock = dio_check_reserved;
+	p->io.xFileControl       = dio_file_control;
+	p->io.xSectorSize        = dio_sector_size;
+	p->io.xDeviceCharacteristics = dio_device_chars;
+	if (base_m->iVersion >= 2) {
+		p->io.xShmMap     = dio_shm_map;
+		p->io.xShmLock    = dio_shm_lock;
+		p->io.xShmBarrier = dio_shm_barrier;
+		p->io.xShmUnmap   = dio_shm_unmap;
+	}
+	if (base_m->iVersion >= 3) {
+		p->io.xFetch   = dio_fetch;
+		p->io.xUnfetch = dio_unfetch;
+	}
+	p->base.pMethods = &p->io;
+
+	if (zName && (flags & SQLITE_OPEN_MAIN_DB)) {
+		p->direct_fd = open(zName, O_RDONLY | O_DIRECT | O_CLOEXEC);
+		if (p->direct_fd < 0)
+			fprintf(stderr, "[dio] O_DIRECT open failed for %s: %s (reads fall back to buffered)\n",
+				zName, strerror(errno));
+		else
+			fprintf(stderr, "[dio] O_DIRECT enabled for %s (fd=%d)\n", zName, p->direct_fd);
+	}
+
+	return SQLITE_OK;
+}
+
+static int register_dio_vfs(void)
+{
+	sqlite3_vfs *pBase = sqlite3_vfs_find(NULL);
+
+	if (!pBase) {
+		fprintf(stderr, "[dio] no default VFS found\n");
+		return -1;
+	}
+
+	memcpy(&g_dio_vfs, pBase, sizeof(sqlite3_vfs));
+	g_dio_vfs.zName     = DIO_VFS_NAME;
+	g_dio_vfs.szOsFile  = (int)(sizeof(struct dio_file) + pBase->szOsFile);
+	g_dio_vfs.xOpen     = dio_open;
+	g_dio_vfs.pAppData  = pBase;
+
+	return sqlite3_vfs_register(&g_dio_vfs, 0);
+}
+
+/* ================================================================ */
+
 static unsigned int next_rand(unsigned int *state)
 {
 	return rand_r(state);
@@ -299,7 +514,7 @@ static void usage(const char *prog)
 		"  %s --mode init [--table-count N] [--rows-per-table N]\n"
 		"                 [--target-bytes SZ] [--reads N]\n"
 		"                 [--interleave-rows N] [--interleave-reads N]\n"
-		"                 [--strict-cold-per-select]\n"
+		"                 [--strict-cold-per-select] [--direct-io]\n"
 		"                 [--page-tier-path PATH] [--ftl-host-page-bytes N]\n"
 		"                 [--access-count-path PATH]\n"
 		"                 [--zipf-seed S] [--exp-seed S] [--normal-seed S]\n"
@@ -2124,7 +2339,15 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	build_db_path(db_path, sizeof(db_path), opts);
 	unlink(db_path);
 
-	rc = sqlite3_open(db_path, &db);
+	if (opts->direct_io && register_dio_vfs() == 0) {
+		rc = sqlite3_open_v2(db_path, &db,
+				     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+				     DIO_VFS_NAME);
+	} else {
+		if (opts->direct_io)
+			fprintf(stderr, "[dio] VFS registration failed, falling back to buffered I/O\n");
+		rc = sqlite3_open(db_path, &db);
+	}
 	if (rc != SQLITE_OK) {
 		fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
 		return -1;
@@ -2163,9 +2386,10 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	active_count = table_count;
 
 	printf("[sqlite_init] config tables=%u total_rows=%llu row_pages=%u interleave_rows=%u "
-	       "read_ops_per_event=%u strict_cold_per_select=%u\n",
+	       "read_ops_per_event=%u strict_cold_per_select=%u direct_io=%u\n",
 	       table_count, total_rows, (unsigned int)LPN_PER_ROW, interleave_rows,
-	       reads_per_event, opts->strict_cold_per_select ? 1U : 0U);
+	       reads_per_event, opts->strict_cold_per_select ? 1U : 0U,
+	       opts->direct_io ? 1U : 0U);
 
 	rc = build_table_read_plan(layout, opts, reads_per_event, &read_plan);
 	if (rc != 0)
@@ -2230,11 +2454,13 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 				sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 			txn_active = false;
 			rows_since_commit = 0;
-			drop_dataset_cache(db, db_path);
+			if (!opts->direct_io)
+				drop_dataset_cache(db, db_path);
 
 			read_events++;
 			rc = run_read_event(read_events, layout, tables, table_count,
-					    db, db_path, opts->strict_cold_per_select,
+					    db, db_path,
+					    opts->direct_io ? false : opts->strict_cold_per_select,
 					    read_plan,
 					    table_latency, table_read_ops, &event_elapsed);
 			if (rc != 0)
@@ -3032,6 +3258,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->page_tier_path = DEFAULT_PAGE_TIER_PATH;
 	opts->ftl_host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
 	opts->access_count_path = DEFAULT_ACCESS_COUNT_PATH;
+	opts->direct_io = false;
 
 	while ((c = getopt_long(argc, argv, "m:d:r:a:l:s:o:H:M:S:Uh", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -3146,6 +3373,9 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			break;
 		case 1017:
 			opts->access_count_path = optarg;
+			break;
+		case 1018:
+			opts->direct_io = true;
 			break;
 		case 'h':
 		default:
