@@ -141,6 +141,14 @@ struct conv_ftl {
 	uint64_t global_valid_pg_cnt;     /* 全局有效页总数 */
 	uint64_t migration_read_path_count;    /* 读路径触发迁移次数 */
 	uint64_t migration_read_path_time_ns;  /* 读路径迁移耗时累计 */
+	uint64_t qlc_promote_cursor;      /* QLC 内部 slow->fast 扫描游标 */
+	uint64_t qlc_demote_cursor;       /* QLC 内部 fast->slow 扫描游标 */
+	uint32_t qlc_rebalance_period_writes;  /* 每多少次主机写触发一次内部重平衡 */
+	uint32_t qlc_rebalance_promote_budget; /* 每轮 slow->fast 预算页数 */
+	uint32_t qlc_rebalance_demote_budget;  /* 每轮 fast->slow 预算页数 */
+	bool qlc_fast_drain_active;            /* 快区超过高水位后持续降温到目标水位 */
+	uint64_t qlc_fast_count;              /* 当前在 fast zone (L/CL) 的 QLC 页数 */
+	uint64_t qlc_slow_count;              /* 当前在 slow zone (U/CU) 的 QLC 页数 */
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */

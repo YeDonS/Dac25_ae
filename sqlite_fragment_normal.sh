@@ -8,7 +8,7 @@ source commonvariables.sh
 SRC_PATH="sqlite"
 
 if [[ ! -f ./sqlite_append ]] || [[ $FORCE_REBUILD == 1 ]]; then
-    gcc -D TARGET_FOLDER="\"$TARGET_FOLDER\"" -D RESULT_FOLDER="\"$RESULT_FOLDER\"" -o ./sqlite_append ./$SRC_PATH/sqlite_append.c -lsqlite3 -lm
+    gcc -D_GNU_SOURCE -D TARGET_FOLDER="\"$TARGET_FOLDER\"" -D RESULT_FOLDER="\"$RESULT_FOLDER\"" -o ./sqlite_append ./$SRC_PATH/sqlite_append.c -lsqlite3 -lm
 fi
 
 ZIPF_ALPHA=${ZIPF_ALPHA:-1.2}
@@ -29,6 +29,7 @@ SQLITE_STRICT_COLD_PER_SELECT=${SQLITE_STRICT_COLD_PER_SELECT:-1}
 SQLITE_PAGE_TIER_PATH=${SQLITE_PAGE_TIER_PATH:-/sys/kernel/debug/nvmev/ftl0/page_tier}
 SQLITE_ACCESS_COUNT_PATH=${SQLITE_ACCESS_COUNT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_count}
 SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
+SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
 
 mkdir -p "$RESULT_FOLDER"
 mkdir -p "$TARGET_FOLDER"
@@ -48,6 +49,9 @@ run_normal_suite() {
 
     if [[ "$SQLITE_STRICT_COLD_PER_SELECT" == "1" ]]; then
         strict_args+=(--strict-cold-per-select)
+    fi
+    if [[ "$SQLITE_DIRECT_IO" == "1" ]]; then
+        strict_args+=(--direct-io)
     fi
 
     ./nvmevstart_on.sh
