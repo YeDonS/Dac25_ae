@@ -29,7 +29,7 @@ SQLITE_STRICT_COLD_PER_SELECT=${SQLITE_STRICT_COLD_PER_SELECT:-1}
 SQLITE_PAGE_TIER_PATH=${SQLITE_PAGE_TIER_PATH:-/sys/kernel/debug/nvmev/ftl0/page_tier}
 SQLITE_ACCESS_COUNT_PATH=${SQLITE_ACCESS_COUNT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_count}
 SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
-SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
+SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-0}
 
 mkdir -p "$RESULT_FOLDER"
 mkdir -p "$TARGET_FOLDER"
@@ -59,6 +59,9 @@ run_exp_suite() {
     lsblk
     source setdevice.sh
     mkdir -p "$trace_dir"
+
+    echo 0 | sudo tee /sys/block/${DATA_NAME}/queue/read_ahead_kb >/dev/null 2>&1 || true
+    echo "[readahead] set /sys/block/${DATA_NAME}/queue/read_ahead_kb = $(cat /sys/block/${DATA_NAME}/queue/read_ahead_kb 2>/dev/null || echo N/A)"
 
     drop_caches
     numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append --mode init \

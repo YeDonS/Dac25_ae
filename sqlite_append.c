@@ -272,9 +272,10 @@ static double monotonic_sec(void)
 
 static void drop_page_cache(void)
 {
-	int rc = system("sync");
-	(void)rc;
-	FILE *fp = fopen("/proc/sys/vm/drop_caches", "w");
+	FILE *fp;
+
+	sync();
+	fp = fopen("/proc/sys/vm/drop_caches", "w");
 	if (!fp) {
 		perror("drop_caches");
 		return;
@@ -282,6 +283,23 @@ static void drop_page_cache(void)
 	if (fputs("3\n", fp) < 0)
 		perror("drop_caches write");
 	fclose(fp);
+}
+
+static void disable_file_readahead(const char *path)
+{
+#if defined(__linux__)
+	int fd;
+
+	if (!path || !*path)
+		return;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return;
+	posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+	close(fd);
+#else
+	(void)path;
+#endif
 }
 
 /* ================================================================
@@ -298,6 +316,8 @@ struct dio_file {
 	sqlite3_file *pBase;
 	sqlite3_io_methods io;
 	int direct_fd;
+	void *aligned_buf;
+	size_t aligned_buf_sz;
 };
 
 static sqlite3_vfs g_dio_vfs;
@@ -313,6 +333,9 @@ static int dio_close(sqlite3_file *f)
 		close(p->direct_fd);
 		p->direct_fd = -1;
 	}
+	free(p->aligned_buf);
+	p->aligned_buf = NULL;
+	p->aligned_buf_sz = 0;
 	rc = p->pBase->pMethods->xClose(p->pBase);
 	p->base.pMethods = NULL;
 	return rc;
@@ -321,7 +344,8 @@ static int dio_close(sqlite3_file *f)
 static int dio_read(sqlite3_file *f, void *zBuf, int iAmt, sqlite3_int64 iOfst)
 {
 	struct dio_file *p = (struct dio_file *)f;
-	void *abuf;
+	void *abuf = NULL;
+	bool need_free = false;
 	ssize_t n;
 	sqlite3_int64 aligned_start;
 	size_t aligned_len, skip, avail;
@@ -333,12 +357,17 @@ static int dio_read(sqlite3_file *f, void *zBuf, int iAmt, sqlite3_int64 iOfst)
 	skip = (size_t)(iOfst - aligned_start);
 	aligned_len = ((skip + (size_t)iAmt + DIO_ALIGN - 1) / DIO_ALIGN) * DIO_ALIGN;
 
-	if (posix_memalign(&abuf, DIO_ALIGN, aligned_len) != 0)
-		goto fallback;
+	if (p->aligned_buf && aligned_len <= p->aligned_buf_sz) {
+		abuf = p->aligned_buf;
+	} else {
+		if (posix_memalign(&abuf, DIO_ALIGN, aligned_len) != 0)
+			goto fallback;
+		need_free = true;
+	}
 
 	n = pread(p->direct_fd, abuf, aligned_len, (off_t)aligned_start);
 	if (n < 0) {
-		free(abuf);
+		if (need_free) free(abuf);
 		goto fallback;
 	}
 	if ((size_t)n < skip + (size_t)iAmt) {
@@ -346,12 +375,12 @@ static int dio_read(sqlite3_file *f, void *zBuf, int iAmt, sqlite3_int64 iOfst)
 		if (avail > 0)
 			memcpy(zBuf, (char *)abuf + skip, avail);
 		memset((char *)zBuf + avail, 0, (size_t)iAmt - avail);
-		free(abuf);
+		if (need_free) free(abuf);
 		return SQLITE_IOERR_SHORT_READ;
 	}
 
 	memcpy(zBuf, (char *)abuf + skip, (size_t)iAmt);
-	free(abuf);
+	if (need_free) free(abuf);
 	return SQLITE_OK;
 
 fallback:
@@ -467,11 +496,17 @@ static int dio_open(sqlite3_vfs *pVfs, const char *zName, sqlite3_file *pFile,
 
 	if (zName && (flags & SQLITE_OPEN_MAIN_DB)) {
 		p->direct_fd = open(zName, O_RDONLY | O_DIRECT | O_CLOEXEC);
-		if (p->direct_fd < 0)
+		if (p->direct_fd < 0) {
 			fprintf(stderr, "[dio] O_DIRECT open failed for %s: %s (reads fall back to buffered)\n",
 				zName, strerror(errno));
-		else
+		} else {
 			fprintf(stderr, "[dio] O_DIRECT enabled for %s (fd=%d)\n", zName, p->direct_fd);
+			p->aligned_buf_sz = DIO_ALIGN;
+			if (posix_memalign(&p->aligned_buf, DIO_ALIGN, p->aligned_buf_sz) != 0) {
+				p->aligned_buf = NULL;
+				p->aligned_buf_sz = 0;
+			}
+		}
 	}
 
 	return SQLITE_OK;
@@ -2264,7 +2299,10 @@ static void drop_dataset_cache(sqlite3 *db, const char *db_path)
 		if (rc != SQLITE_OK)
 			fprintf(stderr, "sqlite3_db_cacheflush failed: %s\n", sqlite3_errstr(rc));
 		sqlite3_db_release_memory(db);
+		sqlite3_exec(db, "PRAGMA shrink_memory;", NULL, NULL, NULL);
 	}
+
+	drop_page_cache();
 
 	if (!db_path || !db_path[0])
 		return;
@@ -2276,11 +2314,8 @@ static void drop_dataset_cache(sqlite3 *db, const char *db_path)
 	}
 
 #if defined(__linux__)
-	int err = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-	if (err != 0) {
-		errno = err;
-		perror("posix_fadvise");
-	}
+	posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+	posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 #elif defined(F_NOCACHE)
 	int flag = 1;
 	if (fcntl(fd, F_NOCACHE, &flag) == -1)
@@ -2364,6 +2399,8 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		fprintf(stderr, "synchronous pragma failed\n");
 		goto out;
 	}
+
+	disable_file_readahead(db_path);
 
 	rc = prepare_table_states(db, layout, opts, &tables, &total_rows);
 	if (rc != 0)
