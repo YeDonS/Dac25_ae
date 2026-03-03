@@ -748,9 +748,16 @@ static int page_tier_show(struct seq_file *m, void *v)
 	spp = &conv_ftl->ssd->sp;
 	for (lpn = 0; lpn < spp->tt_pgs; lpn++) {
 		struct ppa ppa = get_maptbl_ent(conv_ftl, lpn);
+		bool in_slc;
 		if (!mapped_ppa(&ppa) || !valid_ppa(conv_ftl, &ppa))
 			continue;
-		seq_printf(m, "%llu %u\n", lpn, conv_ftl->page_in_slc[lpn] ? 1 : 0);
+
+		in_slc = conv_ftl->page_in_slc[lpn] || is_slc_block(conv_ftl, ppa.g.blk);
+		if (in_slc)
+			seq_printf(m, "%llu 1 -1\n", lpn);
+		else
+			seq_printf(m, "%llu 0 %u\n", lpn,
+				   (unsigned int)get_qlc_zone_for_read(conv_ftl, &ppa));
 	}
 
 	return 0;

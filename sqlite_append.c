@@ -74,6 +74,7 @@
 #define DEFAULT_INTERLEAVE_ROWS  1000U
 #define DEFAULT_READS_PER_EVENT  1000U
 #define DEFAULT_COLD_SCAN_ITERS  3U
+#define PAGE_TIER_ZONE_COUNT     4U
 
 typedef unsigned int UINT32;
 
@@ -209,6 +210,8 @@ struct table_state {
 struct page_tier_entry {
 	unsigned long long lpn;
 	unsigned int in_slc;
+	unsigned int qlc_zone;
+	unsigned int qlc_zone_known;
 };
 
 struct file_extent {
@@ -321,6 +324,8 @@ struct dio_file {
 };
 
 static sqlite3_vfs g_dio_vfs;
+static unsigned int g_dio_maindb_open_ok;
+static unsigned int g_dio_maindb_open_fail;
 
 /* ---------- io_methods delegates ---------- */
 
@@ -497,9 +502,11 @@ static int dio_open(sqlite3_vfs *pVfs, const char *zName, sqlite3_file *pFile,
 	if (zName && (flags & SQLITE_OPEN_MAIN_DB)) {
 		p->direct_fd = open(zName, O_RDONLY | O_DIRECT | O_CLOEXEC);
 		if (p->direct_fd < 0) {
+			g_dio_maindb_open_fail++;
 			fprintf(stderr, "[dio] O_DIRECT open failed for %s: %s (reads fall back to buffered)\n",
 				zName, strerror(errno));
 		} else {
+			g_dio_maindb_open_ok++;
 			fprintf(stderr, "[dio] O_DIRECT enabled for %s (fd=%d)\n", zName, p->direct_fd);
 			p->aligned_buf_sz = DIO_ALIGN;
 			if (posix_memalign(&p->aligned_buf, DIO_ALIGN, p->aligned_buf_sz) != 0) {
@@ -526,6 +533,8 @@ static int register_dio_vfs(void)
 	g_dio_vfs.szOsFile  = (int)(sizeof(struct dio_file) + pBase->szOsFile);
 	g_dio_vfs.xOpen     = dio_open;
 	g_dio_vfs.pAppData  = pBase;
+	g_dio_maindb_open_ok = 0;
+	g_dio_maindb_open_fail = 0;
 
 	return sqlite3_vfs_register(&g_dio_vfs, 0);
 }
@@ -604,6 +613,11 @@ static int cmp_u64_asc(const void *a, const void *b)
 	if (ua > ub)
 		return 1;
 	return 0;
+}
+
+static bool page_tier_zone_is_fast(unsigned int zone)
+{
+	return zone == 0U || zone == 1U;
 }
 
 static int cmp_tier_entry_lpn(const void *a, const void *b)
@@ -1651,9 +1665,13 @@ static int load_page_tier_entries(const char *path, struct page_tier_entry **ent
 	while (fgets(line, sizeof(line), fp)) {
 		unsigned long long lpn;
 		unsigned int in_slc;
+		int qlc_zone = -1;
+		int scanned;
 		struct page_tier_entry *tmp;
 
-		if (sscanf(line, "%llu %u", &lpn, &in_slc) != 2)
+		/* Backward compatible: accept both "lpn in_slc" and "lpn in_slc qlc_zone". */
+		scanned = sscanf(line, "%llu %u %d", &lpn, &in_slc, &qlc_zone);
+		if (scanned < 2)
 			continue;
 
 		if (count == cap) {
@@ -1670,6 +1688,13 @@ static int load_page_tier_entries(const char *path, struct page_tier_entry **ent
 
 		entries[count].lpn = lpn;
 		entries[count].in_slc = in_slc ? 1U : 0U;
+		if (scanned >= 3 && qlc_zone >= 0 && qlc_zone < (int)PAGE_TIER_ZONE_COUNT) {
+			entries[count].qlc_zone = (unsigned int)qlc_zone;
+			entries[count].qlc_zone_known = 1U;
+		} else {
+			entries[count].qlc_zone = 0U;
+			entries[count].qlc_zone_known = 0U;
+		}
 		count++;
 	}
 
@@ -1698,7 +1723,8 @@ static int load_page_tier_entries(const char *path, struct page_tier_entry **ent
 }
 
 static bool lookup_page_tier(const struct page_tier_entry *entries, size_t count,
-			     unsigned long long lpn, unsigned int *in_slc_out)
+			     unsigned long long lpn, unsigned int *in_slc_out,
+			     unsigned int *qlc_zone_out, bool *qlc_zone_known_out)
 {
 	size_t lo = 0;
 	size_t hi = count;
@@ -1715,6 +1741,10 @@ static bool lookup_page_tier(const struct page_tier_entry *entries, size_t count
 		return false;
 	if (in_slc_out)
 		*in_slc_out = entries[lo].in_slc;
+	if (qlc_zone_out)
+		*qlc_zone_out = entries[lo].qlc_zone;
+	if (qlc_zone_known_out)
+		*qlc_zone_known_out = entries[lo].qlc_zone_known ? true : false;
 	return true;
 }
 
@@ -2040,9 +2070,11 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 	}
 
 	fprintf(fp,
-		"table_id,table_name,db_pages,distinct_ftl_lpn,slc_lpn,qlc_lpn,unknown_lpn,"
+		"table_id,table_name,db_pages,distinct_ftl_lpn,slc_lpn,qlc_lpn,"
+		"qlc_fast_lpn,qlc_slow_lpn,qlc_zone_unknown_lpn,unknown_lpn,"
 		"acc_mean,acc_p50,acc_p90,acc_p99,acc_max,acc_missing_lpn,"
-		"slc_ratio_known,cold_time_sec,cold_throughput_mb_s\n");
+		"slc_ratio_known,qlc_fast_ratio_known,qlc_slow_ratio_known,"
+		"cold_time_sec,cold_throughput_mb_s\n");
 
 	rc = sqlite3_prepare_v2(db, "PRAGMA page_size;", -1, &pragma_stmt, NULL);
 	if (rc == SQLITE_OK && sqlite3_step(pragma_stmt) == SQLITE_ROW) {
@@ -2078,6 +2110,9 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 		unsigned long long db_pages = 0;
 		unsigned long long slc_lpn = 0;
 		unsigned long long qlc_lpn = 0;
+		unsigned long long qlc_fast_lpn = 0;
+		unsigned long long qlc_slow_lpn = 0;
+		unsigned long long qlc_zone_unknown_lpn = 0;
 		unsigned long long unknown_lpn = 0;
 		unsigned long long acc_sum = 0;
 		unsigned long long acc_p50 = 0;
@@ -2164,12 +2199,23 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 
 		for (size_t i = 0; i < lpn_count; ++i) {
 			unsigned int in_slc = 0;
+			unsigned int qlc_zone = 0;
+			bool qlc_zone_known = false;
 			unsigned long long acc = 0;
-			if (tiers && tier_count > 0 && lookup_page_tier(tiers, tier_count, lpn_vec[i], &in_slc)) {
-				if (in_slc)
+			if (tiers && tier_count > 0 &&
+			    lookup_page_tier(tiers, tier_count, lpn_vec[i], &in_slc,
+					     &qlc_zone, &qlc_zone_known)) {
+				if (in_slc) {
 					slc_lpn++;
-				else
+				} else {
 					qlc_lpn++;
+					if (!qlc_zone_known)
+						qlc_zone_unknown_lpn++;
+					else if (page_tier_zone_is_fast(qlc_zone))
+						qlc_fast_lpn++;
+					else
+						qlc_slow_lpn++;
+				}
 			} else {
 				unknown_lpn++;
 			}
@@ -2195,17 +2241,21 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 		}
 
 		double known = (double)(slc_lpn + qlc_lpn);
+		double qlc_known = (double)(qlc_fast_lpn + qlc_slow_lpn);
 		double slc_ratio = known > 0.0 ? (double)slc_lpn / known : 0.0;
+		double qlc_fast_ratio = qlc_known > 0.0 ? (double)qlc_fast_lpn / qlc_known : 0.0;
+		double qlc_slow_ratio = qlc_known > 0.0 ? (double)qlc_slow_lpn / qlc_known : 0.0;
 		double acc_mean = acc_count > 0 ? (double)acc_sum / (double)acc_count : 0.0;
 		double cold_time = cold_per_table ? cold_per_table[tbl] : 0.0;
 		double tbl_bytes_mb = (double)layout->rows_per_table[tbl] * ROW_PAYLOAD_BYTES /
 				      (1024.0 * 1024.0);
 		double cold_tp = cold_time > 0.0 ? tbl_bytes_mb / cold_time : 0.0;
 
-		fprintf(fp, "%u,%s,%llu,%zu,%llu,%llu,%llu,%.9f,%llu,%llu,%llu,%llu,%llu,%.9f,%.9f,%.2f\n",
-			tbl, table_name, db_pages, lpn_count, slc_lpn, qlc_lpn, unknown_lpn,
+		fprintf(fp, "%u,%s,%llu,%zu,%llu,%llu,%llu,%llu,%llu,%llu,%.9f,%llu,%llu,%llu,%llu,%llu,%.9f,%.9f,%.9f,%.9f,%.2f\n",
+			tbl, table_name, db_pages, lpn_count, slc_lpn, qlc_lpn,
+			qlc_fast_lpn, qlc_slow_lpn, qlc_zone_unknown_lpn, unknown_lpn,
 			acc_mean, acc_p50, acc_p90, acc_p99, acc_max, acc_missing_lpn,
-			slc_ratio, cold_time, cold_tp);
+			slc_ratio, qlc_fast_ratio, qlc_slow_ratio, cold_time, cold_tp);
 	}
 
 	free(lpn_vec);
@@ -2427,6 +2477,10 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	       table_count, total_rows, (unsigned int)LPN_PER_ROW, interleave_rows,
 	       reads_per_event, opts->strict_cold_per_select ? 1U : 0U,
 	       opts->direct_io ? 1U : 0U);
+	if (opts->direct_io) {
+		printf("[sqlite_init] dio_main_db_open_ok=%u dio_main_db_open_fail=%u\n",
+		       g_dio_maindb_open_ok, g_dio_maindb_open_fail);
+	}
 
 	rc = build_table_read_plan(layout, opts, reads_per_event, &read_plan);
 	if (rc != 0)
