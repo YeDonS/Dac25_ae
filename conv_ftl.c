@@ -646,8 +646,26 @@ static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl)
 
 static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
-	/* User requested to disable the 10% recent write guard */
-	return false;
+	struct heat_tracking *ht;
+	uint64_t epoch, age, guard_window;
+
+	if (!conv_ftl)
+		return false;
+
+	ht = &conv_ftl->heat_track;
+	if (!ht || !ht->write_epoch)
+		return false;
+
+	epoch = ht->write_epoch[lpn];
+	if (epoch == 0)
+		return false;
+
+	age = conv_ftl->total_host_writes - epoch;
+	guard_window = total_slc_pages(conv_ftl) * RECENT_WRITE_GUARD_PCT / 100U;
+	if (!guard_window)
+		guard_window = 1;
+
+	return age < guard_window;
 }
 
 static void update_qlc_latency_zone(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)

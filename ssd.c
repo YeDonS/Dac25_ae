@@ -23,6 +23,117 @@ static inline void compute_line_distribution(uint32_t total_lines,
 	*qlc_lines = total_lines - slc;
 }
 
+static int fast_profile_lat(int base)
+{
+	if (base <= 0)
+		return base;
+	return 1;
+}
+
+void ssd_capture_latency_defaults(struct ssdparams *spp)
+{
+	int i;
+
+	if (!spp)
+		return;
+
+	for (i = 0; i < MAX_CELL_TYPES; i++) {
+		spp->base_pg_4kb_rd_lat[i] = spp->pg_4kb_rd_lat[i];
+		spp->base_pg_rd_lat[i] = spp->pg_rd_lat[i];
+	}
+
+	for (i = 0; i < ARRAY_SIZE(spp->qlc_pg_4kb_rd_lat); i++) {
+		spp->base_qlc_pg_4kb_rd_lat[i] = spp->qlc_pg_4kb_rd_lat[i];
+		spp->base_qlc_pg_rd_lat[i] = spp->qlc_pg_rd_lat[i];
+	}
+
+	spp->base_pg_wr_lat = spp->pg_wr_lat;
+	spp->base_blk_er_lat = spp->blk_er_lat;
+	spp->base_qlc_pg_wr_lat = spp->qlc_pg_wr_lat;
+	spp->base_qlc_blk_er_lat = spp->qlc_blk_er_lat;
+	spp->base_migration_lat = spp->migration_lat;
+	spp->base_fw_4kb_rd_lat = spp->fw_4kb_rd_lat;
+	spp->base_fw_rd_lat = spp->fw_rd_lat;
+	spp->base_fw_wbuf_lat0 = spp->fw_wbuf_lat0;
+	spp->base_fw_wbuf_lat1 = spp->fw_wbuf_lat1;
+	spp->base_fw_ch_xfer_lat = spp->fw_ch_xfer_lat;
+	spp->latency_profile = SSD_LATENCY_PROFILE_NORMAL;
+}
+
+const char *ssd_latency_profile_name(enum ssd_latency_profile profile)
+{
+	switch (profile) {
+	case SSD_LATENCY_PROFILE_INIT_FAST:
+		return "init-fast";
+	case SSD_LATENCY_PROFILE_NORMAL:
+	default:
+		return "normal";
+	}
+}
+
+static void ssd_apply_latency_profile(struct ssdparams *spp, enum ssd_latency_profile profile)
+{
+	int i;
+
+	if (!spp)
+		return;
+
+	switch (profile) {
+	case SSD_LATENCY_PROFILE_INIT_FAST:
+		for (i = 0; i < MAX_CELL_TYPES; i++) {
+			spp->pg_4kb_rd_lat[i] = fast_profile_lat(spp->base_pg_4kb_rd_lat[i]);
+			spp->pg_rd_lat[i] = fast_profile_lat(spp->base_pg_rd_lat[i]);
+		}
+		for (i = 0; i < ARRAY_SIZE(spp->qlc_pg_4kb_rd_lat); i++) {
+			spp->qlc_pg_4kb_rd_lat[i] =
+				fast_profile_lat(spp->base_qlc_pg_4kb_rd_lat[i]);
+			spp->qlc_pg_rd_lat[i] = fast_profile_lat(spp->base_qlc_pg_rd_lat[i]);
+		}
+		spp->pg_wr_lat = fast_profile_lat(spp->base_pg_wr_lat);
+		spp->blk_er_lat = fast_profile_lat(spp->base_blk_er_lat);
+		spp->qlc_pg_wr_lat = fast_profile_lat(spp->base_qlc_pg_wr_lat);
+		spp->qlc_blk_er_lat = fast_profile_lat(spp->base_qlc_blk_er_lat);
+		spp->migration_lat = fast_profile_lat(spp->base_migration_lat);
+		spp->fw_4kb_rd_lat = fast_profile_lat(spp->base_fw_4kb_rd_lat);
+		spp->fw_rd_lat = fast_profile_lat(spp->base_fw_rd_lat);
+		spp->fw_wbuf_lat0 = fast_profile_lat(spp->base_fw_wbuf_lat0);
+		spp->fw_wbuf_lat1 = fast_profile_lat(spp->base_fw_wbuf_lat1);
+		spp->fw_ch_xfer_lat = fast_profile_lat(spp->base_fw_ch_xfer_lat);
+		break;
+	case SSD_LATENCY_PROFILE_NORMAL:
+	default:
+		for (i = 0; i < MAX_CELL_TYPES; i++) {
+			spp->pg_4kb_rd_lat[i] = spp->base_pg_4kb_rd_lat[i];
+			spp->pg_rd_lat[i] = spp->base_pg_rd_lat[i];
+		}
+		for (i = 0; i < ARRAY_SIZE(spp->qlc_pg_4kb_rd_lat); i++) {
+			spp->qlc_pg_4kb_rd_lat[i] = spp->base_qlc_pg_4kb_rd_lat[i];
+			spp->qlc_pg_rd_lat[i] = spp->base_qlc_pg_rd_lat[i];
+		}
+		spp->pg_wr_lat = spp->base_pg_wr_lat;
+		spp->blk_er_lat = spp->base_blk_er_lat;
+		spp->qlc_pg_wr_lat = spp->base_qlc_pg_wr_lat;
+		spp->qlc_blk_er_lat = spp->base_qlc_blk_er_lat;
+		spp->migration_lat = spp->base_migration_lat;
+		spp->fw_4kb_rd_lat = spp->base_fw_4kb_rd_lat;
+		spp->fw_rd_lat = spp->base_fw_rd_lat;
+		spp->fw_wbuf_lat0 = spp->base_fw_wbuf_lat0;
+		spp->fw_wbuf_lat1 = spp->base_fw_wbuf_lat1;
+		spp->fw_ch_xfer_lat = spp->base_fw_ch_xfer_lat;
+		break;
+	}
+
+	spp->latency_profile = profile;
+}
+
+void ssd_set_latency_profile(struct ssd *ssd, enum ssd_latency_profile profile)
+{
+	if (!ssd)
+		return;
+
+	ssd_apply_latency_profile(&ssd->sp, profile);
+}
+
 uint64_t __get_ioclock(struct ssd *ssd)
 {
 	return cpu_clock(ssd->cpu_nr_dispatcher);
@@ -191,6 +302,7 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 	spp->fw_ch_xfer_lat = FW_CH_XFER_LATENCY;
 	spp->fw_wbuf_lat0 = FW_WBUF_LATENCY0;
 	spp->fw_wbuf_lat1 = FW_WBUF_LATENCY1;
+	ssd_capture_latency_defaults(spp);
 
 	spp->ch_bandwidth = NAND_CHANNEL_BANDWIDTH;
 	spp->pcie_bandwidth = PCIE_BANDWIDTH;
