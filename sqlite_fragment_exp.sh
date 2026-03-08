@@ -30,6 +30,7 @@ SQLITE_PAGE_TIER_PATH=${SQLITE_PAGE_TIER_PATH:-/sys/kernel/debug/nvmev/ftl0/page
 SQLITE_ACCESS_COUNT_PATH=${SQLITE_ACCESS_COUNT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_count}
 SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
 SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-0}
+FAST_INIT_ARGS=${FAST_INIT_ARGS:-}
 
 mkdir -p "$RESULT_FOLDER"
 mkdir -p "$TARGET_FOLDER"
@@ -65,6 +66,7 @@ run_exp_suite() {
 
     drop_caches
     numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append --mode init \
+        $FAST_INIT_ARGS \
         --target-bytes "$SQLITE_TARGET_BYTES" \
         --table-count "$SQLITE_TABLE_COUNT" \
         --rows-per-table "$SQLITE_ROWS_PER_TABLE" \

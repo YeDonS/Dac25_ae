@@ -20,6 +20,7 @@
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -75,6 +76,9 @@
 #define DEFAULT_READS_PER_EVENT  1000U
 #define DEFAULT_COLD_SCAN_ITERS  3U
 #define PAGE_TIER_ZONE_COUNT     4U
+#define DEFAULT_LATENCY_PROFILE_PATH "/proc/nvmev/latency_profile"
+#define DEFAULT_INIT_PROFILE        "init-fast"
+#define DEFAULT_COLD_PROFILE        "normal"
 
 typedef unsigned int UINT32;
 
@@ -109,6 +113,11 @@ static const struct option long_opts[] = {
 	{"ftl-host-page-bytes", required_argument, NULL, 1016},
 	{"access-count-path", required_argument, NULL, 1017},
 	{"direct-io", no_argument, NULL, 1018},
+	{"fast-init-profile", no_argument, NULL, 1019},
+	{"latency-profile-path", required_argument, NULL, 1020},
+	{"init-latency-profile", required_argument, NULL, 1021},
+	{"cold-latency-profile", required_argument, NULL, 1022},
+	{"latency-profile-settle-ms", required_argument, NULL, 1023},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -166,6 +175,11 @@ struct workload_options {
 	unsigned long long ftl_host_page_bytes;
 	const char *access_count_path;
 	bool direct_io;
+	bool fast_init_profile;
+	const char *latency_profile_path;
+	const char *init_latency_profile;
+	const char *cold_latency_profile;
+	unsigned int latency_profile_settle_ms;
 };
 
 struct zipf_sampler {
@@ -561,6 +575,11 @@ static void usage(const char *prog)
 		"                 [--strict-cold-per-select] [--direct-io]\n"
 		"                 [--page-tier-path PATH] [--ftl-host-page-bytes N]\n"
 		"                 [--access-count-path PATH]\n"
+		"                 [--fast-init-profile]\n"
+		"                 [--latency-profile-path PATH]\n"
+		"                 [--init-latency-profile NAME]\n"
+		"                 [--cold-latency-profile NAME]\n"
+		"                 [--latency-profile-settle-ms N]\n"
 		"                 [--zipf-seed S] [--exp-seed S] [--normal-seed S]\n"
 		"                 [--tag NAME] [--trace-dir DIR]\n"
 		"  %s --mode read --distribution zipf|exp|uniform|normal|sequential\n"
@@ -570,6 +589,60 @@ static void usage(const char *prog)
 		"                 [--human-log] [--suppress-report]\n"
 		"  %s --mode scan [--scan-iters N]\n",
 		prog, prog, prog);
+}
+
+static int write_string_file(const char *path, const char *value)
+{
+	FILE *fp;
+
+	if (!path || !*path || !value || !*value)
+		return -EINVAL;
+
+	fp = fopen(path, "w");
+	if (!fp)
+		return -errno;
+
+	if (fprintf(fp, "%s\n", value) < 0) {
+		int saved = errno ? -errno : -EIO;
+		fclose(fp);
+		return saved;
+	}
+
+	if (fclose(fp) != 0)
+		return -errno;
+
+	return 0;
+}
+
+static int maybe_switch_latency_profile(const struct workload_options *opts,
+					const char *profile,
+					const char *phase)
+{
+	int rc;
+
+	if (!opts || !opts->fast_init_profile)
+		return 0;
+	if (!profile || !*profile)
+		return 0;
+
+	rc = write_string_file(opts->latency_profile_path, profile);
+	if (rc != 0) {
+		fprintf(stderr,
+			"[sqlite_init] failed to set latency profile '%s' for %s via %s (%d)\n",
+			profile, phase ? phase : "phase",
+			opts->latency_profile_path ? opts->latency_profile_path : "(null)",
+			rc);
+		return rc;
+	}
+
+	printf("[sqlite_init] latency_profile=%s phase=%s path=%s\n",
+	       profile, phase ? phase : "phase",
+	       opts->latency_profile_path ? opts->latency_profile_path : "(null)");
+
+	if (opts->latency_profile_settle_ms > 0)
+		usleep((useconds_t)opts->latency_profile_settle_ms * 1000U);
+
+	return 0;
 }
 
 static void copy_text(char *dst, size_t len, const char *src)
@@ -1887,6 +1960,34 @@ static int append_lpn_range(unsigned long long lpn_start, unsigned long long lpn
 	return 0;
 }
 
+static unsigned long long detect_partition_offset_bytes(const char *path)
+{
+#if defined(__linux__)
+	struct stat st;
+	char sysfs[128];
+	FILE *fp;
+	unsigned long long start_sector = 0;
+
+	if (!path || stat(path, &st) != 0)
+		return 0;
+
+	snprintf(sysfs, sizeof(sysfs), "/sys/dev/block/%u:%u/start",
+		 major(st.st_dev), minor(st.st_dev));
+
+	fp = fopen(sysfs, "r");
+	if (!fp)
+		return 0;
+
+	if (fscanf(fp, "%llu", &start_sector) != 1)
+		start_sector = 0;
+	fclose(fp);
+	return start_sector * 512ULL;
+#else
+	(void)path;
+	return 0;
+#endif
+}
+
 static int load_file_extents(const char *path, struct file_extent **extents_out,
 			     size_t *extent_count_out)
 {
@@ -2087,7 +2188,16 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 
 	rc = load_file_extents(db_path, &extents, &extent_count);
 	if (rc == 0 && extent_count > 0) {
+		unsigned long long part_off = detect_partition_offset_bytes(db_path);
+
 		use_fiemap = true;
+		if (part_off > 0) {
+			for (size_t i = 0; i < extent_count; ++i)
+				extents[i].physical += part_off;
+			fprintf(stderr,
+				"[table_tier] partition offset %llu bytes (%llu FTL pages) applied to FIEMAP extents\n",
+				part_off, part_off / host_page_bytes);
+		}
 	} else {
 		fprintf(stderr,
 			"FIEMAP unavailable for %s (rc=%d), fallback to logical offset mapping\n",
@@ -2413,6 +2523,7 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	size_t access_entry_count = 0;
 	unsigned int *heat = NULL;
 	bool txn_active = false;
+	bool fast_profile_applied = false;
 	int rc = -1;
 
 	if (!heat_out)
@@ -2420,6 +2531,13 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 
 	if (reads_per_event == 0)
 		reads_per_event = DEFAULT_READS_PER_EVENT;
+
+	if (opts->fast_init_profile) {
+		rc = maybe_switch_latency_profile(opts, opts->init_latency_profile, "init-start");
+		if (rc != 0)
+			return rc;
+		fast_profile_applied = true;
+	}
 
 	build_db_path(db_path, sizeof(db_path), opts);
 	unlink(db_path);
@@ -2434,8 +2552,10 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		rc = sqlite3_open(db_path, &db);
 	}
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
-		return -1;
+		fprintf(stderr, "Cannot open database: %s\n",
+			db ? sqlite3_errmsg(db) : "sqlite open failed");
+		rc = -1;
+		goto out;
 	}
 
 	rc = sqlite3_exec(db, "PRAGMA journal_mode = off;", NULL, NULL, NULL);
@@ -2473,10 +2593,10 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	active_count = table_count;
 
 	printf("[sqlite_init] config tables=%u total_rows=%llu row_pages=%u interleave_rows=%u "
-	       "read_ops_per_event=%u strict_cold_per_select=%u direct_io=%u\n",
+	       "read_ops_per_event=%u strict_cold_per_select=%u direct_io=%u fast_init_profile=%u\n",
 	       table_count, total_rows, (unsigned int)LPN_PER_ROW, interleave_rows,
 	       reads_per_event, opts->strict_cold_per_select ? 1U : 0U,
-	       opts->direct_io ? 1U : 0U);
+	       opts->direct_io ? 1U : 0U, opts->fast_init_profile ? 1U : 0U);
 	if (opts->direct_io) {
 		printf("[sqlite_init] dio_main_db_open_ok=%u dio_main_db_open_fail=%u\n",
 		       g_dio_maindb_open_ok, g_dio_maindb_open_fail);
@@ -2574,6 +2694,13 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		txn_active = false;
 	}
 
+	if (fast_profile_applied) {
+		rc = maybe_switch_latency_profile(opts, opts->cold_latency_profile, "cold-read");
+		if (rc != 0)
+			goto out;
+		fast_profile_applied = false;
+	}
+
 	cold_per_table = calloc(table_count ? table_count : 1U, sizeof(double));
 	cold_read_time = run_cold_full_read(db, layout, 1, cold_per_table);
 
@@ -2643,6 +2770,8 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	rc = 0;
 
 out:
+	if (fast_profile_applied)
+		maybe_switch_latency_profile(opts, opts->cold_latency_profile, "cleanup");
 	if (heat)
 		free(heat);
 	free(access_entries);
@@ -3350,6 +3479,11 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->ftl_host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
 	opts->access_count_path = DEFAULT_ACCESS_COUNT_PATH;
 	opts->direct_io = false;
+	opts->fast_init_profile = false;
+	opts->latency_profile_path = DEFAULT_LATENCY_PROFILE_PATH;
+	opts->init_latency_profile = DEFAULT_INIT_PROFILE;
+	opts->cold_latency_profile = DEFAULT_COLD_PROFILE;
+	opts->latency_profile_settle_ms = 0;
 
 	while ((c = getopt_long(argc, argv, "m:d:r:a:l:s:o:H:M:S:Uh", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -3467,6 +3601,21 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			break;
 		case 1018:
 			opts->direct_io = true;
+			break;
+		case 1019:
+			opts->fast_init_profile = true;
+			break;
+		case 1020:
+			opts->latency_profile_path = optarg;
+			break;
+		case 1021:
+			opts->init_latency_profile = optarg;
+			break;
+		case 1022:
+			opts->cold_latency_profile = optarg;
+			break;
+		case 1023:
+			opts->latency_profile_settle_ms = (unsigned int)strtoul(optarg, NULL, 10);
 			break;
 		case 'h':
 		default:
