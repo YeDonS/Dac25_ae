@@ -167,8 +167,7 @@ static inline void nvmev_set_maptbl_site(const char *site, u64 lpn)
 }
 
 static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn);
-
-static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn);
+static inline uint64_t total_slc_pages(const struct conv_ftl *conv_ftl);
 
 static inline void compute_line_distribution(uint32_t total_lines,
 					     uint32_t *slc_lines,
