@@ -1826,9 +1826,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		conv_ftl->debug_page_tier =
 			debugfs_create_file("page_tier", 0440, parent,
 					    conv_ftl, &page_tier_fops);
-		conv_ftl->debug_read_repromotion =
-			debugfs_create_bool("read_repromotion_enable", 0644, parent,
-					    &conv_ftl->enable_read_repromotion);
+		conv_ftl->debug_read_repromotion = NULL;
 	}
 
 	return;
@@ -2016,9 +2014,11 @@ static inline uint32_t get_glun(struct conv_ftl *conv_ftl, struct ppa *ppa)
 static inline struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	uint32_t die = encode_die(&conv_ftl->ssd->sp, ppa);
+	struct line_mgmt *lm;
+	uint32_t idx;
 
 	if (is_slc_block(conv_ftl, ppa->g.blk)) {
-		struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
+		lm = get_slc_die_lm(conv_ftl, die);
 		if (!lm || !lm->lines || ppa->g.blk >= lm->tt_lines)
 			return NULL;
 		return &lm->lines[ppa->g.blk];
@@ -2027,11 +2027,11 @@ static inline struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	if (ppa->g.blk < conv_ftl->slc_blks_per_pl)
 		return NULL;
 
-	struct line_mgmt *lm = get_qlc_die_lm(conv_ftl, die);
+	lm = get_qlc_die_lm(conv_ftl, die);
 	if (!lm || !lm->lines)
 		return NULL;
 
-	uint32_t idx = ppa->g.blk - conv_ftl->slc_blks_per_pl;
+	idx = ppa->g.blk - conv_ftl->slc_blks_per_pl;
 	if (idx >= lm->tt_lines)
 		return NULL;
 
