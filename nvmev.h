@@ -257,6 +257,7 @@ struct nvmev_dev {
 	struct proc_dir_entry *proc_read_times;
 	struct proc_dir_entry *proc_write_times;
 	struct proc_dir_entry *proc_latency_profile;
+	struct proc_dir_entry *proc_read_repromotion;
 	struct proc_dir_entry *proc_io_units;
 	struct proc_dir_entry *proc_stat;
 

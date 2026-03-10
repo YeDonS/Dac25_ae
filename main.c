@@ -339,6 +339,29 @@ static void nvmev_apply_latency_profile_all(enum ssd_latency_profile profile)
 	}
 }
 
+static void nvmev_apply_read_repromotion_all(bool enabled)
+{
+	unsigned int i;
+
+	if (!nvmev_vdev || !nvmev_vdev->ns)
+		return;
+
+	for (i = 0; i < nvmev_vdev->nr_ns; i++) {
+		struct nvmev_ns *ns = &nvmev_vdev->ns[i];
+
+		if (!ns->ftls)
+			continue;
+
+		if (ns->proc_io_cmd == conv_proc_nvme_io_cmd) {
+			struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
+			uint32_t part;
+
+			for (part = 0; part < ns->nr_parts; part++)
+				conv_ftls[part].enable_read_repromotion = enabled;
+		}
+	}
+}
+
 static enum ssd_latency_profile nvmev_current_latency_profile(void)
 {
 	unsigned int i;
@@ -371,6 +394,30 @@ static enum ssd_latency_profile nvmev_current_latency_profile(void)
 	return SSD_LATENCY_PROFILE_NORMAL;
 }
 
+static bool nvmev_current_read_repromotion(void)
+{
+	unsigned int i;
+
+	if (!nvmev_vdev || !nvmev_vdev->ns)
+		return true;
+
+	for (i = 0; i < nvmev_vdev->nr_ns; i++) {
+		struct nvmev_ns *ns = &nvmev_vdev->ns[i];
+
+		if (!ns->ftls)
+			continue;
+
+		if (ns->proc_io_cmd == conv_proc_nvme_io_cmd) {
+			struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
+
+			if (ns->nr_parts > 0)
+				return conv_ftls[0].enable_read_repromotion;
+		}
+	}
+
+	return true;
+}
+
 static bool nvmev_parse_latency_profile(const char *input, enum ssd_latency_profile *profile)
 {
 	if (!input || !profile)
@@ -384,6 +431,28 @@ static bool nvmev_parse_latency_profile(const char *input, enum ssd_latency_prof
 	if (!strcasecmp(input, "init-fast") || !strcasecmp(input, "init_fast") ||
 	    !strcasecmp(input, "fast")) {
 		*profile = SSD_LATENCY_PROFILE_INIT_FAST;
+		return true;
+	}
+
+	return false;
+}
+
+static bool nvmev_parse_bool_value(const char *input, bool *value)
+{
+	if (!input || !value)
+		return false;
+
+	if (!strcasecmp(input, "1") || !strcasecmp(input, "on") ||
+	    !strcasecmp(input, "true") || !strcasecmp(input, "enable") ||
+	    !strcasecmp(input, "enabled")) {
+		*value = true;
+		return true;
+	}
+
+	if (!strcasecmp(input, "0") || !strcasecmp(input, "off") ||
+	    !strcasecmp(input, "false") || !strcasecmp(input, "disable") ||
+	    !strcasecmp(input, "disabled")) {
+		*value = false;
 		return true;
 	}
 
@@ -405,6 +474,8 @@ static int __proc_file_read(struct seq_file *m, void *data)
 		seq_printf(m, "%u x %u", cfg->nr_io_units, cfg->io_unit_shift);
 	} else if (strcmp(filename, "latency_profile") == 0) {
 		seq_puts(m, ssd_latency_profile_name(nvmev_current_latency_profile()));
+	} else if (strcmp(filename, "read_repromotion") == 0) {
+		seq_puts(m, nvmev_current_read_repromotion() ? "1" : "0");
 	} else if (strcmp(filename, "stat") == 0) {
 		int i;
 		unsigned int nr_in_flight = 0;
@@ -494,6 +565,17 @@ static ssize_t __proc_file_write(struct file *file, const char __user *buf, size
 		} else {
 			NVMEV_ERROR("Unknown latency profile '%s'\n", input);
 		}
+	} else if (!strcmp(filename, "read_repromotion")) {
+		bool enabled;
+
+		ret = 0;
+		if (nvmev_parse_bool_value(input, &enabled)) {
+			nvmev_apply_read_repromotion_all(enabled);
+			NVMEV_INFO("Applied read repromotion: %s\n",
+				   enabled ? "on" : "off");
+		} else {
+			NVMEV_ERROR("Unknown read repromotion value '%s'\n", input);
+		}
 	} else if (!strcmp(filename, "debug")) {
 		/* Left for later use */
 	}
@@ -550,6 +632,8 @@ void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 		proc_create("write_times", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_latency_profile =
 		proc_create("latency_profile", 0664, nvmev_vdev->proc_root, &proc_file_fops);
+	nvmev_vdev->proc_read_repromotion =
+		proc_create("read_repromotion", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_io_units =
 		proc_create("io_units", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_stat = proc_create("stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
@@ -561,6 +645,7 @@ void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 	remove_proc_entry("read_times", nvmev_vdev->proc_root);
 	remove_proc_entry("write_times", nvmev_vdev->proc_root);
 	remove_proc_entry("latency_profile", nvmev_vdev->proc_root);
+	remove_proc_entry("read_repromotion", nvmev_vdev->proc_root);
 	remove_proc_entry("io_units", nvmev_vdev->proc_root);
 	remove_proc_entry("stat", nvmev_vdev->proc_root);
 	remove_proc_entry("debug", nvmev_vdev->proc_root);

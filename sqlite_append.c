@@ -79,6 +79,8 @@
 #define DEFAULT_LATENCY_PROFILE_PATH "/proc/nvmev/latency_profile"
 #define DEFAULT_INIT_PROFILE        "init-fast"
 #define DEFAULT_COLD_PROFILE        "normal"
+#define DEFAULT_READ_REPROMOTION_CTRL_PATH \
+	"/proc/nvmev/read_repromotion"
 
 typedef unsigned int UINT32;
 
@@ -118,6 +120,10 @@ static const struct option long_opts[] = {
 	{"init-latency-profile", required_argument, NULL, 1021},
 	{"cold-latency-profile", required_argument, NULL, 1022},
 	{"latency-profile-settle-ms", required_argument, NULL, 1023},
+	{"cold-full-read-mode", required_argument, NULL, 1024},
+	{"cold-full-read-iters", required_argument, NULL, 1025},
+	{"cold-disable-read-repromotion", no_argument, NULL, 1026},
+	{"read-repromotion-ctrl-path", required_argument, NULL, 1027},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -140,6 +146,11 @@ enum trace_mode {
 	TRACE_MODE_NONE = 0,
 	TRACE_MODE_RECORD,
 	TRACE_MODE_REPLAY,
+};
+
+enum cold_full_read_mode {
+	COLD_FULL_READ_PER_TABLE = 0,
+	COLD_FULL_READ_FULL_SCAN,
 };
 
 struct workload_options {
@@ -180,6 +191,10 @@ struct workload_options {
 	const char *init_latency_profile;
 	const char *cold_latency_profile;
 	unsigned int latency_profile_settle_ms;
+	enum cold_full_read_mode cold_full_read_mode;
+	unsigned int cold_full_read_iters;
+	bool cold_disable_read_repromotion;
+	const char *read_repromotion_ctrl_path;
 };
 
 struct zipf_sampler {
@@ -580,6 +595,10 @@ static void usage(const char *prog)
 		"                 [--init-latency-profile NAME]\n"
 		"                 [--cold-latency-profile NAME]\n"
 		"                 [--latency-profile-settle-ms N]\n"
+		"                 [--cold-full-read-mode per-table|full-scan]\n"
+		"                 [--cold-full-read-iters N]\n"
+		"                 [--cold-disable-read-repromotion]\n"
+		"                 [--read-repromotion-ctrl-path PATH]\n"
 		"                 [--zipf-seed S] [--exp-seed S] [--normal-seed S]\n"
 		"                 [--tag NAME] [--trace-dir DIR]\n"
 		"  %s --mode read --distribution zipf|exp|uniform|normal|sequential\n"
@@ -611,6 +630,57 @@ static int write_string_file(const char *path, const char *value)
 	if (fclose(fp) != 0)
 		return -errno;
 
+	return 0;
+}
+
+static const char *cold_full_read_mode_name(enum cold_full_read_mode mode)
+{
+	switch (mode) {
+	case COLD_FULL_READ_FULL_SCAN:
+		return "full-scan";
+	case COLD_FULL_READ_PER_TABLE:
+	default:
+		return "per-table";
+	}
+}
+
+static enum cold_full_read_mode parse_cold_full_read_mode(const char *value)
+{
+	if (!value || !*value)
+		return COLD_FULL_READ_PER_TABLE;
+	if (strcasecmp(value, "full-scan") == 0 || strcasecmp(value, "full_scan") == 0)
+		return COLD_FULL_READ_FULL_SCAN;
+	if (strcasecmp(value, "per-table") == 0 || strcasecmp(value, "per_table") == 0)
+		return COLD_FULL_READ_PER_TABLE;
+
+	fprintf(stderr, "Unknown cold full read mode '%s'\n", value);
+	exit(EXIT_FAILURE);
+}
+
+static int set_read_repromotion_state(const struct workload_options *opts,
+				      bool enabled, const char *phase)
+{
+	const char *value = enabled ? "1" : "0";
+	int rc;
+
+	if (!opts || !opts->read_repromotion_ctrl_path || !opts->read_repromotion_ctrl_path[0])
+		return -EINVAL;
+
+	rc = write_string_file(opts->read_repromotion_ctrl_path, value);
+	if (rc != 0) {
+		fprintf(stderr,
+			"[sqlite_init] failed to set read repromotion '%s' for %s via %s (%d)\n",
+			enabled ? "on" : "off",
+			phase ? phase : "phase",
+			opts->read_repromotion_ctrl_path,
+			rc);
+		return rc;
+	}
+
+	printf("[sqlite_init] read_repromotion=%s phase=%s path=%s\n",
+	       enabled ? "on" : "off",
+	       phase ? phase : "phase",
+	       opts->read_repromotion_ctrl_path);
 	return 0;
 }
 
@@ -1625,6 +1695,7 @@ static int write_row_stats_csv(const char *path, const struct dataset_layout *la
 }
 
 static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layout,
+				 enum cold_full_read_mode mode,
 				 unsigned int iterations, double *per_table_out)
 {
 	unsigned int runs = iterations ? iterations : 1U;
@@ -1641,6 +1712,9 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 	for (unsigned int iter = 0; iter < runs; ++iter) {
 		double start = monotonic_sec();
 
+		if (mode == COLD_FULL_READ_FULL_SCAN)
+			drop_page_cache();
+
 		for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
 			char sql[256];
 			char table_name[MAX_TABLE_NAME];
@@ -1648,8 +1722,8 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 			int rc;
 			double tbl_start, tbl_end;
 
-			/* drop cache before each table for independent cold measurement */
-			drop_page_cache();
+			if (mode == COLD_FULL_READ_PER_TABLE)
+				drop_page_cache();
 
 			build_table_name(table_name, sizeof(table_name), tbl);
 			snprintf(sql, sizeof(sql),
@@ -1675,7 +1749,13 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 				per_table_out[tbl] += tbl_end - tbl_start;
 		}
 
-		total += monotonic_sec() - start;
+		{
+			double elapsed = monotonic_sec() - start;
+
+			total += elapsed;
+			printf("[sqlite_cold_full_read] mode=%s iter=%u/%u time=%.6fs\n",
+			       cold_full_read_mode_name(mode), iter + 1, runs, elapsed);
+		}
 	}
 
 	if (per_table_out && runs > 1) {
@@ -2516,6 +2596,7 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	char table_tier_path[PATH_MAX];
 	double total_read_time = 0.0;
 	double cold_read_time = 0.0;
+	unsigned int cold_read_iters = opts->cold_full_read_iters ? opts->cold_full_read_iters : 1U;
 	double *cold_per_table = NULL;
 	struct page_tier_entry *tier_entries = NULL;
 	size_t tier_entry_count = 0;
@@ -2524,6 +2605,7 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	unsigned int *heat = NULL;
 	bool txn_active = false;
 	bool fast_profile_applied = false;
+	bool read_repromotion_toggled = false;
 	int rc = -1;
 
 	if (!heat_out)
@@ -2597,6 +2679,10 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	       table_count, total_rows, (unsigned int)LPN_PER_ROW, interleave_rows,
 	       reads_per_event, opts->strict_cold_per_select ? 1U : 0U,
 	       opts->direct_io ? 1U : 0U, opts->fast_init_profile ? 1U : 0U);
+	printf("[sqlite_init] cold_read_config mode=%s iters=%u read_repromotion=%s ctrl_path=%s\n",
+	       cold_full_read_mode_name(opts->cold_full_read_mode), cold_read_iters,
+	       opts->cold_disable_read_repromotion ? "off" : "on",
+	       opts->read_repromotion_ctrl_path ? opts->read_repromotion_ctrl_path : "(null)");
 	if (opts->direct_io) {
 		printf("[sqlite_init] dio_main_db_open_ok=%u dio_main_db_open_fail=%u\n",
 		       g_dio_maindb_open_ok, g_dio_maindb_open_fail);
@@ -2702,7 +2788,25 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	}
 
 	cold_per_table = calloc(table_count ? table_count : 1U, sizeof(double));
-	cold_read_time = run_cold_full_read(db, layout, 1, cold_per_table);
+	if (cold_read_iters > 1 && !opts->cold_disable_read_repromotion) {
+		fprintf(stderr,
+			"[sqlite_init] warning: cold_full_read_iters=%u with read repromotion enabled may mutate layout across iterations\n",
+			cold_read_iters);
+	}
+	if (opts->cold_disable_read_repromotion) {
+		rc = set_read_repromotion_state(opts, false, "cold-read-start");
+		if (rc != 0)
+			goto out;
+		read_repromotion_toggled = true;
+	}
+	cold_read_time = run_cold_full_read(db, layout, opts->cold_full_read_mode,
+					    cold_read_iters, cold_per_table);
+	if (read_repromotion_toggled) {
+		rc = set_read_repromotion_state(opts, true, "cold-read-end");
+		if (rc != 0)
+			goto out;
+		read_repromotion_toggled = false;
+	}
 
 	heat = materialize_row_heat(layout, tables);
 	if (!heat) {
@@ -2746,9 +2850,12 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	double cold_throughput = cold_read_time > 0.0 ? cold_bytes_mb / cold_read_time : 0.0;
 
 	printf("[sqlite_init] tag=%s tables=%u total_rows=%u read_events=%u "
-	       "interleaved_read_time=%.6fs cold_full_read=%.6fs cold_full_read_tp=%.2fMB/s db=%s\n",
+	       "interleaved_read_time=%.6fs cold_full_read=%.6fs cold_full_read_tp=%.2fMB/s "
+	       "cold_mode=%s cold_iters=%u cold_read_repromotion=%s db=%s\n",
 	       effective_tag(opts), layout->table_count, layout->total_rows, read_events,
-	       total_read_time, cold_read_time, cold_throughput, db_path);
+	       total_read_time, cold_read_time, cold_throughput,
+	       cold_full_read_mode_name(opts->cold_full_read_mode), cold_read_iters,
+	       opts->cold_disable_read_repromotion ? "off" : "on", db_path);
 
 	if (cold_per_table) {
 		for (unsigned int tbl = 0; tbl < table_count; ++tbl) {
@@ -2770,6 +2877,8 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	rc = 0;
 
 out:
+	if (read_repromotion_toggled)
+		set_read_repromotion_state(opts, true, "cleanup");
 	if (fast_profile_applied)
 		maybe_switch_latency_profile(opts, opts->cold_latency_profile, "cleanup");
 	if (heat)
@@ -3484,6 +3593,10 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->init_latency_profile = DEFAULT_INIT_PROFILE;
 	opts->cold_latency_profile = DEFAULT_COLD_PROFILE;
 	opts->latency_profile_settle_ms = 0;
+	opts->cold_full_read_mode = COLD_FULL_READ_PER_TABLE;
+	opts->cold_full_read_iters = 1;
+	opts->cold_disable_read_repromotion = false;
+	opts->read_repromotion_ctrl_path = DEFAULT_READ_REPROMOTION_CTRL_PATH;
 
 	while ((c = getopt_long(argc, argv, "m:d:r:a:l:s:o:H:M:S:Uh", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -3611,16 +3724,30 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		case 1021:
 			opts->init_latency_profile = optarg;
 			break;
-		case 1022:
-			opts->cold_latency_profile = optarg;
-			break;
-		case 1023:
-			opts->latency_profile_settle_ms = (unsigned int)strtoul(optarg, NULL, 10);
-			break;
-		case 'h':
-		default:
-			usage(argv[0]);
-			exit(EXIT_FAILURE);
+			case 1022:
+				opts->cold_latency_profile = optarg;
+				break;
+			case 1023:
+				opts->latency_profile_settle_ms = (unsigned int)strtoul(optarg, NULL, 10);
+				break;
+			case 1024:
+				opts->cold_full_read_mode = parse_cold_full_read_mode(optarg);
+				break;
+			case 1025:
+				opts->cold_full_read_iters = (unsigned int)strtoul(optarg, NULL, 10);
+				if (opts->cold_full_read_iters == 0)
+					opts->cold_full_read_iters = 1;
+				break;
+			case 1026:
+				opts->cold_disable_read_repromotion = true;
+				break;
+			case 1027:
+				opts->read_repromotion_ctrl_path = optarg;
+				break;
+			case 'h':
+			default:
+				usage(argv[0]);
+				exit(EXIT_FAILURE);
 		}
 	}
 

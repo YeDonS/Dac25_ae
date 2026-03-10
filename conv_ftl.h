@@ -149,6 +149,7 @@ struct conv_ftl {
 	bool qlc_fast_drain_active;            /* 快区超过高水位后持续降温到目标水位 */
 	uint64_t qlc_fast_count;              /* 当前在 fast zone (L/CL) 的 QLC 页数 */
 	uint64_t qlc_slow_count;              /* 当前在 slow zone (U/CU) 的 QLC 页数 */
+	bool enable_read_repromotion;         /* 是否允许读路径触发 QLC->SLC 回迁 */
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
@@ -161,6 +162,7 @@ struct conv_ftl {
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
 	struct dentry *debug_access_inject; /* debugfs entry for counter injection */
 	struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
+	struct dentry *debug_read_repromotion; /* debugfs entry for read repromotion toggle */
 	
 	/* 初始化状态标记 */
 	bool maptbl_initialized;     /* 映射表是否初始化成功 */

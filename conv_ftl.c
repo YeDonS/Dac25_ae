@@ -1785,6 +1785,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->qlc_fast_drain_active = false;
 	conv_ftl->qlc_fast_count = 0;
 	conv_ftl->qlc_slow_count = 0;
+	conv_ftl->enable_read_repromotion = true;
 	spin_lock_init(&conv_ftl->qlc_zone_lock);
 
 	/* 直接初始化水位线（无后台线程） */
@@ -1821,16 +1822,19 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		struct dentry *parent = conv_ftl->debug_dir ? conv_ftl->debug_dir :
 							   nvmev_debugfs_root();
 
-		conv_ftl->debug_access_count =
-			debugfs_create_file("access_count", 0440, parent,
+			conv_ftl->debug_access_count =
+				debugfs_create_file("access_count", 0440, parent,
 					    conv_ftl, &access_count_fops);
-		conv_ftl->debug_access_inject =
-			debugfs_create_file("access_inject", 0200, parent,
+			conv_ftl->debug_access_inject =
+				debugfs_create_file("access_inject", 0200, parent,
 					    conv_ftl, &access_inject_fops);
-		conv_ftl->debug_page_tier =
-			debugfs_create_file("page_tier", 0440, parent,
+			conv_ftl->debug_page_tier =
+				debugfs_create_file("page_tier", 0440, parent,
 					    conv_ftl, &page_tier_fops);
-	}
+			conv_ftl->debug_read_repromotion =
+				debugfs_create_bool("read_repromotion_enable", 0644, parent,
+					    &conv_ftl->enable_read_repromotion);
+		}
 
 	return;
 }
@@ -1845,6 +1849,7 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		conv_ftl->debug_access_count = NULL;
 		conv_ftl->debug_access_inject = NULL;
 		conv_ftl->debug_page_tier = NULL;
+		conv_ftl->debug_read_repromotion = NULL;
 	} else {
 		if (conv_ftl->debug_access_count) {
 			debugfs_remove(conv_ftl->debug_access_count);
@@ -1854,11 +1859,15 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 			debugfs_remove(conv_ftl->debug_access_inject);
 			conv_ftl->debug_access_inject = NULL;
 		}
-		if (conv_ftl->debug_page_tier) {
-			debugfs_remove(conv_ftl->debug_page_tier);
-			conv_ftl->debug_page_tier = NULL;
+			if (conv_ftl->debug_page_tier) {
+				debugfs_remove(conv_ftl->debug_page_tier);
+				conv_ftl->debug_page_tier = NULL;
+			}
+			if (conv_ftl->debug_read_repromotion) {
+				debugfs_remove(conv_ftl->debug_read_repromotion);
+				conv_ftl->debug_read_repromotion = NULL;
+			}
 		}
-	}
 	
 	/* 清理 SLC/QLC 相关资源 */
 	remove_slc_lines(conv_ftl);
@@ -3828,7 +3837,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			/* 更新热数据跟踪信息 */
 			update_heat_info(conv_ftl, local_lpn, true);
 
-				if (!is_slc_block(conv_ftl, cur_ppa.g.blk) && has_avg &&
+				if (conv_ftl->enable_read_repromotion &&
+				    !is_slc_block(conv_ftl, cur_ppa.g.blk) && has_avg &&
 				    ht && ht->access_count) {
 					uint64_t access_cnt = ht->access_count[local_lpn];
 
