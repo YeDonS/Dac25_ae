@@ -54,8 +54,8 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define RECENT_WRITE_GUARD_PCT 10U
 #define QLC_FAST_HIGH_WM_PCT 90U
 #define QLC_FAST_TARGET_WM_PCT 80U
-#define QLC_PROMOTE_RATIO_NUM 3U
-#define QLC_PROMOTE_RATIO_DEN 2U
+#define QLC_PROMOTE_RATIO_NUM 1U
+#define QLC_PROMOTE_RATIO_DEN 1U
 #define QLC_REBALANCE_SCAN_LIMIT 4096U
 
 struct nvmev_cmd_debug {

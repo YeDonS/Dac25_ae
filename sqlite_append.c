@@ -1696,7 +1696,8 @@ static int write_row_stats_csv(const char *path, const struct dataset_layout *la
 
 static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layout,
 				 enum cold_full_read_mode mode,
-				 unsigned int iterations, double *per_table_out)
+				 unsigned int iterations, const unsigned int *read_plan,
+				 double *per_table_out)
 {
 	unsigned int runs = iterations ? iterations : 1U;
 	double total = 0.0;
@@ -1721,6 +1722,10 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 			sqlite3_stmt *stmt = NULL;
 			int rc;
 			double tbl_start, tbl_end;
+			unsigned int reads = read_plan ? read_plan[tbl] : 1U;
+
+			if (reads == 0)
+				continue;
 
 			if (mode == COLD_FULL_READ_PER_TABLE)
 				drop_page_cache();
@@ -1736,13 +1741,18 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 			}
 
 			tbl_start = monotonic_sec();
-			while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
-				;
+			for (unsigned int r = 0; r < reads; ++r) {
+				sqlite3_reset(stmt);
+				while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
+					;
+				if (rc != SQLITE_DONE) {
+					fprintf(stderr, "Cold read failed for %s: %s\n",
+						table_name, sqlite3_errmsg(db));
+					break;
+				}
+			}
 			tbl_end = monotonic_sec();
 
-			if (rc != SQLITE_DONE)
-				fprintf(stderr, "Cold read failed for %s: %s\n", table_name,
-					sqlite3_errmsg(db));
 			sqlite3_finalize(stmt);
 
 			if (per_table_out)
@@ -2800,7 +2810,7 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		read_repromotion_toggled = true;
 	}
 	cold_read_time = run_cold_full_read(db, layout, opts->cold_full_read_mode,
-					    cold_read_iters, cold_per_table);
+					    cold_read_iters, read_plan, cold_per_table);
 	if (read_repromotion_toggled) {
 		rc = set_read_repromotion_state(opts, true, "cold-read-end");
 		if (rc != 0)
@@ -2846,7 +2856,12 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 
 	report_cold_tail_latency(layout, tables, table_latency, table_read_ops);
 
-	double cold_bytes_mb = (double)layout->total_rows * ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+	double cold_bytes_mb = 0.0;
+	for (unsigned int tbl = 0; tbl < table_count; ++tbl) {
+		unsigned int tbl_reads = read_plan ? read_plan[tbl] : 1U;
+		cold_bytes_mb += (double)layout->rows_per_table[tbl] * tbl_reads *
+				 ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+	}
 	double cold_throughput = cold_read_time > 0.0 ? cold_bytes_mb / cold_read_time : 0.0;
 
 	printf("[sqlite_init] tag=%s tables=%u total_rows=%u read_events=%u "
@@ -2860,7 +2875,8 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	if (cold_per_table) {
 		for (unsigned int tbl = 0; tbl < table_count; ++tbl) {
 			char name[MAX_TABLE_NAME];
-			double tbl_bytes_mb = (double)layout->rows_per_table[tbl] *
+			unsigned int tbl_reads = read_plan ? read_plan[tbl] : 1U;
+			double tbl_bytes_mb = (double)layout->rows_per_table[tbl] * tbl_reads *
 					      ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
 			double tbl_tp = cold_per_table[tbl] > 0.0 ?
 					tbl_bytes_mb / cold_per_table[tbl] : 0.0;
