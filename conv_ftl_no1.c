@@ -54,8 +54,8 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define RECENT_WRITE_GUARD_PCT 10U
 #define QLC_FAST_HIGH_WM_PCT 90U
 #define QLC_FAST_TARGET_WM_PCT 80U
-#define QLC_PROMOTE_RATIO_NUM 3U
-#define QLC_PROMOTE_RATIO_DEN 2U
+#define QLC_PROMOTE_RATIO_NUM 1U
+#define QLC_PROMOTE_RATIO_DEN 1U
 #define QLC_REBALANCE_SCAN_LIMIT 4096U
 
 struct nvmev_cmd_debug {
@@ -326,18 +326,13 @@ static inline void collect_qlc_stats(struct conv_ftl *conv_ftl,
 
 static inline uint32_t pick_locked_qlc_page_type(struct conv_ftl *conv_ftl, bool warm)
 {
+	/* [DISABLED] Mechanism 3: round-robin all 4 zones (L->CL->CU->U) */
 	uint32_t type;
 
 	if (!conv_ftl)
 		return QLC_PAGE_TYPE_L;
 
-	if (warm)
-		type = (conv_ftl->qlc_zone_rr_cursor++ & 0x1) ?
-		       QLC_PAGE_TYPE_CL : QLC_PAGE_TYPE_L;
-	else
-		type = (conv_ftl->qlc_zone_rr_cursor++ & 0x1) ?
-		       QLC_PAGE_TYPE_U : QLC_PAGE_TYPE_CU;
-
+	type = conv_ftl->qlc_zone_rr_cursor++ % QLC_PAGE_PATTERN;
 	return type;
 }
 
