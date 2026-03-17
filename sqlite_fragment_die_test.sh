@@ -28,6 +28,8 @@ SQLITE_INTERLEAVE_READS=${SQLITE_INTERLEAVE_READS:-1000}
 SQLITE_PAGE_TIER_PATH=${SQLITE_PAGE_TIER_PATH:-/sys/kernel/debug/nvmev/ftl0/page_tier}
 SQLITE_ACCESS_COUNT_PATH=${SQLITE_ACCESS_COUNT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_count}
 SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
+SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
+SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-1}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
 NORMAL_STDDEV=${NORMAL_STDDEV:-400}
 NORMAL_SEED=${NORMAL_SEED:-314159}
@@ -98,6 +100,14 @@ run_one_test() {
 
     mkdir -p "$TARGET_FOLDER"
 
+    local extra_args=()
+    if [[ "$SQLITE_DIRECT_IO" == "1" ]]; then
+        extra_args+=(--direct-io)
+    fi
+    if [[ "$SQLITE_FAST_INIT_PROFILE" == "1" ]]; then
+        extra_args+=(--fast-init-profile)
+    fi
+
     numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./sqlite_append_die --mode init \
         --target-bytes "$SQLITE_TARGET_BYTES" \
         --table-count "$SQLITE_TABLE_COUNT" \
@@ -120,6 +130,7 @@ run_one_test() {
         --cold-random-reads-per-tbl "$COLD_READS_PER_TBL" \
         --cold-disable-read-repromotion \
         --strict-cold-per-select \
+        "${extra_args[@]}" \
         --tag "$tag" \
         >"${out_dir}/sqlite_${tag}_init.txt" 2>&1
 
