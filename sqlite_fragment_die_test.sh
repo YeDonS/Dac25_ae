@@ -54,6 +54,9 @@ if [[ ! -f ./sqlite_append_die ]] || [[ $FORCE_REBUILD == 1 ]]; then
         -lsqlite3 -lm -lpthread
 fi
 
+mkdir -p "$RESULT_FOLDER"
+mkdir -p "$TARGET_FOLDER"
+
 drop_caches() {
     sync
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
@@ -66,13 +69,15 @@ load_die_module() {
         echo "ERROR: $ko_path not found. Run build_die.sh first." >&2
         exit 1
     fi
-    echo "=== Loading $ko_path ==="
-    sudo insmod "$ko_path" memmap_start=256G memmap_size=64G cpus=131,132,135,136
-    sleep 1
-}
-
-unload_module() {
-    sudo rmmod nvmev 2>/dev/null || true
+    echo "=== Loading $ko_path (via nvmevstart_on.sh) ==="
+    if [[ -f ./nvmev_on.ko ]]; then
+        cp ./nvmev_on.ko ./nvmev_on.ko.die_bak
+    fi
+    cp "$ko_path" ./nvmev_on.ko
+    ./nvmevstart_on.sh
+    if [[ -f ./nvmev_on.ko.die_bak ]]; then
+        mv ./nvmev_on.ko.die_bak ./nvmev_on.ko
+    fi
     sleep 1
 }
 
@@ -89,13 +94,13 @@ run_one_test() {
     echo "  variant=$variant  threads=$threads  tag=$tag"
     echo "================================================================"
 
-    unload_module
     load_die_module "$variant"
 
     lsblk
     source setdevice.sh
 
     echo 0 | sudo tee /sys/block/${DATA_NAME}/queue/read_ahead_kb >/dev/null 2>&1 || true
+    echo "[readahead] set /sys/block/${DATA_NAME}/queue/read_ahead_kb = $(cat /sys/block/${DATA_NAME}/queue/read_ahead_kb 2>/dev/null || echo N/A)"
     drop_caches
 
     mkdir -p "$TARGET_FOLDER"
@@ -143,6 +148,7 @@ run_one_test() {
     echo "  Output: ${out_dir}/sqlite_${tag}_init.txt"
 
     source resetdevice.sh
+    sleep 1
 }
 
 # ---------- main ----------
