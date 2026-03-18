@@ -695,6 +695,8 @@ static int set_read_repromotion_state(const struct workload_options *opts,
 }
 
 #define GC_NAND_TIMING_PATH "/sys/module/nvmev/parameters/gc_nand_timing"
+#define DIE_STATS_PATH      "/sys/module/nvmev/parameters/die_stats"
+#define DIE_STATS_RESET_PATH "/sys/module/nvmev/parameters/die_stats_reset"
 
 static void set_gc_nand_timing(int enabled)
 {
@@ -705,6 +707,32 @@ static void set_gc_nand_timing(int enabled)
 		fprintf(stderr, "[die_test] failed to set gc_nand_timing=%s (%d)\n", val, rc);
 	else
 		printf("[die_test] gc_nand_timing=%s\n", val);
+}
+
+static void reset_die_stats(void)
+{
+	int rc = write_string_file(DIE_STATS_RESET_PATH, "1");
+	if (rc != 0)
+		fprintf(stderr, "[die_test] failed to reset die_stats (%d)\n", rc);
+}
+
+static void dump_die_stats(const char *phase)
+{
+	FILE *fp = fopen(DIE_STATS_PATH, "r");
+	char line[256];
+
+	if (!fp) {
+		fprintf(stderr, "[die_test] cannot read %s\n", DIE_STATS_PATH);
+		return;
+	}
+	printf("[die_stats] phase=%s\n", phase);
+	while (fgets(line, sizeof(line), fp)) {
+		size_t len = strlen(line);
+		if (len > 0 && line[len - 1] == '\n')
+			line[len - 1] = '\0';
+		printf("[die_stats] %s\n", line);
+	}
+	fclose(fp);
 }
 
 static int maybe_switch_latency_profile(const struct workload_options *opts,
@@ -1805,6 +1833,8 @@ struct concurrent_read_ctx {
 	unsigned int thread_id;
 	const char *db_path;
 	const struct dataset_layout *layout;
+	unsigned int tbl_start;
+	unsigned int tbl_end;
 	unsigned int reads_per_tbl;
 	unsigned int seed;
 	double elapsed_sec;
@@ -1815,7 +1845,6 @@ static void *random_read_worker(void *arg)
 {
 	struct concurrent_read_ctx *ctx = arg;
 	sqlite3 *db = NULL;
-	unsigned int tbl_count = ctx->layout->table_count;
 	unsigned int seed = ctx->seed;
 	double start, end;
 	unsigned long long total_rows = 0;
@@ -1831,7 +1860,7 @@ static void *random_read_worker(void *arg)
 
 	start = monotonic_sec();
 
-	for (unsigned int tbl = 0; tbl < tbl_count; ++tbl) {
+	for (unsigned int tbl = ctx->tbl_start; tbl < ctx->tbl_end; ++tbl) {
 		char table_name[MAX_TABLE_NAME];
 		char sql[256];
 		sqlite3_stmt *stmt = NULL;
@@ -1852,7 +1881,7 @@ static void *random_read_worker(void *arg)
 		}
 
 		for (unsigned int r = 0; r < ctx->reads_per_tbl; ++r) {
-			unsigned int row_id = (unsigned int)(rand_r(&seed) % max_row) + 1;
+			unsigned int row_id = (unsigned int)(rand_r(&seed) % max_row);
 
 			sqlite3_reset(stmt);
 			sqlite3_bind_int(stmt, 1, (int)row_id);
@@ -1875,7 +1904,8 @@ static double run_cold_random_concurrent_read(const char *db_path,
 					      const struct dataset_layout *layout,
 					      unsigned int threads,
 					      unsigned int reads_per_tbl,
-					      unsigned int base_seed)
+					      unsigned int base_seed,
+					      unsigned long long *total_rows_out)
 {
 	pthread_t *tids;
 	struct concurrent_read_ctx *ctxs;
@@ -1898,16 +1928,27 @@ static double run_cold_random_concurrent_read(const char *db_path,
 
 	drop_page_cache();
 
+	unsigned int tbl_count = layout->table_count;
+	unsigned int base_per_thread = tbl_count / threads;
+	unsigned int remainder = tbl_count % threads;
+	unsigned int tbl_off = 0;
+
 	wall_start = monotonic_sec();
 
 	for (unsigned int i = 0; i < threads; ++i) {
+		unsigned int n = base_per_thread + (i < remainder ? 1 : 0);
 		ctxs[i].thread_id = i;
 		ctxs[i].db_path = db_path;
 		ctxs[i].layout = layout;
+		ctxs[i].tbl_start = tbl_off;
+		ctxs[i].tbl_end = tbl_off + n;
 		ctxs[i].reads_per_tbl = reads_per_tbl;
 		ctxs[i].seed = base_seed + i * 1000;
 		ctxs[i].elapsed_sec = 0.0;
 		ctxs[i].rows_read = 0;
+		printf("[sqlite_cold_random] thread=%u tables=[%u,%u)\n",
+		       i, ctxs[i].tbl_start, ctxs[i].tbl_end);
+		tbl_off += n;
 		pthread_create(&tids[i], NULL, random_read_worker, &ctxs[i]);
 	}
 
@@ -1927,6 +1968,9 @@ static double run_cold_random_concurrent_read(const char *db_path,
 	       "wall_time=%.6fs throughput=%.2fMB/s\n",
 	       threads, reads_per_tbl, total_rows, wall_elapsed,
 	       wall_elapsed > 0 ? data_mb / wall_elapsed : 0.0);
+
+	if (total_rows_out)
+		*total_rows_out = total_rows;
 
 	free(tids);
 	free(ctxs);
@@ -2968,22 +3012,28 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 			goto out;
 		read_repromotion_toggled = true;
 	}
-	if (opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CONCURRENT)
+	if (opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CONCURRENT) {
+		reset_die_stats();
 		set_gc_nand_timing(1);
+	}
 
+	unsigned long long concurrent_rows_read = 0;
 	if (opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CONCURRENT) {
 		cold_read_time = run_cold_random_concurrent_read(
 			db_path, layout,
 			opts->cold_concurrent_threads,
 			opts->cold_random_reads_per_tbl,
-			opts->seed);
+			opts->seed,
+			&concurrent_rows_read);
 	} else {
 		cold_read_time = run_cold_full_read(db, layout, opts->cold_full_read_mode,
 						    cold_read_iters, read_plan, cold_per_table);
 	}
 
-	if (opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CONCURRENT)
+	if (opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CONCURRENT) {
 		set_gc_nand_timing(0);
+		dump_die_stats("cold-read");
+	}
 	if (read_repromotion_toggled) {
 		rc = set_read_repromotion_state(opts, true, "cold-read-end");
 		if (rc != 0)
@@ -3030,10 +3080,15 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	report_cold_tail_latency(layout, tables, table_latency, table_read_ops);
 
 	double cold_bytes_mb = 0.0;
-	for (unsigned int tbl = 0; tbl < table_count; ++tbl) {
-		unsigned int tbl_reads = read_plan ? read_plan[tbl] : 1U;
-		cold_bytes_mb += (double)layout->rows_per_table[tbl] * tbl_reads *
-				 ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+	if (opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CONCURRENT) {
+		cold_bytes_mb = (double)concurrent_rows_read *
+				ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+	} else {
+		for (unsigned int tbl = 0; tbl < table_count; ++tbl) {
+			unsigned int tbl_reads = read_plan ? read_plan[tbl] : 1U;
+			cold_bytes_mb += (double)layout->rows_per_table[tbl] * tbl_reads *
+					 ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+		}
 	}
 	double cold_throughput = cold_read_time > 0.0 ? cold_bytes_mb / cold_read_time : 0.0;
 
@@ -3045,7 +3100,7 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	       cold_full_read_mode_name(opts->cold_full_read_mode), cold_read_iters,
 	       opts->cold_disable_read_repromotion ? "off" : "on", db_path);
 
-	if (cold_per_table) {
+	if (cold_per_table && opts->cold_full_read_mode != COLD_FULL_READ_RANDOM_CONCURRENT) {
 		for (unsigned int tbl = 0; tbl < table_count; ++tbl) {
 			char name[MAX_TABLE_NAME];
 			unsigned int tbl_reads = read_plan ? read_plan[tbl] : 1U;

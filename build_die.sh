@@ -3,53 +3,72 @@
 # build_die.sh - Build NVMeVirt kernel module with die-contention timing enabled.
 #
 # Usage:
-#   ./build_die.sh die_all    # die affinity ON  + GC NAND timing ON
-#   ./build_die.sh die_no2    # die affinity OFF + GC NAND timing ON
+#   ./build_die.sh die_all       # QLC hot/cold ON  + die affinity ON
+#   ./build_die.sh die_no1       # QLC hot/cold OFF + die affinity ON
+#   ./build_die.sh die_no2       # QLC hot/cold ON  + die affinity OFF
+#   ./build_die.sh die_base      # QLC hot/cold OFF + die affinity OFF
+#   ./build_die.sh all           # build all four variants
 #
-# Output:
-#   nvmev_die_all.ko  or  nvmev_die_no2.ko
-#
-# Key difference from the normal build:
-#   ssd_die.c removes the GC_IO early-return in ssd_advance_nand(),
-#   so GC/migration I/O goes through real die-level NAND timing.
+# All variants use ssd_die.c which adds per-die conflict counters
+# and a runtime gc_nand_timing toggle via sysfs.
 
-VARIANT="${1:?Usage: $0 die_all|die_no2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-if [[ "$VARIANT" != "die_all" && "$VARIANT" != "die_no2" ]]; then
-    echo "Error: variant must be 'die_all' or 'die_no2'" >&2
-    exit 1
-fi
+# Map variant name to conv_ftl source file
+ftl_source_for() {
+    case "$1" in
+        die_all)  echo "conv_ftl.c"          ;;
+        die_no1)  echo "conv_ftl_no1.c"      ;;
+        die_no2)  echo "conv_ftl_no2.c"      ;;
+        die_base) echo "conv_ftl_baseline.c"  ;;
+        *) echo "UNKNOWN"; return 1           ;;
+    esac
+}
 
-echo "=== Building nvmev_${VARIANT}.ko ==="
+build_one() {
+    local variant="$1"
+    local ftl_src
+    ftl_src="$(ftl_source_for "$variant")"
 
-# Back up originals
-cp ssd.c ssd.c.bak
-cp conv_ftl.c conv_ftl.c.bak
+    if [[ ! -f "$ftl_src" ]]; then
+        echo "ERROR: $ftl_src not found for variant $variant" >&2
+        return 1
+    fi
 
-# Swap in die-test ssd (GC NAND timing enabled)
-cp ssd_die.c ssd.c
+    echo ""
+    echo "=== Building nvmev_${variant}.ko  (ftl=$ftl_src) ==="
 
-# Swap in the right conv_ftl variant
-if [[ "$VARIANT" == "die_all" ]]; then
-    # conv_ftl.c already has die affinity - use the backup we just made
+    cp ssd.c ssd.c.bak
+    cp conv_ftl.c conv_ftl.c.bak
+
+    cp ssd_die.c ssd.c
+    if [[ "$ftl_src" != "conv_ftl.c" ]]; then
+        cp "$ftl_src" conv_ftl.c
+    else
+        cp conv_ftl.c.bak conv_ftl.c
+    fi
+
+    make clean
+    make APPROACH=on
+
+    cp nvmev.ko "nvmev_${variant}.ko"
+    echo "=== Built: nvmev_${variant}.ko ==="
+
+    cp ssd.c.bak ssd.c
     cp conv_ftl.c.bak conv_ftl.c
+    rm -f ssd.c.bak conv_ftl.c.bak
+}
+
+if [[ "${1:-}" == "all" ]]; then
+    for v in die_base die_no1 die_no2 die_all; do
+        build_one "$v"
+    done
+    echo ""
+    echo "=== All variants built ==="
+    ls -lh nvmev_die_*.ko
 else
-    cp baseline_versions/conv_ftl_no2.c conv_ftl.c
+    VARIANT="${1:?Usage: $0 die_all|die_no1|die_no2|die_base|all}"
+    ftl_source_for "$VARIANT" >/dev/null || { echo "Unknown variant '$VARIANT'" >&2; exit 1; }
+    build_one "$VARIANT"
 fi
-
-# Build
-make clean
-make APPROACH=on   # DIEAFFINITY=1 for both (not used at runtime, but keeps build consistent)
-
-# Save the output module
-cp nvmev.ko "nvmev_${VARIANT}.ko"
-echo "=== Built: nvmev_${VARIANT}.ko ==="
-
-# Restore originals
-cp ssd.c.bak ssd.c
-cp conv_ftl.c.bak conv_ftl.c
-rm -f ssd.c.bak conv_ftl.c.bak
-
-echo "=== Original files restored ==="

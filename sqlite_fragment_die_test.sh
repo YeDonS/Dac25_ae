@@ -2,13 +2,15 @@
 #
 # sqlite_fragment_die_test.sh
 #
-# Die-contention test: compares die_all (die affinity ON) vs die_no2 (die affinity OFF)
-# with GC NAND timing enabled, using concurrent random cold reads.
+# Die-contention test: compares 4 FTL variants with concurrent random cold reads.
+#   die_base: QLC hot/cold OFF + die affinity OFF
+#   die_no1:  QLC hot/cold OFF + die affinity ON
+#   die_no2:  QLC hot/cold ON  + die affinity OFF
+#   die_all:  QLC hot/cold ON  + die affinity ON
 #
 # Prerequisites:
-#   1. Run  cd nvmevirt_DA && ./build_die.sh die_all && ./build_die.sh die_no2
-#      to produce nvmev_die_all.ko and nvmev_die_no2.ko
-#   2. Ensure sqlite3 dev headers are installed.
+#   cd nvmevirt_DA && ./build_die.sh all
+#   (produces nvmev_die_base.ko, nvmev_die_no1.ko, nvmev_die_no2.ko, nvmev_die_all.ko)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -18,7 +20,7 @@ source commonvariables.sh
 # ---------- tunables ----------
 THREAD_COUNTS="${THREAD_COUNTS:-4 8 16}"
 COLD_READS_PER_TBL="${COLD_READS_PER_TBL:-5000}"
-VARIANTS="${VARIANTS:-die_all die_no2}"
+VARIANTS="${VARIANTS:-die_base die_no1 die_no2 die_all}"
 
 SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
 SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-100}
@@ -84,7 +86,8 @@ load_die_module() {
 run_one_test() {
     local variant="$1"
     local threads="$2"
-    local tag="die_${variant}_t${threads}"
+    local tag="fragment_on_${variant}_t${threads}"
+    local init_txt="${RESULT_FOLDER%/}/sqlite_fragment_on_init_${variant}_t${threads}.txt"
     local out_dir="${DIE_RESULT_BASE}/${variant}/t${threads}"
 
     mkdir -p "$out_dir"
@@ -137,15 +140,16 @@ run_one_test() {
         --strict-cold-per-select \
         "${extra_args[@]}" \
         --tag "$tag" \
-        >"${out_dir}/sqlite_${tag}_init.txt" 2>&1
+        >"$init_txt" 2>&1
 
-    # Copy result CSVs into the per-test output directory
+    # Copy to per-test subdirectory for organization
+    cp "$init_txt" "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_tier_${tag}.csv "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_${tag}.csv      "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_row_${tag}.csv         "${out_dir}/" 2>/dev/null || true
 
     echo "=== Done: variant=$variant threads=$threads ==="
-    echo "  Output: ${out_dir}/sqlite_${tag}_init.txt"
+    echo "  Output: $init_txt"
 
     source resetdevice.sh
     sleep 1
@@ -156,8 +160,8 @@ run_one_test() {
 
 mkdir -p "$DIE_RESULT_BASE"
 
-for variant in $VARIANTS; do
-    for threads in $THREAD_COUNTS; do
+for threads in $THREAD_COUNTS; do
+    for variant in $VARIANTS; do
         run_one_test "$variant" "$threads"
     done
 done

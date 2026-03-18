@@ -11,6 +11,47 @@
 static int gc_nand_timing = 0;
 module_param(gc_nand_timing, int, 0664);
 
+#define DIE_STAT_MAX 64
+static atomic_long_t die_read_total[DIE_STAT_MAX];
+static atomic_long_t die_read_conflict[DIE_STAT_MAX];
+static atomic_long_t die_read_wait_ns[DIE_STAT_MAX];
+
+static int die_stats_reset = 0;
+static int die_stats_set_reset(const char *val, const struct kernel_param *kp) {
+	int i;
+	for (i = 0; i < DIE_STAT_MAX; i++) {
+		atomic_long_set(&die_read_total[i], 0);
+		atomic_long_set(&die_read_conflict[i], 0);
+		atomic_long_set(&die_read_wait_ns[i], 0);
+	}
+	return 0;
+}
+static const struct kernel_param_ops die_stats_reset_ops = {
+	.set = die_stats_set_reset,
+	.get = param_get_int,
+};
+module_param_cb(die_stats_reset, &die_stats_reset_ops, &die_stats_reset, 0664);
+
+static char die_stats_buf[4096];
+static int die_stats_get(char *buf, const struct kernel_param *kp) {
+	int i, len = 0;
+	for (i = 0; i < DIE_STAT_MAX; i++) {
+		long total = atomic_long_read(&die_read_total[i]);
+		if (total == 0) continue;
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+			"die%d reads=%ld conflicts=%ld wait_ns=%ld\n",
+			i, total,
+			atomic_long_read(&die_read_conflict[i]),
+			atomic_long_read(&die_read_wait_ns[i]));
+	}
+	return len;
+}
+static const struct kernel_param_ops die_stats_show_ops = {
+	.set = die_stats_set_reset,
+	.get = die_stats_get,
+};
+module_param_cb(die_stats, &die_stats_show_ops, &die_stats_buf, 0664);
+
 static inline void compute_line_distribution(uint32_t total_lines,
 					     uint32_t *slc_lines,
 					     uint32_t *qlc_lines)
@@ -699,6 +740,18 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 	case NAND_READ:
 		/* read: perform NAND cmd first */
 		nand_stime = max(lun->next_lun_avail_time, cmd_stime);
+
+		if (ncmd->type != GC_IO) {
+			int die_idx = ppa->g.lun * spp->nchs + ppa->g.ch;
+			if (die_idx >= 0 && die_idx < DIE_STAT_MAX) {
+				atomic_long_inc(&die_read_total[die_idx]);
+				if (nand_stime > cmd_stime) {
+					atomic_long_inc(&die_read_conflict[die_idx]);
+					atomic_long_add((long)(nand_stime - cmd_stime),
+							&die_read_wait_ns[die_idx]);
+				}
+			}
+		}
 
 		if (is_qlc) {
 			/* QLC 读延迟 */
