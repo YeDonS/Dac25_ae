@@ -39,6 +39,13 @@ build_one() {
     echo ""
     echo "=== Building nvmev_${variant}.ko  (ftl=$ftl_src) ==="
 
+    # Save previously built die .ko files before make clean wipes them
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    for f in nvmev_die_*.ko; do
+        [[ -f "$f" ]] && cp "$f" "$tmpdir/"
+    done
+
     cp ssd.c ssd.c.bak
     cp conv_ftl.c conv_ftl.c.bak
 
@@ -54,6 +61,12 @@ build_one() {
 
     cp nvmev.ko "nvmev_${variant}.ko"
     echo "=== Built: nvmev_${variant}.ko ==="
+
+    # Restore previously built die .ko files
+    for f in "$tmpdir"/nvmev_die_*.ko; do
+        [[ -f "$f" ]] && cp "$f" .
+    done
+    rm -rf "$tmpdir"
 
     cp ssd.c.bak ssd.c
     cp conv_ftl.c.bak conv_ftl.c
