@@ -1933,7 +1933,7 @@ static double run_cold_random_concurrent_read(const char *db_path,
 	unsigned long long total_rows = 0;
 
 	if (!threads)
-		threads = 8;
+		threads = 1;
 	if (!reads_per_tbl)
 		reads_per_tbl = 5000;
 
@@ -3950,7 +3950,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->cold_full_read_iters = 1;
 	opts->cold_disable_read_repromotion = false;
 	opts->read_repromotion_ctrl_path = DEFAULT_READ_REPROMOTION_CTRL_PATH;
-	opts->cold_concurrent_threads = 8;
+	opts->cold_concurrent_threads = 1;
 	opts->cold_random_reads_per_tbl = 5000;
 	opts->dummy_interleave = false;
 	opts->dummy_stripe_bytes = DEFAULT_DUMMY_STRIPE_BYTES;
@@ -4104,7 +4104,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		case 1028:
 			opts->cold_concurrent_threads = (unsigned int)strtoul(optarg, NULL, 10);
 			if (opts->cold_concurrent_threads == 0)
-				opts->cold_concurrent_threads = 8;
+				opts->cold_concurrent_threads = 1;
 			break;
 		case 1029:
 			opts->cold_random_reads_per_tbl = (unsigned int)strtoul(optarg, NULL, 10);

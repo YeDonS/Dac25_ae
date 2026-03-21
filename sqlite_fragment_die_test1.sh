@@ -23,9 +23,9 @@ cd "$SCRIPT_DIR"
 source commonvariables.sh
 
 # ---------- tunables ----------
-THREAD_COUNTS="${THREAD_COUNTS:-4 8 16}"
+THREAD_COUNTS="${THREAD_COUNTS:-1 4 8}"
 COLD_READS_PER_TBL="${COLD_READS_PER_TBL:-5000}"
-VARIANTS="${VARIANTS:-die_base die_no1 die_no2 die_all}"
+VARIANTS="${VARIANTS:-die_base die_no1 die_no2 die_no3 die_all}"
 
 SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
 SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-100}
