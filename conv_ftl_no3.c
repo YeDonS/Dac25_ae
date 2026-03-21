@@ -19,7 +19,7 @@
 #include <linux/hashtable.h>
 #include <linux/spinlock.h>
 #include <linux/moduleparam.h>
-/* kthread/waitqueue no longer needed (threads removed) */
+#include <linux/workqueue.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -54,8 +54,8 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define RECENT_WRITE_GUARD_PCT 10U
 #define QLC_FAST_HIGH_WM_PCT 90U
 #define QLC_FAST_TARGET_WM_PCT 80U
-#define QLC_PROMOTE_RATIO_NUM 3U
-#define QLC_PROMOTE_RATIO_DEN 2U
+#define QLC_PROMOTE_RATIO_NUM 1U
+#define QLC_PROMOTE_RATIO_DEN 1U
 #define QLC_REBALANCE_SCAN_LIMIT 4096U
 
 struct nvmev_cmd_debug {
@@ -326,13 +326,18 @@ static inline void collect_qlc_stats(struct conv_ftl *conv_ftl,
 
 static inline uint32_t pick_locked_qlc_page_type(struct conv_ftl *conv_ftl, bool warm)
 {
-	/* [DISABLED] Mechanism 3: round-robin all 4 zones (L->CL->CU->U) */
 	uint32_t type;
 
 	if (!conv_ftl)
 		return QLC_PAGE_TYPE_L;
 
-	type = conv_ftl->qlc_zone_rr_cursor++ % QLC_PAGE_PATTERN;
+	if (warm)
+		type = (conv_ftl->qlc_zone_rr_cursor++ & 0x1) ?
+		       QLC_PAGE_TYPE_CL : QLC_PAGE_TYPE_L;
+	else
+		type = (conv_ftl->qlc_zone_rr_cursor++ & 0x1) ?
+		       QLC_PAGE_TYPE_U : QLC_PAGE_TYPE_CU;
+
 	return type;
 }
 
@@ -361,6 +366,8 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
 static void qlc_maybe_rebalance_internal(struct conv_ftl *conv_ftl);
+static void bg_repromotion_worker(struct work_struct *work);
+static void bg_qlc_rebalance_worker(struct work_struct *work);
 /* 无阈值：总是尝试从 SLC 迁移少量更冷页面到 QLC */
 static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_pages)
 {
@@ -1783,6 +1790,16 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->enable_read_repromotion = true;
 	spin_lock_init(&conv_ftl->qlc_zone_lock);
 
+	/* 后台迁移 workqueue 初始化 */
+	conv_ftl->bg_migration_wq = alloc_workqueue("nvmev_bg_mig",
+						     WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	INIT_WORK(&conv_ftl->repromotion_work, bg_repromotion_worker);
+	INIT_WORK(&conv_ftl->qlc_rebalance_work, bg_qlc_rebalance_worker);
+	atomic64_set(&conv_ftl->total_host_reads, 0);
+	spin_lock_init(&conv_ftl->repromote_queue_lock);
+	conv_ftl->repromote_head = 0;
+	conv_ftl->repromote_tail = 0;
+
 	/* 直接初始化水位线（无后台线程） */
 	{
 		uint64_t slc_total_pages = total_slc_pages(conv_ftl);
@@ -1817,24 +1834,28 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		struct dentry *parent = conv_ftl->debug_dir ? conv_ftl->debug_dir :
 							   nvmev_debugfs_root();
 
-		conv_ftl->debug_access_count =
-			debugfs_create_file("access_count", 0440, parent,
+			conv_ftl->debug_access_count =
+				debugfs_create_file("access_count", 0440, parent,
 					    conv_ftl, &access_count_fops);
-		conv_ftl->debug_access_inject =
-			debugfs_create_file("access_inject", 0200, parent,
+			conv_ftl->debug_access_inject =
+				debugfs_create_file("access_inject", 0200, parent,
 					    conv_ftl, &access_inject_fops);
-		conv_ftl->debug_page_tier =
-			debugfs_create_file("page_tier", 0440, parent,
+			conv_ftl->debug_page_tier =
+				debugfs_create_file("page_tier", 0440, parent,
 					    conv_ftl, &page_tier_fops);
-		conv_ftl->debug_read_repromotion = NULL;
-	}
+			conv_ftl->debug_read_repromotion = NULL;
+		}
 
 	return;
 }
 
 static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
-	/* 无后台线程可停止（同步模式） */
+	if (conv_ftl->bg_migration_wq) {
+		flush_workqueue(conv_ftl->bg_migration_wq);
+		destroy_workqueue(conv_ftl->bg_migration_wq);
+		conv_ftl->bg_migration_wq = NULL;
+	}
 
 	if (conv_ftl->debug_dir) {
 		debugfs_remove_recursive(conv_ftl->debug_dir);
@@ -1852,15 +1873,15 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 			debugfs_remove(conv_ftl->debug_access_inject);
 			conv_ftl->debug_access_inject = NULL;
 		}
-		if (conv_ftl->debug_page_tier) {
-			debugfs_remove(conv_ftl->debug_page_tier);
-			conv_ftl->debug_page_tier = NULL;
+			if (conv_ftl->debug_page_tier) {
+				debugfs_remove(conv_ftl->debug_page_tier);
+				conv_ftl->debug_page_tier = NULL;
+			}
+			if (conv_ftl->debug_read_repromotion) {
+				debugfs_remove(conv_ftl->debug_read_repromotion);
+				conv_ftl->debug_read_repromotion = NULL;
+			}
 		}
-		if (conv_ftl->debug_read_repromotion) {
-			debugfs_remove(conv_ftl->debug_read_repromotion);
-			conv_ftl->debug_read_repromotion = NULL;
-		}
-	}
 	
 	/* 清理 SLC/QLC 相关资源 */
 	remove_slc_lines(conv_ftl);
@@ -3497,12 +3518,12 @@ static int migrate_page_within_qlc(struct conv_ftl *conv_ftl, uint64_t lpn,
 static void qlc_maybe_rebalance_internal(struct conv_ftl *conv_ftl)
 {
 	struct heat_tracking *ht;
-	uint32_t period;
 	uint32_t promote_budget, demote_budget;
 	uint64_t avg_reads, promote_th;
 	uint64_t qlc_total_pages, qlc_fast_pages;
 	uint64_t fast_pct;
 	uint32_t promoted = 0, demoted = 0;
+	uint64_t rd_seq;
 
 	if (!conv_ftl || !conv_ftl->ssd)
 		return;
@@ -3511,18 +3532,12 @@ static void qlc_maybe_rebalance_internal(struct conv_ftl *conv_ftl)
 	if (!ht || !ht->access_count)
 		return;
 
-	period = conv_ftl->qlc_rebalance_period_writes;
-	if (!period)
-		period = 1;
-	if (!conv_ftl->total_host_writes ||
-	    (conv_ftl->total_host_writes % period) != 0)
-		return;
-
 	if (!calc_global_avg_reads(conv_ftl, &avg_reads))
 		return;
 	promote_th = qlc_calc_promote_threshold(avg_reads);
 
-	if ((conv_ftl->total_host_writes % (period * 100)) == 0) {
+	rd_seq = atomic64_read(&conv_ftl->total_host_reads);
+	if ((rd_seq % 1000) == 0) {
 		uint64_t cal_total, cal_fast;
 		qlc_count_resident_distribution(conv_ftl, &cal_total, &cal_fast);
 		conv_ftl->qlc_fast_count = cal_fast;
@@ -3739,6 +3754,37 @@ static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
     
     NVMEV_DEBUG("Migrated LPN %llu from SLC to QLC (zone_hint=%u)\n", lpn, zone_hint);
 }
+
+static void bg_repromotion_worker(struct work_struct *work)
+{
+	struct conv_ftl *conv_ftl = container_of(work, struct conv_ftl, repromotion_work);
+	uint64_t lpn;
+	struct ppa ppa, cur;
+	uint64_t migration_done = 0;
+
+	while (1) {
+		spin_lock(&conv_ftl->repromote_queue_lock);
+		if (conv_ftl->repromote_head == conv_ftl->repromote_tail) {
+			spin_unlock(&conv_ftl->repromote_queue_lock);
+			break;
+		}
+		lpn = conv_ftl->repromote_lpns[conv_ftl->repromote_head];
+		ppa = conv_ftl->repromote_ppas[conv_ftl->repromote_head];
+		conv_ftl->repromote_head =
+			(conv_ftl->repromote_head + 1) % REPROMOTE_QUEUE_SIZE;
+		spin_unlock(&conv_ftl->repromote_queue_lock);
+
+		cur = get_maptbl_ent(conv_ftl, lpn);
+		if (cur.ppa == ppa.ppa && !is_slc_block(conv_ftl, cur.g.blk))
+			migrate_page_to_slc(conv_ftl, lpn, &cur, &migration_done);
+	}
+}
+
+static void bg_qlc_rebalance_worker(struct work_struct *work)
+{
+	(void)work;
+}
+
 static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
@@ -3757,6 +3803,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	uint32_t xfer_size, i;
 	uint32_t nr_parts = ns->nr_parts;
 
+	uint64_t rd_seq;
 	struct ppa prev_ppa;
 	uint64_t prev_lpn = INVALID_LPN;
 	struct nand_cmd srd = {
@@ -3787,6 +3834,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
         ret->nsecs_target = nsecs_start;
         return true; /* Return completion with error to avoid host timeout */
     }
+
+	rd_seq = atomic64_inc_return(&conv_ftl->total_host_reads);
 
 	if (LBA_TO_BYTE(nr_lba) <= (KB(4) * nr_parts)) {
 		srd.stime += spp->fw_4kb_rd_lat;
@@ -3832,37 +3881,30 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			/* 更新热数据跟踪信息 */
 			update_heat_info(conv_ftl, local_lpn, true);
 
-				if (conv_ftl->enable_read_repromotion &&
-				    !is_slc_block(conv_ftl, cur_ppa.g.blk) && has_avg &&
-				    ht && ht->access_count) {
-					uint64_t access_cnt = ht->access_count[local_lpn];
+			if (conv_ftl->enable_read_repromotion &&
+			    !is_slc_block(conv_ftl, cur_ppa.g.blk) && has_avg &&
+			    ht && ht->access_count) {
+				uint64_t access_cnt = ht->access_count[local_lpn];
 
-					if (access_cnt > avg_reads) {
-						uint64_t migration_done = 0;
-						uint64_t mig_start = ktime_get_ns();
-						NVMEV_DEBUG("[REPROMOTION_VERIFY] Hot LPN %llu (Acc:%llu > Avg:%llu) triggering QLC->SLC migration\n",
-							                               local_lpn, access_cnt, avg_reads);
+				if (access_cnt > avg_reads) {
+					uint32_t next_tail;
 
-						migrate_page_to_slc(conv_ftl, local_lpn, &cur_ppa,
-								    &migration_done);
-						cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
-						conv_ftl->migration_read_path_time_ns +=
-							ktime_get_ns() - mig_start;
-						NVMEV_DEBUG("[REPROMOTION_VERIFY] LPN %llu Promoted. Extra Latency: %llu ns\n",
-							                               local_lpn,ktime_get_ns() - mig_start);
-						conv_ftl->migration_read_path_count++;
-						if (migration_done)
-							nsecs_latest = max(nsecs_latest, migration_done);
-
-						printk_ratelimited(KERN_INFO
-							"[COLD_MIG_PROBE] mig lpn=%llu acc=%llu avg=%llu mig_sim_done=%llu rd_sim_start=%llu wall_ns=%llu total_mig=%llu\n",
-							local_lpn, access_cnt, avg_reads,
-							migration_done,
-							nsecs_start,
-							(uint64_t)(ktime_get_ns() - mig_start),
-							conv_ftl->migration_read_path_count);
+					spin_lock(&conv_ftl->repromote_queue_lock);
+					next_tail = (conv_ftl->repromote_tail + 1) %
+						    REPROMOTE_QUEUE_SIZE;
+					if (next_tail != conv_ftl->repromote_head) {
+						conv_ftl->repromote_lpns[conv_ftl->repromote_tail] = local_lpn;
+						conv_ftl->repromote_ppas[conv_ftl->repromote_tail] = cur_ppa;
+						conv_ftl->repromote_tail = next_tail;
 					}
+					spin_unlock(&conv_ftl->repromote_queue_lock);
+
+					if (conv_ftl->bg_migration_wq)
+						queue_work(conv_ftl->bg_migration_wq,
+							   &conv_ftl->repromotion_work);
+					conv_ftl->migration_read_path_count++;
 				}
+			}
 
 				{
 					struct nand_page *pg_chk;
@@ -3982,6 +4024,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			}
 		}
 	}
+
+	/* [DISABLED] QLC internal rebalance disabled in no3 variant */
 
 ret->nsecs_target = nsecs_latest;
 	ret->status = NVME_SC_SUCCESS;
@@ -4485,8 +4529,6 @@ retry_wb_alloc:
 		/* 更新热数据信息 */
 		update_heat_info(conv_ftl, local_lpn, false);
 		conv_ftl->heat_track.last_access_time[local_lpn] = __get_ioclock(conv_ftl->ssd);
-		qlc_maybe_rebalance_internal(conv_ftl);
-		
 
 			/* 检查是否需要触发后台迁移 */
 			collect_slc_stats(conv_ftl, &slc_stats_tail);

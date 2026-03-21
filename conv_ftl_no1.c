@@ -19,7 +19,7 @@
 #include <linux/hashtable.h>
 #include <linux/spinlock.h>
 #include <linux/moduleparam.h>
-/* kthread/waitqueue no longer needed (threads removed) */
+#include <linux/workqueue.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -361,6 +361,8 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
 static void qlc_maybe_rebalance_internal(struct conv_ftl *conv_ftl);
+static void bg_repromotion_worker(struct work_struct *work);
+static void bg_qlc_rebalance_worker(struct work_struct *work);
 /* 无阈值：总是尝试从 SLC 迁移少量更冷页面到 QLC */
 static void migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t max_pages)
 {
@@ -1783,6 +1785,16 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->enable_read_repromotion = false;
 	spin_lock_init(&conv_ftl->qlc_zone_lock);
 
+	/* 后台迁移 workqueue 初始化 */
+	conv_ftl->bg_migration_wq = alloc_workqueue("nvmev_bg_mig",
+						     WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	INIT_WORK(&conv_ftl->repromotion_work, bg_repromotion_worker);
+	INIT_WORK(&conv_ftl->qlc_rebalance_work, bg_qlc_rebalance_worker);
+	atomic64_set(&conv_ftl->total_host_reads, 0);
+	spin_lock_init(&conv_ftl->repromote_queue_lock);
+	conv_ftl->repromote_head = 0;
+	conv_ftl->repromote_tail = 0;
+
 	/* 直接初始化水位线（无后台线程） */
 	{
 		uint64_t slc_total_pages = total_slc_pages(conv_ftl);
@@ -1834,7 +1846,11 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
-	/* 无后台线程可停止（同步模式） */
+	if (conv_ftl->bg_migration_wq) {
+		flush_workqueue(conv_ftl->bg_migration_wq);
+		destroy_workqueue(conv_ftl->bg_migration_wq);
+		conv_ftl->bg_migration_wq = NULL;
+	}
 
 	if (conv_ftl->debug_dir) {
 		debugfs_remove_recursive(conv_ftl->debug_dir);
@@ -3739,6 +3755,17 @@ static void migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
     
     NVMEV_DEBUG("Migrated LPN %llu from SLC to QLC (zone_hint=%u)\n", lpn, zone_hint);
 }
+
+static void bg_repromotion_worker(struct work_struct *work)
+{
+	(void)work;
+}
+
+static void bg_qlc_rebalance_worker(struct work_struct *work)
+{
+	(void)work;
+}
+
 static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;

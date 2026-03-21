@@ -3,11 +3,12 @@
 # build_die.sh - Build NVMeVirt kernel module with die-contention timing enabled.
 #
 # Usage:
-#   ./build_die.sh die_all       # QLC hot/cold ON  + die affinity ON
-#   ./build_die.sh die_no1       # QLC hot/cold OFF + die affinity ON
-#   ./build_die.sh die_no2       # QLC hot/cold ON  + die affinity OFF
-#   ./build_die.sh die_base      # QLC hot/cold OFF + die affinity OFF
-#   ./build_die.sh all           # build all four variants
+#   ./build_die.sh die_all       # repromotion ON  + QLC internal migration ON
+#   ./build_die.sh die_no1       # repromotion OFF + QLC internal migration OFF
+#   ./build_die.sh die_no2       # repromotion ON  + QLC internal migration ON  (variant 2)
+#   ./build_die.sh die_no3       # repromotion ON  + QLC internal migration OFF
+#   ./build_die.sh die_base      # repromotion OFF + QLC internal migration OFF (baseline)
+#   ./build_die.sh all           # build all five variants
 #
 # All variants use ssd_die.c which adds per-die conflict counters
 # and a runtime gc_nand_timing toggle via sysfs.
@@ -21,6 +22,7 @@ ftl_source_for() {
         die_all)  echo "conv_ftl.c"          ;;
         die_no1)  echo "conv_ftl_no1.c"      ;;
         die_no2)  echo "conv_ftl_no2.c"      ;;
+        die_no3)  echo "conv_ftl_no3.c"      ;;
         die_base) echo "conv_ftl_baseline.c"  ;;
         *) echo "UNKNOWN"; return 1           ;;
     esac
@@ -74,14 +76,14 @@ build_one() {
 }
 
 if [[ "${1:-}" == "all" ]]; then
-    for v in die_base die_no1 die_no2 die_all; do
+    for v in die_base die_no1 die_no2 die_no3 die_all; do
         build_one "$v"
     done
     echo ""
     echo "=== All variants built ==="
     ls -lh nvmev_die_*.ko
 else
-    VARIANT="${1:?Usage: $0 die_all|die_no1|die_no2|die_base|all}"
+    VARIANT="${1:?Usage: $0 die_all|die_no1|die_no2|die_no3|die_base|all}"
     ftl_source_for "$VARIANT" >/dev/null || { echo "Unknown variant '$VARIANT'" >&2; exit 1; }
     build_one "$VARIANT"
 fi

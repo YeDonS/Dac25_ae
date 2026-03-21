@@ -151,6 +151,20 @@ struct conv_ftl {
 	uint64_t qlc_slow_count;              /* 当前在 slow zone (U/CU) 的 QLC 页数 */
 	bool enable_read_repromotion;         /* 是否允许读路径触发 QLC->SLC 回迁 */
 
+	/* 后台迁移 workqueue（回迁 + QLC 内部迁移异步执行） */
+	struct workqueue_struct *bg_migration_wq;
+	struct work_struct repromotion_work;
+	struct work_struct qlc_rebalance_work;
+	atomic64_t total_host_reads;
+
+	/* 异步回迁请求环形队列 */
+	spinlock_t repromote_queue_lock;
+#define REPROMOTE_QUEUE_SIZE 32
+	uint64_t repromote_lpns[REPROMOTE_QUEUE_SIZE];
+	struct ppa repromote_ppas[REPROMOTE_QUEUE_SIZE];
+	uint32_t repromote_head;
+	uint32_t repromote_tail;
+
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
