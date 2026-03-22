@@ -473,6 +473,29 @@ static inline bool should_gc_qlc_high(struct conv_ftl *conv_ftl)
 	collect_qlc_stats(conv_ftl, &qlc_stats);
 	return qlc_stats.free <= conv_ftl->qlc_gc_free_thres_high;
 }
+
+static inline bool should_gc_slc_any_die_critical(struct conv_ftl *conv_ftl,
+						   uint32_t *starved_die)
+{
+	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	uint32_t die;
+
+	if (!conv_ftl->slc_lunlm)
+		return false;
+
+	spin_lock(&conv_ftl->slc_lock);
+	for (die = 0; die < die_count; die++) {
+		struct line_mgmt *lm = &conv_ftl->slc_lunlm[die];
+		if (lm->free_line_cnt == 0 && lm->victim_line_cnt > 0) {
+			spin_unlock(&conv_ftl->slc_lock);
+			*starved_die = die;
+			return true;
+		}
+	}
+	spin_unlock(&conv_ftl->slc_lock);
+	return false;
+}
+
 static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
 	unsigned seq;
@@ -2795,6 +2818,96 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 	return 0;
 }
 
+static int do_gc_for_die(struct conv_ftl *conv_ftl, uint32_t target_die, bool is_slc)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct line_mgmt *lm;
+	struct line *victim_line;
+	struct ppa ppa;
+	int pg, max_pgs;
+	uint32_t ch = 0, lun = 0;
+	struct convparams *cpp;
+
+	if (is_slc)
+		lm = get_slc_die_lm(conv_ftl, target_die);
+	else
+		lm = get_qlc_die_lm(conv_ftl, target_die);
+
+	if (!lm)
+		return -1;
+
+	spin_lock(is_slc ? &conv_ftl->slc_lock : &conv_ftl->qlc_lock);
+	victim_line = pqueue_peek(lm->victim_line_pq);
+	if (!victim_line) {
+		spin_unlock(is_slc ? &conv_ftl->slc_lock : &conv_ftl->qlc_lock);
+		return -1;
+	}
+	pqueue_pop(lm->victim_line_pq);
+	victim_line->pos = 0;
+	lm->victim_line_cnt--;
+	spin_unlock(is_slc ? &conv_ftl->slc_lock : &conv_ftl->qlc_lock);
+
+	ppa.g.blk = blk_from_line(victim_line->id);
+	ppa.g.pl = 0;
+	decode_die(spp, target_die, &ch, &lun);
+	ppa.g.ch = ch;
+	ppa.g.lun = lun;
+
+	max_pgs = spp->pgs_per_blk;
+	{
+		struct nand_block *victim_blk = get_blk(conv_ftl->ssd, &ppa);
+		if (victim_blk)
+			max_pgs = victim_blk->npgs;
+	}
+
+	{
+		uint32_t pages_moved = 0;
+		bool gc_failed = false;
+
+		for (pg = 0; pg < max_pgs; pg++) {
+			struct nand_page *pg_iter;
+
+			ppa.g.pg = pg;
+			pg_iter = get_pg(conv_ftl->ssd, &ppa);
+
+			if (pg_iter && pg_iter->status == PG_VALID) {
+				if (gc_write_page(conv_ftl, &ppa) < 0) {
+					gc_failed = true;
+					break;
+				}
+				pages_moved++;
+			}
+		}
+
+		if (gc_failed && victim_line->vpc > 0) {
+			spinlock_t *lock = is_slc ? &conv_ftl->slc_lock : &conv_ftl->qlc_lock;
+			spin_lock(lock);
+			pqueue_insert(lm->victim_line_pq, victim_line);
+			lm->victim_line_cnt++;
+			spin_unlock(lock);
+			return -1;
+		}
+	}
+
+	ppa.g.pg = 0;
+	mark_block_free(conv_ftl, &ppa);
+
+	cpp = &conv_ftl->cp;
+	if (cpp->enable_gc_delay) {
+		struct nand_cmd gce = {
+			.type = GC_IO,
+			.cmd = NAND_ERASE,
+			.stime = 0,
+			.interleave_pci_dma = false,
+			.ppa = &ppa,
+		};
+		ssd_advance_nand(conv_ftl->ssd, &gce);
+	}
+
+	mark_line_free(conv_ftl, &ppa);
+	return 0;
+}
+
 static void forground_gc(struct conv_ftl *conv_ftl)
 {
 	static uint64_t fgc_last_print_ns = 0;
@@ -2820,6 +2933,16 @@ static void forground_gc(struct conv_ftl *conv_ftl)
 		fgc_triggered++;
 		do_gc(conv_ftl, true, 0);
 		return;
+	}
+
+	/* per-die 保护：任何 die 的 SLC free=0 且有 victim 可回收 */
+	{
+		uint32_t starved_die;
+		if (should_gc_slc_any_die_critical(conv_ftl, &starved_die)) {
+			fgc_triggered++;
+			do_gc_for_die(conv_ftl, starved_die, true);
+			return;
+		}
 	}
 
 	/* 没触发 GC 时，也每 5 秒打印一次状态（确保总能看到输出） */
@@ -2875,13 +2998,14 @@ static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id)
 	return (blk_id < conv_ftl->slc_blks_per_pl);
 }
 
-/* 获取 SLC 的新页面 - 使用 Die Affinity */
+/* 获取 SLC 的新页面 - 使用 Die Affinity, 支持 die fallback */
 static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	struct nand_page *pg;
-	uint32_t die;
+	uint32_t die, tried;
+	uint32_t die_count;
 	struct write_pointer *wp;
 	struct line_mgmt *lm;
 
@@ -2890,65 +3014,62 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 		return (struct ppa){ .ppa = UNMAPPED_PPA };
 	}
 
-	die = conv_ftl->lunpointer % conv_ftl->die_count;
-	wp = &conv_ftl->slc_lunwp[die];
-	lm = get_slc_die_lm(conv_ftl, die);
-	if (!lm || !lm->lines) {
-		NVMEV_ERROR("SLC line manager missing for die %u\n", die);
-		return (struct ppa){ .ppa = UNMAPPED_PPA };
-	}
+	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
 
-	if (!wp->curline) {
-		spin_lock(&conv_ftl->slc_lock);
-		struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+	for (tried = 0; tried < die_count; tried++) {
+		die = (conv_ftl->lunpointer + tried) % die_count;
+		wp = &conv_ftl->slc_lunwp[die];
+		lm = get_slc_die_lm(conv_ftl, die);
+		if (!lm || !lm->lines)
+			continue;
 
-		if (!curline) {
-			NVMEV_ERROR("No free SLC line available!\n");
+		if (!wp->curline) {
+			struct line *curline;
+
+			spin_lock(&conv_ftl->slc_lock);
+			curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+			if (!curline) {
+				spin_unlock(&conv_ftl->slc_lock);
+				continue;
+			}
+
+			list_del_init(&curline->entry);
+			lm->free_line_cnt--;
+			decode_die(spp, die, &wp->ch, &wp->lun);
+			wp->curline = curline;
+			wp->blk = curline->id;
+			wp->pg = 0;
+			wp->pl = 0;
 			spin_unlock(&conv_ftl->slc_lock);
-			return (struct ppa){ .ppa = UNMAPPED_PPA };
 		}
 
-		NVMEV_DEBUG("[DEBUG] get_new_slc_page: Allocated SLC line with ID %u (range: [0, %u), total_lines=%u)\n",
-			    curline->id, conv_ftl->slc_blks_per_pl, lm->tt_lines);
-		if (curline->id >= conv_ftl->slc_blks_per_pl) {
-			NVMEV_ERROR("[CRITICAL] get_new_slc_page: SLC line ID %u exceeds range [0, %u)\n",
-				    curline->id, conv_ftl->slc_blks_per_pl);
-		}
-
-		list_del_init(&curline->entry);
-		lm->free_line_cnt--;
-
-		decode_die(spp, die, &wp->ch, &wp->lun);
-		wp->curline = curline;
-		wp->blk = curline->id;
-		wp->pg = 0;
-		wp->pl = 0;
-		spin_unlock(&conv_ftl->slc_lock);
-	}
+		if (tried > 0)
+			conv_ftl->lunpointer = die;
 
 retry_get_page:
-	ppa.ppa = 0;
-	ppa.g.ch = wp->ch;
-	ppa.g.lun = wp->lun;
-	ppa.g.pg = wp->pg;
-	ppa.g.blk = wp->blk;
-	ppa.g.pl = wp->pl;
+		ppa.ppa = 0;
+		ppa.g.ch = wp->ch;
+		ppa.g.lun = wp->lun;
+		ppa.g.pg = wp->pg;
+		ppa.g.blk = wp->blk;
+		ppa.g.pl = wp->pl;
 
-	pg = get_pg(conv_ftl->ssd, &ppa);
-	if (!pg)
-		return (struct ppa){ .ppa = UNMAPPED_PPA };
+		pg = get_pg(conv_ftl->ssd, &ppa);
+		if (!pg)
+			continue;
 
-	if (pg->status != PG_FREE) {
-		advance_slc_write_pointer(conv_ftl, die);
-		goto retry_get_page;
+		if (pg->status != PG_FREE) {
+			advance_slc_write_pointer(conv_ftl, die);
+			if (!wp->curline)
+				continue;
+			goto retry_get_page;
+		}
+
+		return ppa;
 	}
 
-	if (ppa.g.blk >= conv_ftl->slc_blks_per_pl) {
-		NVMEV_ERROR("get_new_slc_page: Generated invalid SLC block %u >= %u\n",
-			    ppa.g.blk, conv_ftl->slc_blks_per_pl);
-	}
-
-	return ppa;
+	NVMEV_ERROR("No free SLC line on any die!\n");
+	return (struct ppa){ .ppa = UNMAPPED_PPA };
 }
 
 /* 推进 SLC 写指针 - 使用 Die Affinity */
@@ -3013,66 +3134,73 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die)
 		conv_ftl->lunpointer = (die + 1) % conv_ftl->die_count;
 }
 
-/* 新增：GC 专用 SLC 页面获取（使用 per-die GC 写指针） */
+/* GC 专用 SLC 页面获取, 支持 die fallback */
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	struct write_pointer *wp;
-	struct line_mgmt *lm = NULL;
+	struct line_mgmt *lm;
 	struct nand_page *pg;
+	uint32_t tried;
+	uint32_t die_count;
 
-	if (!conv_ftl->gc_slc_lunwp)
+	if (!conv_ftl->gc_slc_lunwp || conv_ftl->die_count == 0)
 		return (struct ppa){ .ppa = UNMAPPED_PPA };
 
-	if (conv_ftl->die_count == 0)
-		return (struct ppa){ .ppa = UNMAPPED_PPA };
+	die_count = conv_ftl->die_count;
 
-	die %= conv_ftl->die_count;
-	wp = &conv_ftl->gc_slc_lunwp[die];
-	lm = get_slc_die_lm(conv_ftl, die);
-	if (!lm || !lm->lines)
-		return (struct ppa){ .ppa = UNMAPPED_PPA };
+	for (tried = 0; tried < die_count; tried++) {
+		uint32_t candidate = (die + tried) % die_count;
 
-	if (!wp->curline) {
-		spin_lock(&conv_ftl->slc_lock);
-		struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+		wp = &conv_ftl->gc_slc_lunwp[candidate];
+		lm = get_slc_die_lm(conv_ftl, candidate);
+		if (!lm || !lm->lines)
+			continue;
 
-		if (!curline) {
-			NVMEV_ERROR("No free SLC line available for GC (die=%u)!\n", die);
+		if (!wp->curline) {
+			struct line *curline;
+
+			spin_lock(&conv_ftl->slc_lock);
+			curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+			if (!curline) {
+				spin_unlock(&conv_ftl->slc_lock);
+				continue;
+			}
+
+			list_del_init(&curline->entry);
+			lm->free_line_cnt--;
+			decode_die(spp, candidate, &wp->ch, &wp->lun);
+			wp->curline = curline;
+			wp->blk = curline->id;
+			wp->pg = 0;
+			wp->pl = 0;
 			spin_unlock(&conv_ftl->slc_lock);
-			return (struct ppa){ .ppa = UNMAPPED_PPA };
 		}
 
-		list_del_init(&curline->entry);
-		lm->free_line_cnt--;
-
-		decode_die(spp, die, &wp->ch, &wp->lun);
-		wp->curline = curline;
-		wp->blk = curline->id;
-		wp->pg = 0;
-		wp->pl = 0;
-		spin_unlock(&conv_ftl->slc_lock);
-	}
-
 retry_gc_get_page:
-	ppa.ppa = 0;
-	ppa.g.ch = wp->ch;
-	ppa.g.lun = wp->lun;
-	ppa.g.pg = wp->pg;
-	ppa.g.blk = wp->blk;
-	ppa.g.pl = wp->pl;
+		ppa.ppa = 0;
+		ppa.g.ch = wp->ch;
+		ppa.g.lun = wp->lun;
+		ppa.g.pg = wp->pg;
+		ppa.g.blk = wp->blk;
+		ppa.g.pl = wp->pl;
 
-	pg = get_pg(conv_ftl->ssd, &ppa);
-	if (!pg)
-		return (struct ppa){ .ppa = UNMAPPED_PPA };
+		pg = get_pg(conv_ftl->ssd, &ppa);
+		if (!pg)
+			continue;
 
-	if (pg->status != PG_FREE) {
-		advance_gc_slc_write_pointer(conv_ftl, die);
-		goto retry_gc_get_page;
+		if (pg->status != PG_FREE) {
+			advance_gc_slc_write_pointer(conv_ftl, candidate);
+			if (!wp->curline)
+				continue;
+			goto retry_gc_get_page;
+		}
+
+		return ppa;
 	}
 
-	return ppa;
+	return (struct ppa){ .ppa = UNMAPPED_PPA };
 }
 
 /* 新增：GC 专用 SLC 写指针推进（使用 per-die GC 写指针） */
@@ -4452,21 +4580,21 @@ retry_wb_alloc:
             forground_gc(conv_ftl);
         }
 
-        /*
-         * Scheme 2: when SLC is at or below the emergency reserve,
-         * enter an aggressive recovery loop before giving up.
-         */
         {
             int slc_retry = 0;
             const int SLC_MAX_RETRIES = 8;
 
             ppa = get_new_slc_page(conv_ftl);
             while (!mapped_ppa(&ppa) && slc_retry < SLC_MAX_RETRIES) {
+                uint32_t starved_die;
+
                 slc_retry++;
                 migrate_some_cold_from_slc(conv_ftl, conv_ftl->slc_pgs_per_blk * 8);
+
+                if (should_gc_slc_any_die_critical(conv_ftl, &starved_die))
+                    do_gc_for_die(conv_ftl, starved_die, true);
+
                 forground_gc(conv_ftl);
-                collect_slc_stats(conv_ftl, &slc_stats);
-                slc_free_lines = slc_stats.free;
                 ppa = get_new_slc_page(conv_ftl);
             }
         }
