@@ -126,6 +126,11 @@ struct conv_ftl {
 
 	/* 页面元数据 - 记录页面是否在 SLC 中 */
 	bool *page_in_slc;           /* 标记页面是否在 SLC 中 */
+	uint64_t *slc_resident_lpns; /* per-die dense resident LPN set for SLC cold migration */
+	uint32_t *slc_resident_slot; /* LPN -> slot in slc_resident_lpns, U32_MAX if absent */
+	uint32_t *slc_die_resident_count;  /* 当前每个 die 的 SLC resident 页数 */
+	uint32_t *slc_die_resident_cursor; /* 每个 die 的冷迁移扫描游标 */
+	uint32_t slc_resident_capacity_per_die; /* 每个 die 的 resident set 容量 */
 	uint64_t *qlc_page_wcnt;     /* 每个 LPN 写入到 QLC 的次数 */
 	uint64_t qlc_total_wcnt;     /* 写入到 QLC 的总次数 */
 	uint64_t qlc_unique_pages;   /* 曾写入 QLC 的唯一 LPN 数 */
