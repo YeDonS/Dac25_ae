@@ -4,10 +4,9 @@
 #
 # Die-affinity test 2: WORST-CASE die collision via dummy stripe padding.
 #   Row size = 32KB (= 1 die allocation granularity)
-#   After each row write, 224KB dummy is written to fill remaining 7 dies in the stripe.
+#   After each row write, a small dummy pad is written to maintain worst-case die collision.
 #   This forces every table's rows onto the SAME die → maximum collision (8× penalty).
-#   Total data = 2GB (smaller to keep dummy volume manageable).
-#   Dummy volume = 64000 rows × 224KB ≈ 13.7GB.
+#   Default data = 6GB with ~2GB dummy padding.
 #
 # Compares 4 FTL variants:
 #   die_base: QLC hot/cold OFF + die affinity OFF
@@ -28,17 +27,17 @@ THREAD_COUNTS="${THREAD_COUNTS:-1 4 8}"
 COLD_READS_PER_TBL="${COLD_READS_PER_TBL:-5000}"
 VARIANTS="${VARIANTS:-die_base die_no1 die_no2 die_no3 die_all}"
 
-SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-2G}
-SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-100}
-SQLITE_ROWS_PER_TABLE=${SQLITE_ROWS_PER_TABLE:-640}
-SQLITE_INTERLEAVE_ROWS=${SQLITE_INTERLEAVE_ROWS:-1600}
+SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-6G}
+SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-128}
+SQLITE_ROWS_PER_TABLE=${SQLITE_ROWS_PER_TABLE:-1536}
+SQLITE_INTERLEAVE_ROWS=${SQLITE_INTERLEAVE_ROWS:-6144}
 SQLITE_INTERLEAVE_READS=${SQLITE_INTERLEAVE_READS:-1600}
 SQLITE_PAGE_TIER_PATH=${SQLITE_PAGE_TIER_PATH:-/sys/kernel/debug/nvmev/ftl0/page_tier}
 SQLITE_ACCESS_COUNT_PATH=${SQLITE_ACCESS_COUNT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_count}
 SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
 SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
 SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-1}
-SQLITE_DUMMY_STRIPE_BYTES=${SQLITE_DUMMY_STRIPE_BYTES:-229376}
+SQLITE_DUMMY_STRIPE_BYTES=${SQLITE_DUMMY_STRIPE_BYTES:-10922}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
 NORMAL_STDDEV=${NORMAL_STDDEV:-400}
 NORMAL_SEED=${NORMAL_SEED:-314159}
@@ -70,6 +69,39 @@ mkdir -p "$TARGET_FOLDER"
 drop_caches() {
     sync
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+}
+
+post_run_settle() {
+    local settle_sec="${SQLITE_POST_RUN_SETTLE_SEC:-3}"
+
+    sync
+    sleep "$settle_sec"
+}
+
+partitions_still_present() {
+    lsblk -nr -o NAME "$DATA_DEV" 2>/dev/null | grep -qx "$DATA_PAT_NAME" && return 0
+    lsblk -nr -o NAME "$JOURNAL_DEV" 2>/dev/null | grep -qx "$JOURNAL_PAT_NAME" && return 0
+    return 1
+}
+
+cleanup_after_test() {
+    local max_retry="${SQLITE_RESET_RETRIES:-3}"
+    local attempt=1
+
+    while (( attempt <= max_retry )); do
+        source resetdevice.sh
+        if ! partitions_still_present; then
+            return 0
+        fi
+
+        echo "[reset] partitions still visible after cleanup (attempt ${attempt}/${max_retry}); waiting before retry"
+        sync
+        sleep 3
+        attempt=$((attempt + 1))
+    done
+
+    echo "ERROR: cleanup did not remove stale partitions after ${max_retry} attempts" >&2
+    return 1
 }
 
 load_die_module() {
@@ -161,7 +193,8 @@ run_one_test() {
     echo "=== Done: variant=$variant threads=$threads ==="
     echo "  Output: $init_txt"
 
-    source resetdevice.sh
+    post_run_settle
+    cleanup_after_test
     sleep 1
 }
 
