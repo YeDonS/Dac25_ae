@@ -1410,15 +1410,24 @@ static inline void consume_write_credit(struct conv_ftl *conv_ftl)
 
 static void forground_gc(struct conv_ftl *conv_ftl);
 
-static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
+static inline bool check_and_refill_write_credit(struct conv_ftl *conv_ftl)
 {
 	struct write_flow_control *wfc = &(conv_ftl->wfc);
+	uint32_t refill_pages;
+
 	if (wfc->write_credits <= 0) {
-		/* 前台小步 GC：避免后台线程，快速释放少量行 */
-		forground_gc(conv_ftl);
-		/* 小额补充信用，允许写入继续推进 */
-		wfc->write_credits += 10;
+		/*
+		 * Host write path only marks that front-ground GC should run.
+		 * Actual GC is executed on the oneshot-boundary control tick.
+		 */
+		refill_pages = conv_ftl->ssd->sp.pgs_per_oneshotpg * 8;
+		if (refill_pages < 10)
+			refill_pages = 10;
+		wfc->write_credits += refill_pages;
+		return true;
 	}
+
+	return false;
 }
 
 static void init_write_flow_control(struct conv_ftl *conv_ftl)
@@ -2047,10 +2056,10 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		tmp = div_u64(slc_total_pages * 80, 100);
 		conv_ftl->slc_high_watermark = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
 
-		tmp = div_u64(slc_total_pages * 75, 100);
+		tmp = div_u64(slc_total_pages * 70, 100);
 		conv_ftl->slc_target_watermark = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
 
-		tmp = div_u64(slc_total_pages * 25, 100);
+		tmp = div_u64(slc_total_pages * 10, 100);
 		conv_ftl->slc_gc_free_thres_high = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
 
 		tmp = div_u64(qlc_total_pages * 15, 100);
@@ -2689,6 +2698,7 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	old_in_slc = is_slc_block(conv_ftl, old_ppa->g.blk);
 	if (old_in_slc) {
 		struct line_pool_stats slc_st;
+		uint32_t actual_die;
 		collect_slc_stats(conv_ftl, &slc_st);
 		slc_critical = (slc_st.free <= SLC_EMERGENCY_RESERVE);
 
@@ -2723,7 +2733,8 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 			mark_page_valid(conv_ftl, &new_ppa);
 			slc_resident_track_page(conv_ftl, lpn, encode_die(spp, &new_ppa));
 			set_page_prev_link(conv_ftl, lpn, &new_ppa, stored_prev_lpn);
-			advance_gc_slc_write_pointer(conv_ftl, die_index);
+			actual_die = encode_die(spp, &new_ppa);
+			advance_gc_slc_write_pointer(conv_ftl, actual_die);
 			mark_page_invalid(conv_ftl, old_ppa);
 		set_rmap_ent(conv_ftl, INVALID_LPN, old_ppa);
 		NVMEV_DEBUG("[TASK2][GC-SLC] lpn=%llu prev_lpn=%lld src_die=%u dst_die=%u",
@@ -4491,7 +4502,7 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 		slc_resident_track_page(conv_ftl, lpn, encode_die(spp, &new_ppa));
 
 	/* Advance GC WP */
-	advance_gc_slc_write_pointer(conv_ftl, die_index);
+	advance_gc_slc_write_pointer(conv_ftl, encode_die(spp, &new_ppa));
 
 	/* Update prev link */
 	pg = get_pg(conv_ftl->ssd, qlc_ppa);
@@ -4501,7 +4512,8 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	if (migration_done)
 		*migration_done = nsecs_completed;
 
-	NVMEV_DEBUG("Migrated LPN %llu from QLC to SLC (die=%u)\n", lpn, die_index);
+	NVMEV_DEBUG("Migrated LPN %llu from QLC to SLC (req_die=%u actual_die=%u)\n",
+		    lpn, die_index, encode_die(spp, &new_ppa));
 }
 
 /* 扫描 QLC 热数据并迁移回 SLC */
@@ -4582,11 +4594,11 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint64_t stripe_bytes = 0;
 	uint64_t wbuf_needed = 0;
 	uint64_t prev_link_lpn = INVALID_LPN;
+	bool need_fgc = false;
 //66f1
 
 	struct ppa ppa;
 	struct line_pool_stats slc_stats;
-	struct line_pool_stats slc_stats_tail;
 	uint32_t slc_free_lines;
 	uint32_t slc_used_lines;
 
@@ -4768,42 +4780,6 @@ retry_wb_alloc:
 			}
 		}
 
-        /* 修改：所有新写入都先写到 SLC（不直接写 QLC） */
-        /* 每次写入都检查SLC状态并触发迁移 */
-        collect_slc_stats(conv_ftl, &slc_stats);
-        slc_free_lines = slc_stats.free;
-        
-        /* 检查SLC使用率是否超过高水位线，触发后台迁移 */
-        slc_used_lines = slc_stats.total - slc_free_lines;
-        NVMEV_DEBUG("[DEBUG] SLC status: free_lines=%u, used_lines=%u, high_watermark=%u, total=%u\n", 
-                   slc_free_lines, slc_used_lines, conv_ftl->slc_high_watermark, slc_stats.total);
-        if (slc_used_lines >= conv_ftl->slc_high_watermark) {
-			uint32_t target_lines = conv_ftl->slc_target_watermark;
-			uint32_t over_lines;
-			uint32_t max_pages;
-			uint32_t cap_pages;
-			int32_t target_die = conv_ftl->die_count ?
-				(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
-
-			if (!target_lines || target_lines >= slc_stats.total)
-				target_lines = (slc_stats.total > 1) ? (slc_stats.total - 1) : slc_stats.total;
-
-			over_lines = (slc_used_lines > target_lines) ? (slc_used_lines - target_lines) : 1;
-			max_pages = over_lines * conv_ftl->slc_pgs_per_blk;
-			cap_pages = conv_ftl->slc_pgs_per_blk ? (conv_ftl->slc_pgs_per_blk * 4) : 0;
-			if (max_pages < 8)
-				max_pages = 8;
-			if (cap_pages && max_pages > cap_pages)
-				max_pages = cap_pages;
-
-            NVMEV_DEBUG("[DEBUG] SLC usage high (%u >= %u), migrating %u cold pages (target=%u, cap=%u)\n", 
-                      slc_used_lines, conv_ftl->slc_high_watermark, max_pages, target_lines, cap_pages);
-            migrate_some_cold_from_slc(conv_ftl, max_pages, target_die);
-        }
-        if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-            forground_gc(conv_ftl);
-        }
-
         {
             int slc_retry = 0;
             const int SLC_MAX_RETRIES = 8;
@@ -4868,7 +4844,9 @@ retry_wb_alloc:
         stripe_bytes += spp->pgsz;
         {
             uint32_t pg_off = ppa.g.pg % spp->pgs_per_oneshotpg;
-            if (pg_off == (spp->pgs_per_oneshotpg - 1) || lpn == end_lpn) {
+            bool control_tick = (pg_off == (spp->pgs_per_oneshotpg - 1) || lpn == end_lpn);
+
+            if (control_tick) {
                 uint64_t transfer_bytes = stripe_bytes;
                 if (transfer_bytes == 0) {
                     transfer_bytes = (uint64_t)(pg_off + 1) * spp->pgsz;
@@ -4884,6 +4862,50 @@ retry_wb_alloc:
 			stripe_bytes = 0;
 			swr.stime = nsecs_completed;
             }
+
+			if (control_tick) {
+				uint32_t target_lines;
+				uint32_t over_lines;
+				uint32_t max_pages;
+				uint32_t cap_pages;
+				int32_t target_die = conv_ftl->die_count ?
+					(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
+
+				collect_slc_stats(conv_ftl, &slc_stats);
+				slc_free_lines = slc_stats.free;
+				slc_used_lines = slc_stats.total - slc_free_lines;
+
+				NVMEV_DEBUG("[DEBUG] SLC control tick: free_lines=%u, used_lines=%u, high_watermark=%u, total=%u\n",
+					   slc_free_lines, slc_used_lines,
+					   conv_ftl->slc_high_watermark, slc_stats.total);
+
+				if (slc_used_lines >= conv_ftl->slc_high_watermark) {
+					target_lines = conv_ftl->slc_target_watermark;
+					if (!target_lines || target_lines >= slc_stats.total)
+						target_lines = (slc_stats.total > 1) ?
+							(slc_stats.total - 1) : slc_stats.total;
+
+					over_lines = (slc_used_lines > target_lines) ?
+						(slc_used_lines - target_lines) : 1;
+					max_pages = over_lines * conv_ftl->slc_pgs_per_blk;
+					cap_pages = conv_ftl->slc_pgs_per_blk ?
+						(conv_ftl->slc_pgs_per_blk * 4) : 0;
+					if (max_pages < 8)
+						max_pages = 8;
+					if (cap_pages && max_pages > cap_pages)
+						max_pages = cap_pages;
+
+					NVMEV_DEBUG("[DEBUG] SLC usage high (%u >= %u), migrating %u cold pages (target=%u, cap=%u)\n",
+						   slc_used_lines, conv_ftl->slc_high_watermark,
+						   max_pages, target_lines, cap_pages);
+					migrate_some_cold_from_slc(conv_ftl, max_pages, target_die);
+				}
+
+				if (need_fgc || slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+					forground_gc(conv_ftl);
+					need_fgc = false;
+				}
+			}
         }
 
 		nsecs_latest = max(nsecs_completed, nsecs_latest);
@@ -4894,16 +4916,9 @@ retry_wb_alloc:
 		/* [DISABLED] Mechanism 1: qlc_maybe_rebalance_internal disabled */
 		
 
-			/* 检查是否需要触发后台迁移 */
-			collect_slc_stats(conv_ftl, &slc_stats_tail);
-			if (slc_stats_tail.free < 2) {
-				/* SLC 空间不足，需要迁移一些冷数据到 QLC */
-			NVMEV_DEBUG("SLC space low, triggering migration\n");
-			/* 这里可以实现更复杂的后台迁移策略 */
-		}
-		
 		consume_write_credit(conv_ftl);
-		check_and_refill_write_credit(conv_ftl);
+		if (check_and_refill_write_credit(conv_ftl))
+			need_fgc = true;
 	}
 	if (stripe_bytes > 0) {
 		uint64_t flush_time = nsecs_latest;
