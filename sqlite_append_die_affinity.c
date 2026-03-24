@@ -2802,16 +2802,21 @@ static void drop_dataset_cache(sqlite3 *db, const char *db_path)
 	close(fd);
 }
 
-static int open_dummy_file(const char *dir, const char *tag)
+static int open_dummy_file(const char *dir, const char *tag,
+			  bool prefer_direct)
 {
 	char path[PATH_MAX];
 	int fd;
+	int flags = O_CREAT | O_WRONLY | O_TRUNC;
 
 	snprintf(path, sizeof(path), "%s/dummy_pad_%s.bin",
 		 dir, tag ? tag : "x");
 
-	fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_DIRECT, 0666);
-	if (fd < 0)
+	if (prefer_direct)
+		flags |= O_DIRECT;
+
+	fd = open(path, flags, 0666);
+	if (fd < 0 && prefer_direct)
 		fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
 	return fd;
 }
@@ -2976,7 +2981,18 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		goto out;
 
 	if (opts->dummy_interleave) {
-		dummy_fd = open_dummy_file(TARGET_FOLDER, effective_tag(opts));
+		bool dummy_direct_ok =
+			(opts->dummy_stripe_bytes % DUMMY_WRITE_UNIT) == 0;
+
+		if (!dummy_direct_ok) {
+			fprintf(stderr,
+				"[dummy] stripe_bytes=%llu is not %u-byte aligned; using buffered dummy writes\n",
+				(unsigned long long)opts->dummy_stripe_bytes,
+				(unsigned int)DUMMY_WRITE_UNIT);
+		}
+
+		dummy_fd = open_dummy_file(TARGET_FOLDER, effective_tag(opts),
+					 dummy_direct_ok);
 		if (dummy_fd < 0) {
 			fprintf(stderr, "Failed to open dummy file\n");
 			rc = -errno;
