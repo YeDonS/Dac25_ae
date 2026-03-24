@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/bin/bash
 #
 # sqlite_fragment_die_test2.sh
 #
@@ -19,6 +19,8 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+set -u
 
 source commonvariables.sh
 
@@ -104,6 +106,16 @@ cleanup_after_test() {
     return 1
 }
 
+print_init_log_tail() {
+    local log_path="$1"
+
+    if [[ -f "$log_path" ]]; then
+        echo "----- tail: $log_path -----" >&2
+        tail -n 40 "$log_path" >&2 || true
+        echo "---------------------------" >&2
+    fi
+}
+
 load_die_module() {
     local variant="$1"
     local ko_path="${NVMEV_DIR}/nvmev_${variant}.ko"
@@ -143,6 +155,11 @@ run_one_test() {
 
     lsblk
     source setdevice.sh
+    if ! mountpoint -q "$TARGET_FOLDER"; then
+        echo "ERROR: mount failed for $TARGET_FOLDER" >&2
+        cleanup_after_test || true
+        return 1
+    fi
 
     echo 0 | sudo tee /sys/block/${DATA_NAME}/queue/read_ahead_kb >/dev/null 2>&1 || true
     echo "[readahead] set /sys/block/${DATA_NAME}/queue/read_ahead_kb = $(cat /sys/block/${DATA_NAME}/queue/read_ahead_kb 2>/dev/null || echo N/A)"
@@ -158,7 +175,7 @@ run_one_test() {
         extra_args+=(--fast-init-profile)
     fi
 
-    numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./${EXE_NAME} --mode init \
+    if ! numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./${EXE_NAME} --mode init \
         --target-bytes "$SQLITE_TARGET_BYTES" \
         --table-count "$SQLITE_TABLE_COUNT" \
         --rows-per-table "$SQLITE_ROWS_PER_TABLE" \
@@ -183,7 +200,13 @@ run_one_test() {
         --dummy-stripe-bytes "$SQLITE_DUMMY_STRIPE_BYTES" \
         "${extra_args[@]}" \
         --tag "$tag" \
-        >"$init_txt" 2>&1
+        >"$init_txt" 2>&1; then
+        echo "ERROR: workload failed for variant=$variant threads=$threads" >&2
+        print_init_log_tail "$init_txt"
+        post_run_settle
+        cleanup_after_test || true
+        return 1
+    fi
 
     cp "$init_txt" "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_tier_${tag}.csv "${out_dir}/" 2>/dev/null || true
@@ -194,7 +217,7 @@ run_one_test() {
     echo "  Output: $init_txt"
 
     post_run_settle
-    cleanup_after_test
+    cleanup_after_test || return 1
     sleep 1
 }
 
@@ -203,9 +226,14 @@ run_one_test() {
 
 mkdir -p "$DIE_RESULT_BASE"
 
+failed=0
+
 for threads in $THREAD_COUNTS; do
     for variant in $VARIANTS; do
-        run_one_test "$variant" "$threads"
+        if ! run_one_test "$variant" "$threads"; then
+            echo "[TEST2] failed: variant=$variant threads=$threads" >&2
+            failed=1
+        fi
     done
 done
 
@@ -216,3 +244,5 @@ echo "========================================"
 echo "  [TEST2] All worst-case collision tests completed."
 echo "  Results in: $DIE_RESULT_BASE"
 echo "========================================"
+
+exit "$failed"
