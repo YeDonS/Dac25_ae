@@ -59,6 +59,7 @@
 #define ROW_STATS_FILENAME_FMT   "sqlite_row_%s.csv"
 #define TABLE_STATS_FILENAME_FMT "sqlite_table_%s.csv"
 #define TABLE_TIER_FILENAME_FMT  "sqlite_table_tier_%s.csv"
+#define TABLE_DIE_FILENAME_FMT   "sqlite_table_die_%s.csv"
 #define DEFAULT_TAG              "default"
 #define MAX_TABLE_NAME           64
 #define NORMAL_MEAN_SENTINEL     (-1.0)
@@ -66,6 +67,7 @@
 #define DEFAULT_FTL_HOST_PAGE_BYTES (4096ULL)
 #define DEFAULT_PAGE_TIER_PATH      "/sys/kernel/debug/nvmev/ftl0/page_tier"
 #define DEFAULT_ACCESS_COUNT_PATH   "/sys/kernel/debug/nvmev/ftl0/access_count"
+#define DEFAULT_PAGE_DIE_PATH       "/sys/kernel/debug/nvmev/ftl0/page_die"
 /*
  * Row size calibration for die-affinity testing.
  *
@@ -100,6 +102,8 @@
 #define DEFAULT_COLD_PROFILE        "normal"
 #define DEFAULT_READ_REPROMOTION_CTRL_PATH \
 	"/proc/nvmev/read_repromotion"
+#define DEFAULT_TEST_PHASE_PATH \
+	"/sys/kernel/debug/nvmev/ftl0/test_phase"
 
 typedef unsigned int UINT32;
 
@@ -147,6 +151,8 @@ static const struct option long_opts[] = {
 	{"cold-random-reads-per-tbl", required_argument, NULL, 1029},
 	{"dummy-interleave", no_argument, NULL, 1030},
 	{"dummy-stripe-bytes", required_argument, NULL, 1031},
+	{"test-phase-path", required_argument, NULL, 1032},
+	{"cold-overwrite-pct", required_argument, NULL, 1033},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -174,6 +180,7 @@ enum trace_mode {
 enum cold_full_read_mode {
 	COLD_FULL_READ_PER_TABLE = 0,
 	COLD_FULL_READ_FULL_SCAN,
+	COLD_FULL_READ_FULL_SCAN_OVERWRITE,
 	COLD_FULL_READ_RANDOM_CONCURRENT,
 };
 
@@ -219,6 +226,8 @@ struct workload_options {
 	unsigned int cold_full_read_iters;
 	bool cold_disable_read_repromotion;
 	const char *read_repromotion_ctrl_path;
+	const char *test_phase_path;
+	unsigned int cold_overwrite_pct;
 	unsigned int cold_concurrent_threads;
 	unsigned int cold_random_reads_per_tbl;
 	bool dummy_interleave;
@@ -271,6 +280,11 @@ struct page_tier_entry {
 	unsigned int qlc_zone_known;
 };
 
+struct page_die_entry {
+	unsigned long long lpn;
+	unsigned int die;
+};
+
 struct file_extent {
 	unsigned long long logical;
 	unsigned long long physical;
@@ -297,6 +311,7 @@ static void build_heat_path(char *buf, size_t len, const struct workload_options
 static void build_row_stats_path(char *buf, size_t len, const struct workload_options *opts);
 static void build_table_stats_path(char *buf, size_t len, const struct workload_options *opts);
 static void build_table_tier_path(char *buf, size_t len, const struct workload_options *opts);
+static void build_table_die_path(char *buf, size_t len, const struct workload_options *opts);
 static void drop_page_cache(void);
 static void drop_dataset_cache(sqlite3 *db, const char *db_path);
 
@@ -623,10 +638,12 @@ static void usage(const char *prog)
 		"                 [--init-latency-profile NAME]\n"
 		"                 [--cold-latency-profile NAME]\n"
 		"                 [--latency-profile-settle-ms N]\n"
-		"                 [--cold-full-read-mode per-table|full-scan]\n"
+		"                 [--cold-full-read-mode per-table|full-scan|full-scan-overwrite|random-concurrent]\n"
 		"                 [--cold-full-read-iters N]\n"
 		"                 [--cold-disable-read-repromotion]\n"
 		"                 [--read-repromotion-ctrl-path PATH]\n"
+		"                 [--test-phase-path PATH]\n"
+		"                 [--cold-overwrite-pct N]\n"
 		"                 [--zipf-seed S] [--exp-seed S] [--normal-seed S]\n"
 		"                 [--tag NAME] [--trace-dir DIR]\n"
 		"  %s --mode read --distribution zipf|exp|uniform|normal|sequential\n"
@@ -666,6 +683,8 @@ static const char *cold_full_read_mode_name(enum cold_full_read_mode mode)
 	switch (mode) {
 	case COLD_FULL_READ_FULL_SCAN:
 		return "full-scan";
+	case COLD_FULL_READ_FULL_SCAN_OVERWRITE:
+		return "full-scan-overwrite";
 	case COLD_FULL_READ_RANDOM_CONCURRENT:
 		return "random-concurrent";
 	case COLD_FULL_READ_PER_TABLE:
@@ -680,6 +699,9 @@ static enum cold_full_read_mode parse_cold_full_read_mode(const char *value)
 		return COLD_FULL_READ_PER_TABLE;
 	if (strcasecmp(value, "full-scan") == 0 || strcasecmp(value, "full_scan") == 0)
 		return COLD_FULL_READ_FULL_SCAN;
+	if (strcasecmp(value, "full-scan-overwrite") == 0 ||
+	    strcasecmp(value, "full_scan_overwrite") == 0)
+		return COLD_FULL_READ_FULL_SCAN_OVERWRITE;
 	if (strcasecmp(value, "per-table") == 0 || strcasecmp(value, "per_table") == 0)
 		return COLD_FULL_READ_PER_TABLE;
 	if (strcasecmp(value, "random-concurrent") == 0 || strcasecmp(value, "random_concurrent") == 0)
@@ -713,6 +735,33 @@ static int set_read_repromotion_state(const struct workload_options *opts,
 	       enabled ? "on" : "off",
 	       phase ? phase : "phase",
 	       opts->read_repromotion_ctrl_path);
+	return 0;
+}
+
+static int set_test_phase_state(const struct workload_options *opts,
+				bool enabled, const char *phase)
+{
+	const char *value = enabled ? "1" : "0";
+	int rc;
+
+	if (!opts || !opts->test_phase_path || !opts->test_phase_path[0])
+		return -EINVAL;
+
+	rc = write_string_file(opts->test_phase_path, value);
+	if (rc != 0) {
+		fprintf(stderr,
+			"[sqlite_init] failed to set test_phase '%s' for %s via %s (%d)\n",
+			enabled ? "on" : "off",
+			phase ? phase : "phase",
+			opts->test_phase_path,
+			rc);
+		return rc;
+	}
+
+	printf("[sqlite_init] test_phase=%s phase=%s path=%s\n",
+	       enabled ? "on" : "off",
+	       phase ? phase : "phase",
+	       opts->test_phase_path);
 	return 0;
 }
 
@@ -840,6 +889,18 @@ static int cmp_tier_entry_lpn(const void *a, const void *b)
 {
 	const struct page_tier_entry *ea = a;
 	const struct page_tier_entry *eb = b;
+
+	if (ea->lpn < eb->lpn)
+		return -1;
+	if (ea->lpn > eb->lpn)
+		return 1;
+	return 0;
+}
+
+static int cmp_page_die_entry_lpn(const void *a, const void *b)
+{
+	const struct page_die_entry *ea = a;
+	const struct page_die_entry *eb = b;
 
 	if (ea->lpn < eb->lpn)
 		return -1;
@@ -1767,16 +1828,117 @@ static int write_row_stats_csv(const char *path, const struct dataset_layout *la
 	return 0;
 }
 
+static int overwrite_table_rows(sqlite3 *db, const struct dataset_layout *layout,
+				unsigned int table_id, unsigned int overwrite_pct,
+				unsigned int *seed, unsigned int *rows_out)
+{
+	char sql[256];
+	char table_name[MAX_TABLE_NAME];
+	char rstr1[STR1_LEN + 1];
+	char rstr2[STR2_LEN + 1];
+	char rstr3[STR3_LEN + 1];
+	char rstr4[STR4_LEN + 1];
+	sqlite3_stmt *stmt = NULL;
+	unsigned int row_count;
+	unsigned int overwrite_rows;
+	unsigned int base_offset = 0;
+	int rc;
+
+	if (rows_out)
+		*rows_out = 0;
+	if (!db || !layout || table_id >= layout->table_count || overwrite_pct == 0)
+		return 0;
+
+	row_count = layout->rows_per_table[table_id];
+	if (row_count == 0)
+		return 0;
+
+	overwrite_rows = (unsigned int)(((unsigned long long)row_count * overwrite_pct + 99ULL) / 100ULL);
+	if (overwrite_rows == 0)
+		overwrite_rows = 1;
+	if (overwrite_rows > row_count)
+		overwrite_rows = row_count;
+	if (seed)
+		base_offset = next_rand(seed) % row_count;
+
+	build_table_name(table_name, sizeof(table_name), table_id);
+	snprintf(sql, sizeof(sql),
+		 "UPDATE %s SET str1=?, str2=?, str3=?, str4=? WHERE id=?;",
+		 table_name);
+	rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "Failed to prepare overwrite for %s: %s\n",
+			table_name, sqlite3_errmsg(db));
+		return -EIO;
+	}
+
+	rc = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "Failed to begin overwrite transaction for %s: %s\n",
+			table_name, sqlite3_errmsg(db));
+		sqlite3_finalize(stmt);
+		return -EIO;
+	}
+
+	for (unsigned int i = 0; i < overwrite_rows; ++i) {
+		unsigned int row_idx = (base_offset +
+					 (unsigned int)(((unsigned long long)i * row_count) /
+							overwrite_rows)) % row_count;
+		int record_id = (int)(row_count - 1U - row_idx);
+
+		random_string(rstr1, STR1_LEN);
+		random_string(rstr2, STR2_LEN);
+		random_string(rstr3, STR3_LEN);
+		random_string(rstr4, STR4_LEN);
+
+		sqlite3_reset(stmt);
+		sqlite3_clear_bindings(stmt);
+		sqlite3_bind_text(stmt, 1, rstr1, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(stmt, 2, rstr2, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(stmt, 3, rstr3, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(stmt, 4, rstr4, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_int(stmt, 5, record_id);
+
+		rc = sqlite3_step(stmt);
+		if (rc != SQLITE_DONE) {
+			fprintf(stderr, "Overwrite failed for %s row=%u: %s\n",
+				table_name, row_idx, sqlite3_errmsg(db));
+			sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+			sqlite3_finalize(stmt);
+			return -EIO;
+		}
+	}
+
+	rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "Failed to commit overwrite transaction for %s: %s\n",
+			table_name, sqlite3_errmsg(db));
+		sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+		sqlite3_finalize(stmt);
+		return -EIO;
+	}
+
+	sqlite3_finalize(stmt);
+	if (rows_out)
+		*rows_out = overwrite_rows;
+
+	return 0;
+}
+
 static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layout,
 				 enum cold_full_read_mode mode,
 				 unsigned int iterations, const unsigned int *read_plan,
+				 unsigned int cold_overwrite_pct,
 				 double *per_table_out)
 {
 	unsigned int runs = iterations ? iterations : 1U;
 	double total = 0.0;
+	unsigned int overwrite_seed = 0;
 
 	if (!db || !layout)
 		return 0.0;
+
+	overwrite_seed = (unsigned int)time(NULL) ^ 0x5a17c9e3U;
 
 	if (per_table_out) {
 		for (unsigned int t = 0; t < layout->table_count; ++t)
@@ -1796,11 +1958,22 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 			int rc;
 			double tbl_start, tbl_end;
 			unsigned int reads = read_plan ? read_plan[tbl] : 1U;
+			unsigned int overwritten_rows = 0;
 
 			if (reads == 0)
 				continue;
 
-			if (mode == COLD_FULL_READ_PER_TABLE)
+			if (mode == COLD_FULL_READ_FULL_SCAN_OVERWRITE) {
+				rc = overwrite_table_rows(db, layout, tbl, cold_overwrite_pct,
+							 &overwrite_seed, &overwritten_rows);
+				if (rc != 0)
+					return 0.0;
+				printf("[sqlite_cold_overwrite] table=%u rows=%u pct=%u\n",
+				       tbl, overwritten_rows, cold_overwrite_pct);
+			}
+
+			if (mode == COLD_FULL_READ_PER_TABLE ||
+			    mode == COLD_FULL_READ_FULL_SCAN_OVERWRITE)
 				drop_page_cache();
 
 			build_table_name(table_name, sizeof(table_name), tbl);
@@ -2136,6 +2309,103 @@ static bool lookup_page_tier(const struct page_tier_entry *entries, size_t count
 	return true;
 }
 
+static int load_page_die_entries(const char *path, struct page_die_entry **entries_out,
+				 size_t *count_out, unsigned int *die_slots_out)
+{
+	FILE *fp;
+	struct page_die_entry *entries = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+	unsigned int max_die = 0;
+	char line[128];
+
+	if (entries_out)
+		*entries_out = NULL;
+	if (count_out)
+		*count_out = 0;
+	if (die_slots_out)
+		*die_slots_out = 0;
+	if (!path || !*path)
+		return 0;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		unsigned long long lpn;
+		unsigned int die;
+		struct page_die_entry *tmp;
+
+		if (sscanf(line, "%llu %u", &lpn, &die) != 2)
+			continue;
+
+		if (count == cap) {
+			size_t new_cap = cap ? cap * 2 : 4096;
+			tmp = realloc(entries, new_cap * sizeof(*entries));
+			if (!tmp) {
+				free(entries);
+				fclose(fp);
+				return -ENOMEM;
+			}
+			entries = tmp;
+			cap = new_cap;
+		}
+
+		entries[count].lpn = lpn;
+		entries[count].die = die;
+		if (die > max_die)
+			max_die = die;
+		count++;
+	}
+
+	fclose(fp);
+	if (!entries || count == 0) {
+		free(entries);
+		return 0;
+	}
+
+	qsort(entries, count, sizeof(*entries), cmp_page_die_entry_lpn);
+	size_t unique = 1;
+	for (size_t i = 1; i < count; ++i) {
+		if (entries[i].lpn != entries[unique - 1].lpn)
+			entries[unique++] = entries[i];
+		else
+			entries[unique - 1] = entries[i];
+	}
+
+	if (entries_out)
+		*entries_out = entries;
+	else
+		free(entries);
+	if (count_out)
+		*count_out = unique;
+	if (die_slots_out)
+		*die_slots_out = max_die + 1U;
+	return 0;
+}
+
+static bool lookup_page_die(const struct page_die_entry *entries, size_t count,
+			    unsigned long long lpn, unsigned int *die_out)
+{
+	size_t lo = 0;
+	size_t hi = count;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (entries[mid].lpn < lpn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	if (lo >= count || entries[lo].lpn != lpn)
+		return false;
+	if (die_out)
+		*die_out = entries[lo].die;
+	return true;
+}
+
 static int load_access_count_entries(const char *path, struct access_count_entry **entries_out,
 				     size_t *count_out)
 {
@@ -2451,10 +2721,85 @@ static int append_file_range_lpns(const struct file_extent *extents, size_t exte
 	return 0;
 }
 
+static int collect_table_lpns(sqlite3_stmt *stmt, const char *table_name,
+			      unsigned int page_size, bool use_fiemap,
+			      const struct file_extent *extents, size_t extent_count,
+			      unsigned long long host_page_bytes,
+			      unsigned long long **lpn_vec, size_t *lpn_count,
+			      size_t *lpn_cap, unsigned long long *db_pages_out,
+			      unsigned long long *fiemap_fallback_pages)
+{
+	size_t extent_cursor = 0;
+	int rc;
+
+	if (!stmt || !table_name || !lpn_vec || !lpn_count || !lpn_cap)
+		return -EINVAL;
+
+	*lpn_count = 0;
+	if (db_pages_out)
+		*db_pages_out = 0;
+
+	sqlite3_reset(stmt);
+	sqlite3_clear_bindings(stmt);
+	sqlite3_bind_text(stmt, 1, table_name, -1, SQLITE_STATIC);
+
+	while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+		int pageno = sqlite3_column_int(stmt, 0);
+		unsigned long long file_byte_start;
+		unsigned long long file_byte_end;
+		unsigned long long lpn_start;
+		unsigned long long lpn_end;
+		int map_rc;
+
+		if (pageno <= 0)
+			continue;
+
+		if (db_pages_out)
+			(*db_pages_out)++;
+		file_byte_start = (unsigned long long)(pageno - 1) * (unsigned long long)page_size;
+		file_byte_end = file_byte_start + (unsigned long long)page_size - 1ULL;
+
+		if (use_fiemap) {
+			map_rc = append_file_range_lpns(extents, extent_count, &extent_cursor,
+							file_byte_start, file_byte_end,
+							host_page_bytes,
+							lpn_vec, lpn_count, lpn_cap);
+			if (map_rc == 0)
+				continue;
+
+			if (fiemap_fallback_pages)
+				(*fiemap_fallback_pages)++;
+		}
+
+		lpn_start = file_byte_start / host_page_bytes;
+		lpn_end = file_byte_end / host_page_bytes;
+		map_rc = append_lpn_range(lpn_start, lpn_end, lpn_vec, lpn_count, lpn_cap);
+		if (map_rc != 0)
+			return map_rc;
+	}
+
+	if (rc != SQLITE_DONE)
+		return -1;
+
+	if (*lpn_count > 0) {
+		qsort(*lpn_vec, *lpn_count, sizeof(**lpn_vec), cmp_u64_asc);
+		size_t unique = 1;
+		for (size_t i = 1; i < *lpn_count; ++i) {
+			if ((*lpn_vec)[i] != (*lpn_vec)[unique - 1])
+				(*lpn_vec)[unique++] = (*lpn_vec)[i];
+		}
+		*lpn_count = unique;
+	}
+
+	return 0;
+}
+
 static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *db,
 				const struct dataset_layout *layout,
 				const double *cold_per_table,
 				const struct page_tier_entry *tiers, size_t tier_count,
+				const struct page_die_entry *page_die_entries,
+				size_t page_die_count, unsigned int die_slots,
 				const struct access_count_entry *access_entries,
 				size_t access_entry_count,
 				unsigned long long host_page_bytes)
@@ -2467,6 +2812,8 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 	unsigned int page_size = 4096;
 	unsigned long long *lpn_vec = NULL;
 	unsigned long long *acc_vec = NULL;
+	unsigned long long *die_lpn_counts = NULL;
+	unsigned long long *die_acc_sums = NULL;
 	size_t lpn_cap = 0;
 	size_t acc_cap = 0;
 	bool use_fiemap = false;
@@ -2490,6 +2837,8 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 		"qlc_fast_lpn,qlc_slow_lpn,qlc_zone_unknown_lpn,unknown_lpn,"
 		"acc_mean,acc_p50,acc_p90,acc_p99,acc_max,acc_missing_lpn,"
 		"slc_ratio_known,qlc_fast_ratio_known,qlc_slow_ratio_known,"
+		"distinct_die,dominant_die,dominant_die_lpn,dominant_die_lpn_ratio,"
+		"dominant_die_acc_ratio,effective_die_parallelism,"
 		"cold_time_sec,cold_throughput_mb_s\n");
 
 	rc = sqlite3_prepare_v2(db, "PRAGMA page_size;", -1, &pragma_stmt, NULL);
@@ -2527,11 +2876,23 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 		return -1;
 	}
 
+	if (die_slots > 0) {
+		die_lpn_counts = calloc(die_slots, sizeof(*die_lpn_counts));
+		die_acc_sums = calloc(die_slots, sizeof(*die_acc_sums));
+		if (!die_lpn_counts || !die_acc_sums) {
+			free(die_lpn_counts);
+			free(die_acc_sums);
+			sqlite3_finalize(stmt);
+			free(extents);
+			fclose(fp);
+			return -ENOMEM;
+		}
+	}
+
 	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
 		char table_name[MAX_TABLE_NAME];
 		size_t lpn_count = 0;
 		size_t acc_count = 0;
-		size_t extent_cursor = 0;
 		unsigned long long db_pages = 0;
 		unsigned long long slc_lpn = 0;
 		unsigned long long qlc_lpn = 0;
@@ -2545,67 +2906,34 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 		unsigned long long acc_p99 = 0;
 		unsigned long long acc_max = 0;
 		unsigned long long acc_missing_lpn = 0;
+		unsigned int distinct_die = 0;
+		int dominant_die = -1;
+		unsigned long long dominant_die_lpn = 0;
+		double dominant_die_lpn_ratio = 0.0;
+		double dominant_die_acc_ratio = 0.0;
+		double effective_die_parallelism = 0.0;
 
-		build_table_name(table_name, sizeof(table_name), tbl);
-		sqlite3_reset(stmt);
-		sqlite3_clear_bindings(stmt);
-		sqlite3_bind_text(stmt, 1, table_name, -1, SQLITE_STATIC);
-
-		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-			int pageno = sqlite3_column_int(stmt, 0);
-			unsigned long long file_byte_start;
-			unsigned long long file_byte_end;
-			unsigned long long lpn_start;
-			unsigned long long lpn_end;
-			int map_rc;
-
-			if (pageno <= 0)
-				continue;
-
-			db_pages++;
-			file_byte_start = (unsigned long long)(pageno - 1) * (unsigned long long)page_size;
-			file_byte_end = file_byte_start + (unsigned long long)page_size - 1ULL;
-
-			if (use_fiemap) {
-				map_rc = append_file_range_lpns(extents, extent_count, &extent_cursor,
-								file_byte_start, file_byte_end,
-								host_page_bytes,
-								&lpn_vec, &lpn_count, &lpn_cap);
-				if (map_rc == 0)
-					continue;
-
-				fiemap_fallback_pages++;
-			}
-
-			lpn_start = file_byte_start / host_page_bytes;
-			lpn_end = file_byte_end / host_page_bytes;
-			map_rc = append_lpn_range(lpn_start, lpn_end, &lpn_vec, &lpn_count, &lpn_cap);
-			if (map_rc != 0) {
-				free(lpn_vec);
-				sqlite3_finalize(stmt);
-				free(extents);
-				fclose(fp);
-				return map_rc;
-			}
+		if (die_slots > 0) {
+			memset(die_lpn_counts, 0, die_slots * sizeof(*die_lpn_counts));
+			memset(die_acc_sums, 0, die_slots * sizeof(*die_acc_sums));
 		}
 
-		if (rc != SQLITE_DONE) {
-			fprintf(stderr, "dbstat step failed for %s: %s\n", table_name, sqlite3_errmsg(db));
+		build_table_name(table_name, sizeof(table_name), tbl);
+		rc = collect_table_lpns(stmt, table_name, page_size, use_fiemap,
+					extents, extent_count, host_page_bytes,
+					&lpn_vec, &lpn_count, &lpn_cap, &db_pages,
+					&fiemap_fallback_pages);
+		if (rc != 0) {
+			fprintf(stderr, "failed to collect lpns for %s (rc=%d)\n",
+				table_name, rc);
 			free(lpn_vec);
+			free(acc_vec);
+			free(die_lpn_counts);
+			free(die_acc_sums);
 			sqlite3_finalize(stmt);
 			free(extents);
 			fclose(fp);
-			return -1;
-		}
-
-		if (lpn_count > 0) {
-			qsort(lpn_vec, lpn_count, sizeof(*lpn_vec), cmp_u64_asc);
-			size_t unique = 1;
-			for (size_t i = 1; i < lpn_count; ++i) {
-				if (lpn_vec[i] != lpn_vec[unique - 1])
-					lpn_vec[unique++] = lpn_vec[i];
-			}
-			lpn_count = unique;
+			return rc;
 		}
 
 		if (lpn_count > acc_cap) {
@@ -2627,6 +2955,8 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 			unsigned int qlc_zone = 0;
 			bool qlc_zone_known = false;
 			unsigned long long acc = 0;
+			unsigned int die = 0;
+			bool die_known = false;
 			if (tiers && tier_count > 0 &&
 			    lookup_page_tier(tiers, tier_count, lpn_vec[i], &in_slc,
 					     &qlc_zone, &qlc_zone_known)) {
@@ -2655,6 +2985,18 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 
 			acc_vec[acc_count++] = acc;
 			acc_sum += acc;
+
+			if (die_slots > 0 && page_die_entries && page_die_count > 0 &&
+			    lookup_page_die(page_die_entries, page_die_count, lpn_vec[i], &die) &&
+			    die < die_slots) {
+				die_known = true;
+				die_lpn_counts[die]++;
+				die_acc_sums[die] += acc;
+			}
+
+			if (!die_known) {
+				/* unknown die is excluded from die histogram */
+			}
 		}
 
 		if (acc_count > 0) {
@@ -2663,6 +3005,32 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 			acc_p90 = percentile_u64_from_sorted(acc_vec, acc_count, 0.90);
 			acc_p99 = percentile_u64_from_sorted(acc_vec, acc_count, 0.99);
 			acc_max = acc_vec[acc_count - 1];
+		}
+
+		if (die_slots > 0 && lpn_count > 0) {
+			double sq_sum = 0.0;
+
+			for (unsigned int die = 0; die < die_slots; ++die) {
+				if (die_lpn_counts[die] == 0)
+					continue;
+
+				distinct_die++;
+				if (die_lpn_counts[die] > dominant_die_lpn) {
+					dominant_die_lpn = die_lpn_counts[die];
+					dominant_die = (int)die;
+				}
+				if (acc_sum > 0) {
+					double p = (double)die_acc_sums[die] / (double)acc_sum;
+					sq_sum += p * p;
+				}
+			}
+
+			dominant_die_lpn_ratio = (double)dominant_die_lpn / (double)lpn_count;
+			if (dominant_die >= 0 && acc_sum > 0)
+				dominant_die_acc_ratio =
+					(double)die_acc_sums[dominant_die] / (double)acc_sum;
+			if (sq_sum > 0.0)
+				effective_die_parallelism = 1.0 / sq_sum;
 		}
 
 		double known = (double)(slc_lpn + qlc_lpn);
@@ -2676,15 +3044,20 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 				      (1024.0 * 1024.0);
 		double cold_tp = cold_time > 0.0 ? tbl_bytes_mb / cold_time : 0.0;
 
-		fprintf(fp, "%u,%s,%llu,%zu,%llu,%llu,%llu,%llu,%llu,%llu,%.9f,%llu,%llu,%llu,%llu,%llu,%.9f,%.9f,%.9f,%.9f,%.2f\n",
+		fprintf(fp, "%u,%s,%llu,%zu,%llu,%llu,%llu,%llu,%llu,%llu,%.9f,%llu,%llu,%llu,%llu,%llu,%.9f,%.9f,%.9f,%u,%d,%llu,%.9f,%.9f,%.9f,%.9f,%.2f\n",
 			tbl, table_name, db_pages, lpn_count, slc_lpn, qlc_lpn,
 			qlc_fast_lpn, qlc_slow_lpn, qlc_zone_unknown_lpn, unknown_lpn,
 			acc_mean, acc_p50, acc_p90, acc_p99, acc_max, acc_missing_lpn,
-			slc_ratio, qlc_fast_ratio, qlc_slow_ratio, cold_time, cold_tp);
+			slc_ratio, qlc_fast_ratio, qlc_slow_ratio,
+			distinct_die, dominant_die, dominant_die_lpn,
+			dominant_die_lpn_ratio, dominant_die_acc_ratio,
+			effective_die_parallelism, cold_time, cold_tp);
 	}
 
 	free(lpn_vec);
 	free(acc_vec);
+	free(die_lpn_counts);
+	free(die_acc_sums);
 	sqlite3_finalize(stmt);
 	free(extents);
 	fclose(fp);
@@ -2693,6 +3066,154 @@ static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *
 			"table_tier used logical fallback for %llu pages (fiemap gaps/errors)\n",
 			fiemap_fallback_pages);
 	}
+	return 0;
+}
+
+static int write_table_die_csv(const char *path, const char *db_path, sqlite3 *db,
+			       const struct dataset_layout *layout,
+			       const struct page_die_entry *page_die_entries,
+			       size_t page_die_count, unsigned int die_slots,
+			       const struct access_count_entry *access_entries,
+			       size_t access_entry_count,
+			       unsigned long long host_page_bytes)
+{
+	FILE *fp = NULL;
+	sqlite3_stmt *stmt = NULL;
+	sqlite3_stmt *pragma_stmt = NULL;
+	struct file_extent *extents = NULL;
+	unsigned long long *lpn_vec = NULL;
+	unsigned long long *die_lpn_counts = NULL;
+	unsigned long long *die_acc_sums = NULL;
+	size_t extent_count = 0;
+	size_t lpn_cap = 0;
+	unsigned int page_size = 4096;
+	bool use_fiemap = false;
+	unsigned long long fiemap_fallback_pages = 0;
+	int rc;
+
+	if (!path || !path[0] || !db_path || !db_path[0] || !db || !layout || die_slots == 0)
+		return 0;
+
+	if (host_page_bytes == 0)
+		host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
+
+	fp = fopen(path, "w");
+	if (!fp) {
+		perror("fopen table die");
+		return -1;
+	}
+
+	fprintf(fp,
+		"table_id,table_name,die,lpn_count,lpn_ratio,access_sum,access_ratio\n");
+
+	rc = sqlite3_prepare_v2(db, "PRAGMA page_size;", -1, &pragma_stmt, NULL);
+	if (rc == SQLITE_OK && sqlite3_step(pragma_stmt) == SQLITE_ROW) {
+		int ps = sqlite3_column_int(pragma_stmt, 0);
+		if (ps > 0)
+			page_size = (unsigned int)ps;
+	}
+	if (pragma_stmt)
+		sqlite3_finalize(pragma_stmt);
+
+	rc = load_file_extents(db_path, &extents, &extent_count);
+	if (rc == 0 && extent_count > 0) {
+		unsigned long long part_off = detect_partition_offset_bytes(db_path);
+
+		use_fiemap = true;
+		if (part_off > 0) {
+			for (size_t i = 0; i < extent_count; ++i)
+				extents[i].physical += part_off;
+		}
+	}
+
+	rc = sqlite3_prepare_v2(db, "SELECT pageno FROM dbstat WHERE name = ? ORDER BY pageno;", -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "prepare dbstat failed for table_die: %s\n", sqlite3_errmsg(db));
+		free(extents);
+		fclose(fp);
+		return -1;
+	}
+
+	die_lpn_counts = calloc(die_slots, sizeof(*die_lpn_counts));
+	die_acc_sums = calloc(die_slots, sizeof(*die_acc_sums));
+	if (!die_lpn_counts || !die_acc_sums) {
+		free(lpn_vec);
+		free(die_lpn_counts);
+		free(die_acc_sums);
+		sqlite3_finalize(stmt);
+		free(extents);
+		fclose(fp);
+		return -ENOMEM;
+	}
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		char table_name[MAX_TABLE_NAME];
+		size_t lpn_count = 0;
+		unsigned long long db_pages = 0;
+		unsigned long long acc_sum_total = 0;
+
+		memset(die_lpn_counts, 0, die_slots * sizeof(*die_lpn_counts));
+		memset(die_acc_sums, 0, die_slots * sizeof(*die_acc_sums));
+
+		build_table_name(table_name, sizeof(table_name), tbl);
+		rc = collect_table_lpns(stmt, table_name, page_size, use_fiemap,
+					extents, extent_count, host_page_bytes,
+					&lpn_vec, &lpn_count, &lpn_cap, &db_pages,
+					&fiemap_fallback_pages);
+		if (rc != 0) {
+			fprintf(stderr, "failed to collect lpns for table_die %s (rc=%d)\n",
+				table_name, rc);
+			free(lpn_vec);
+			free(die_lpn_counts);
+			free(die_acc_sums);
+			sqlite3_finalize(stmt);
+			free(extents);
+			fclose(fp);
+			return rc;
+		}
+
+		for (size_t i = 0; i < lpn_count; ++i) {
+			unsigned int die = 0;
+			unsigned long long acc = 0;
+
+			if (!(page_die_entries && page_die_count > 0 &&
+			      lookup_page_die(page_die_entries, page_die_count, lpn_vec[i], &die) &&
+			      die < die_slots))
+				continue;
+
+			if (!(access_entries && access_entry_count > 0 &&
+			      lookup_access_count(access_entries, access_entry_count, lpn_vec[i], &acc)))
+				acc = 0;
+
+			die_lpn_counts[die]++;
+			die_acc_sums[die] += acc;
+			acc_sum_total += acc;
+		}
+
+		for (unsigned int die = 0; die < die_slots; ++die) {
+			double lpn_ratio;
+			double acc_ratio;
+
+			if (die_lpn_counts[die] == 0)
+				continue;
+
+			lpn_ratio = lpn_count > 0 ?
+				(double)die_lpn_counts[die] / (double)lpn_count : 0.0;
+			acc_ratio = acc_sum_total > 0 ?
+				(double)die_acc_sums[die] / (double)acc_sum_total : 0.0;
+
+			fprintf(fp, "%u,%s,%u,%llu,%.9f,%llu,%.9f\n",
+				tbl, table_name, die, die_lpn_counts[die], lpn_ratio,
+				die_acc_sums[die], acc_ratio);
+		}
+	}
+
+	free(lpn_vec);
+	free(die_lpn_counts);
+	free(die_acc_sums);
+	sqlite3_finalize(stmt);
+	free(extents);
+	fclose(fp);
 	return 0;
 }
 
@@ -2906,18 +3427,23 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	char row_stats_path[PATH_MAX];
 	char table_stats_path[PATH_MAX];
 	char table_tier_path[PATH_MAX];
+	char table_die_path[PATH_MAX];
 	double total_read_time = 0.0;
 	double cold_read_time = 0.0;
 	unsigned int cold_read_iters = opts->cold_full_read_iters ? opts->cold_full_read_iters : 1U;
 	double *cold_per_table = NULL;
 	struct page_tier_entry *tier_entries = NULL;
 	size_t tier_entry_count = 0;
+	struct page_die_entry *page_die_entries = NULL;
+	size_t page_die_count = 0;
+	unsigned int page_die_slots = 0;
 	struct access_count_entry *access_entries = NULL;
 	size_t access_entry_count = 0;
 	unsigned int *heat = NULL;
 	bool txn_active = false;
 	bool fast_profile_applied = false;
 	bool read_repromotion_toggled = false;
+	bool test_phase_toggled = false;
 	int dummy_fd = -1;
 	void *dummy_buf = NULL;
 	unsigned long long total_phase_pad_bytes = 0;
@@ -2977,6 +3503,7 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	build_row_stats_path(row_stats_path, sizeof(row_stats_path), opts);
 	build_table_stats_path(table_stats_path, sizeof(table_stats_path), opts);
 	build_table_tier_path(table_tier_path, sizeof(table_tier_path), opts);
+	build_table_die_path(table_die_path, sizeof(table_die_path), opts);
 
 	active = malloc(table_count * sizeof(*active));
 	table_latency = calloc(table_count, sizeof(double));
@@ -3003,6 +3530,9 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	       cold_full_read_mode_name(opts->cold_full_read_mode), cold_read_iters,
 	       opts->cold_disable_read_repromotion ? "off" : "on",
 	       opts->read_repromotion_ctrl_path ? opts->read_repromotion_ctrl_path : "(null)");
+	printf("[sqlite_init] test_phase_path=%s cold_overwrite_pct=%u\n",
+	       opts->test_phase_path ? opts->test_phase_path : "(null)",
+	       opts->cold_overwrite_pct);
 	printf("[sqlite_init] rrpad_mode=1 rrpad_die_count=%u row_die_units=%u\n",
 	       RR_PHASE_DIE_COUNT, RR_PHASE_ROW_UNITS);
 	if (opts->direct_io) {
@@ -3203,6 +3733,10 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 			goto out;
 		read_repromotion_toggled = true;
 	}
+	rc = set_test_phase_state(opts, true, "cold-read-start");
+	if (rc != 0)
+		goto out;
+	test_phase_toggled = true;
 	if (opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CONCURRENT) {
 		reset_die_stats();
 		set_gc_nand_timing(1);
@@ -3218,12 +3752,19 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 			&concurrent_rows_read);
 	} else {
 		cold_read_time = run_cold_full_read(db, layout, opts->cold_full_read_mode,
-						    cold_read_iters, read_plan, cold_per_table);
+						    cold_read_iters, read_plan,
+						    opts->cold_overwrite_pct, cold_per_table);
 	}
 
 	if (opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CONCURRENT) {
 		set_gc_nand_timing(0);
 		dump_die_stats("cold-read");
+	}
+	if (test_phase_toggled) {
+		rc = set_test_phase_state(opts, false, "cold-read-end");
+		if (rc != 0)
+			goto out;
+		test_phase_toggled = false;
 	}
 	if (read_repromotion_toggled) {
 		rc = set_read_repromotion_state(opts, true, "cold-read-end");
@@ -3258,14 +3799,35 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		access_entries = NULL;
 		access_entry_count = 0;
 	}
+	if (load_page_die_entries(DEFAULT_PAGE_DIE_PATH,
+				  &page_die_entries, &page_die_count,
+				  &page_die_slots) != 0) {
+		fprintf(stderr,
+			"Failed to load page die map %s, continue without die placement stats\n",
+			DEFAULT_PAGE_DIE_PATH);
+		page_die_entries = NULL;
+		page_die_count = 0;
+		page_die_slots = 0;
+	}
 	if (write_table_tier_csv(table_tier_path, db_path, db, layout, cold_per_table,
 				 tier_entries, tier_entry_count,
+				 page_die_entries, page_die_count, page_die_slots,
 				 access_entries, access_entry_count,
 				 opts->ftl_host_page_bytes) != 0) {
 		fprintf(stderr, "Failed to write table tier stats %s\n", table_tier_path);
 	} else {
-		printf("[sqlite_init] table_tier=%s page_tier_entries=%zu access_entries=%zu\n",
-		       table_tier_path, tier_entry_count, access_entry_count);
+		printf("[sqlite_init] table_tier=%s page_tier_entries=%zu page_die_entries=%zu access_entries=%zu\n",
+		       table_tier_path, tier_entry_count, page_die_count,
+		       access_entry_count);
+	}
+	if (write_table_die_csv(table_die_path, db_path, db, layout,
+				page_die_entries, page_die_count, page_die_slots,
+				access_entries, access_entry_count,
+				opts->ftl_host_page_bytes) != 0) {
+		fprintf(stderr, "Failed to write table die stats %s\n", table_die_path);
+	} else if (page_die_slots > 0) {
+		printf("[sqlite_init] table_die=%s die_slots=%u\n",
+		       table_die_path, page_die_slots);
 	}
 
 	report_cold_tail_latency(layout, tables, table_latency, table_read_ops);
@@ -3317,6 +3879,8 @@ out:
 	if (dummy_fd >= 0)
 		close(dummy_fd);
 	free(dummy_buf);
+	if (test_phase_toggled)
+		set_test_phase_state(opts, false, "cleanup");
 	if (read_repromotion_toggled)
 		set_read_repromotion_state(opts, true, "cleanup");
 	if (fast_profile_applied)
@@ -3324,6 +3888,7 @@ out:
 	if (heat)
 		free(heat);
 	free(access_entries);
+	free(page_die_entries);
 	free(tier_entries);
 	free(cold_per_table);
 	free(read_plan);
@@ -4038,6 +4603,8 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->cold_full_read_iters = 1;
 	opts->cold_disable_read_repromotion = false;
 	opts->read_repromotion_ctrl_path = DEFAULT_READ_REPROMOTION_CTRL_PATH;
+	opts->test_phase_path = DEFAULT_TEST_PHASE_PATH;
+	opts->cold_overwrite_pct = 0;
 	opts->cold_concurrent_threads = 1;
 	opts->cold_random_reads_per_tbl = 5000;
 	opts->dummy_interleave = false;
@@ -4189,6 +4756,14 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		case 1027:
 			opts->read_repromotion_ctrl_path = optarg;
 			break;
+		case 1032:
+			opts->test_phase_path = optarg;
+			break;
+		case 1033:
+			opts->cold_overwrite_pct = (unsigned int)strtoul(optarg, NULL, 10);
+			if (opts->cold_overwrite_pct > 100)
+				opts->cold_overwrite_pct = 100;
+			break;
 		case 1028:
 			opts->cold_concurrent_threads = (unsigned int)strtoul(optarg, NULL, 10);
 			if (opts->cold_concurrent_threads == 0)
@@ -4223,6 +4798,10 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		build_default_trace_path(opts->trace_path_buf, sizeof(opts->trace_path_buf), opts);
 		opts->trace_path = opts->trace_path_buf;
 	}
+
+	if (opts->cold_full_read_mode == COLD_FULL_READ_FULL_SCAN_OVERWRITE &&
+	    opts->cold_overwrite_pct == 0)
+		opts->cold_overwrite_pct = 10;
 }
 
 int main(int argc, char **argv)
@@ -4317,5 +4896,13 @@ static void build_table_tier_path(char *buf, size_t len, const struct workload_o
 	char filename[128];
 
 	snprintf(filename, sizeof(filename), TABLE_TIER_FILENAME_FMT, effective_tag(opts));
+	join_path(buf, len, RESULT_FOLDER, filename);
+}
+
+static void build_table_die_path(char *buf, size_t len, const struct workload_options *opts)
+{
+	char filename[128];
+
+	snprintf(filename, sizeof(filename), TABLE_DIE_FILENAME_FMT, effective_tag(opts));
 	join_path(buf, len, RESULT_FOLDER, filename);
 }

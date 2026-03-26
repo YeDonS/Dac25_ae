@@ -857,6 +857,295 @@ static const struct file_operations page_tier_fops = {
 	.release = single_release,
 };
 
+static int page_die_show(struct seq_file *m, void *v)
+{
+	struct conv_ftl *conv_ftl = m->private;
+	struct ssdparams *spp;
+	uint64_t lpn;
+
+	(void)v;
+
+	if (!conv_ftl || !conv_ftl->ssd)
+		return 0;
+
+	spp = &conv_ftl->ssd->sp;
+	for (lpn = 0; lpn < spp->tt_pgs; lpn++) {
+		struct ppa ppa = get_maptbl_ent(conv_ftl, lpn);
+
+		if (!mapped_ppa(&ppa) || !valid_ppa(conv_ftl, &ppa))
+			continue;
+
+		seq_printf(m, "%llu %u\n", lpn,
+			   (unsigned int)encode_die(spp, &ppa));
+	}
+
+	return 0;
+}
+
+static int page_die_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, page_die_show, inode->i_private);
+}
+
+static const struct file_operations page_die_fops = {
+	.owner = THIS_MODULE,
+	.open = page_die_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static int die_affinity_stats_show(struct seq_file *m, void *v)
+{
+	struct conv_ftl *conv_ftl = m->private;
+
+	(void)v;
+
+	if (!conv_ftl)
+		return 0;
+
+	seq_printf(m, "append_requests %llu\n",
+		   (unsigned long long)conv_ftl->die_aff_append_requests);
+	seq_printf(m, "append_effective %llu\n",
+		   (unsigned long long)conv_ftl->die_aff_append_effective);
+	seq_printf(m, "overwrite_requests %llu\n",
+		   (unsigned long long)conv_ftl->die_aff_overwrite_requests);
+	seq_printf(m, "overwrite_effective %llu\n",
+		   (unsigned long long)conv_ftl->die_aff_overwrite_effective);
+	return 0;
+}
+
+static int die_affinity_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, die_affinity_stats_show, inode->i_private);
+}
+
+static const struct file_operations die_affinity_stats_fops = {
+	.owner = THIS_MODULE,
+	.open = die_affinity_stats_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static inline bool test_phase_enabled(const struct conv_ftl *conv_ftl)
+{
+	return conv_ftl && READ_ONCE(conv_ftl->test_phase_active);
+}
+
+static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+
+	atomic64_set(&conv_ftl->test_phase_read_reqs, 0);
+	atomic64_set(&conv_ftl->test_phase_overwrite_reqs, 0);
+	atomic64_set(&conv_ftl->test_phase_bg_repromote_ops, 0);
+	atomic64_set(&conv_ftl->test_phase_bg_qlc_rebalance_ops, 0);
+	atomic64_set(&conv_ftl->test_phase_read_bg_conflicts, 0);
+	atomic64_set(&conv_ftl->test_phase_read_overwrite_conflicts, 0);
+	atomic_set(&conv_ftl->test_phase_active_reads, 0);
+	atomic_set(&conv_ftl->test_phase_active_overwrites, 0);
+	atomic_set(&conv_ftl->test_phase_active_bg_ops, 0);
+}
+
+static void test_phase_log_summary(struct conv_ftl *conv_ftl, const char *phase)
+{
+	if (!conv_ftl)
+		return;
+
+	NVMEV_INFO("[TEST_PHASE] %s reads=%lld overwrites=%lld bg_repromote=%lld "
+		   "bg_qlc_rebalance=%lld read_bg_conflicts=%lld read_overwrite_conflicts=%lld\n",
+		   phase ? phase : "summary",
+		   atomic64_read(&conv_ftl->test_phase_read_reqs),
+		   atomic64_read(&conv_ftl->test_phase_overwrite_reqs),
+		   atomic64_read(&conv_ftl->test_phase_bg_repromote_ops),
+		   atomic64_read(&conv_ftl->test_phase_bg_qlc_rebalance_ops),
+		   atomic64_read(&conv_ftl->test_phase_read_bg_conflicts),
+		   atomic64_read(&conv_ftl->test_phase_read_overwrite_conflicts));
+}
+
+static void test_phase_note_read_begin(struct conv_ftl *conv_ftl, bool *tracked)
+{
+	if (tracked)
+		*tracked = false;
+	if (!test_phase_enabled(conv_ftl))
+		return;
+
+	atomic64_inc(&conv_ftl->test_phase_read_reqs);
+	atomic_inc(&conv_ftl->test_phase_active_reads);
+	if (atomic_read(&conv_ftl->test_phase_active_bg_ops) > 0)
+		atomic64_inc(&conv_ftl->test_phase_read_bg_conflicts);
+	if (atomic_read(&conv_ftl->test_phase_active_overwrites) > 0)
+		atomic64_inc(&conv_ftl->test_phase_read_overwrite_conflicts);
+	if (tracked)
+		*tracked = true;
+}
+
+static void test_phase_note_read_end(struct conv_ftl *conv_ftl, bool tracked)
+{
+	if (!tracked || !conv_ftl)
+		return;
+	atomic_dec_if_positive(&conv_ftl->test_phase_active_reads);
+}
+
+static void test_phase_note_overwrite_begin(struct conv_ftl *conv_ftl, bool *tracked)
+{
+	if (tracked)
+		*tracked = false;
+	if (!test_phase_enabled(conv_ftl))
+		return;
+
+	atomic64_inc(&conv_ftl->test_phase_overwrite_reqs);
+	atomic_inc(&conv_ftl->test_phase_active_overwrites);
+	if (atomic_read(&conv_ftl->test_phase_active_reads) > 0)
+		atomic64_inc(&conv_ftl->test_phase_read_overwrite_conflicts);
+	if (tracked)
+		*tracked = true;
+}
+
+static void test_phase_note_overwrite_end(struct conv_ftl *conv_ftl, bool tracked)
+{
+	if (!tracked || !conv_ftl)
+		return;
+	atomic_dec_if_positive(&conv_ftl->test_phase_active_overwrites);
+}
+
+static void test_phase_note_bg_begin(struct conv_ftl *conv_ftl,
+				     atomic64_t *specific_counter,
+				     bool *tracked)
+{
+	if (tracked)
+		*tracked = false;
+	if (!test_phase_enabled(conv_ftl))
+		return;
+
+	if (specific_counter)
+		atomic64_inc(specific_counter);
+	atomic_inc(&conv_ftl->test_phase_active_bg_ops);
+	if (atomic_read(&conv_ftl->test_phase_active_reads) > 0)
+		atomic64_inc(&conv_ftl->test_phase_read_bg_conflicts);
+	if (tracked)
+		*tracked = true;
+}
+
+static void test_phase_note_bg_end(struct conv_ftl *conv_ftl, bool tracked)
+{
+	if (!tracked || !conv_ftl)
+		return;
+	atomic_dec_if_positive(&conv_ftl->test_phase_active_bg_ops);
+}
+
+static ssize_t test_phase_read(struct file *file, char __user *user_buf,
+			       size_t len, loff_t *ppos)
+{
+	struct conv_ftl *conv_ftl = file->private_data;
+	char buf[32];
+	int out_len;
+
+	if (!conv_ftl)
+		return -EINVAL;
+
+	out_len = scnprintf(buf, sizeof(buf), "%u\n",
+			    test_phase_enabled(conv_ftl) ? 1U : 0U);
+	return simple_read_from_buffer(user_buf, len, ppos, buf, out_len);
+}
+
+static ssize_t test_phase_write(struct file *file, const char __user *user_buf,
+				size_t len, loff_t *ppos)
+{
+	struct conv_ftl *conv_ftl = file->private_data;
+	char kbuf[16];
+	size_t copy;
+	bool enabled;
+	int rc;
+
+	(void)ppos;
+
+	if (!conv_ftl)
+		return -EINVAL;
+	if (len == 0)
+		return 0;
+
+	copy = min(len, sizeof(kbuf) - 1);
+	if (copy_from_user(kbuf, user_buf, copy))
+		return -EFAULT;
+	kbuf[copy] = '\0';
+
+	rc = kstrtobool(skip_spaces(kbuf), &enabled);
+	if (rc)
+		return rc;
+
+	if (enabled) {
+		test_phase_reset_stats(conv_ftl);
+		WRITE_ONCE(conv_ftl->test_phase_active, true);
+		NVMEV_INFO("[TEST_PHASE] enter\n");
+	} else {
+		WRITE_ONCE(conv_ftl->test_phase_active, false);
+		test_phase_log_summary(conv_ftl, "exit");
+	}
+
+	return len;
+}
+
+static int test_phase_open(struct inode *inode, struct file *file)
+{
+	file->private_data = inode->i_private;
+	return nonseekable_open(inode, file);
+}
+
+static const struct file_operations test_phase_fops = {
+	.owner = THIS_MODULE,
+	.open = test_phase_open,
+	.read = test_phase_read,
+	.write = test_phase_write,
+	.llseek = no_llseek,
+};
+
+static int test_phase_stats_show(struct seq_file *m, void *v)
+{
+	struct conv_ftl *conv_ftl = m->private;
+
+	(void)v;
+
+	if (!conv_ftl)
+		return 0;
+
+	seq_printf(m, "active %u\n", test_phase_enabled(conv_ftl) ? 1U : 0U);
+	seq_printf(m, "read_requests %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_reqs));
+	seq_printf(m, "overwrite_requests %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_overwrite_reqs));
+	seq_printf(m, "bg_repromote_ops %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_bg_repromote_ops));
+	seq_printf(m, "bg_qlc_rebalance_ops %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_bg_qlc_rebalance_ops));
+	seq_printf(m, "read_bg_conflicts %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_bg_conflicts));
+	seq_printf(m, "read_overwrite_conflicts %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_overwrite_conflicts));
+	seq_printf(m, "active_reads %d\n",
+		   atomic_read(&conv_ftl->test_phase_active_reads));
+	seq_printf(m, "active_overwrites %d\n",
+		   atomic_read(&conv_ftl->test_phase_active_overwrites));
+	seq_printf(m, "active_bg_ops %d\n",
+		   atomic_read(&conv_ftl->test_phase_active_bg_ops));
+	return 0;
+}
+
+static int test_phase_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, test_phase_stats_show, inode->i_private);
+}
+
+static const struct file_operations test_phase_stats_fops = {
+	.owner = THIS_MODULE,
+	.open = test_phase_stats_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int access_inject_open(struct inode *inode, struct file *file)
 {
 	pr_info("access_inject_open: inode=%p private=%p\n", inode, inode->i_private);
@@ -1931,6 +2220,10 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->debug_access_count = NULL;
 	conv_ftl->debug_access_inject = NULL;
 	conv_ftl->debug_page_tier = NULL;
+	conv_ftl->debug_page_die = NULL;
+	conv_ftl->debug_die_affinity_stats = NULL;
+	conv_ftl->debug_test_phase = NULL;
+	conv_ftl->debug_test_phase_stats = NULL;
 
 	conv_ftl->die_count = total_dies(&ssd->sp);
 	if (!conv_ftl->die_count)
@@ -2031,6 +2324,12 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->qlc_zone_rr_cursor = 0;
 	conv_ftl->migration_read_path_count = 0;
 	conv_ftl->migration_read_path_time_ns = 0;
+	conv_ftl->die_aff_append_requests = 0;
+	conv_ftl->die_aff_append_effective = 0;
+	conv_ftl->die_aff_overwrite_requests = 0;
+	conv_ftl->die_aff_overwrite_effective = 0;
+	conv_ftl->test_phase_active = false;
+	test_phase_reset_stats(conv_ftl);
 	conv_ftl->qlc_promote_cursor = 0;
 	conv_ftl->qlc_demote_cursor = 0;
 	conv_ftl->qlc_rebalance_period_writes = 2048;
@@ -2095,6 +2394,18 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		conv_ftl->debug_page_tier =
 			debugfs_create_file("page_tier", 0440, parent,
 					    conv_ftl, &page_tier_fops);
+		conv_ftl->debug_page_die =
+			debugfs_create_file("page_die", 0440, parent,
+					    conv_ftl, &page_die_fops);
+		conv_ftl->debug_die_affinity_stats =
+			debugfs_create_file("die_affinity_stats", 0440, parent,
+					    conv_ftl, &die_affinity_stats_fops);
+		conv_ftl->debug_test_phase =
+			debugfs_create_file("test_phase", 0640, parent,
+					    conv_ftl, &test_phase_fops);
+		conv_ftl->debug_test_phase_stats =
+			debugfs_create_file("test_phase_stats", 0440, parent,
+					    conv_ftl, &test_phase_stats_fops);
 		conv_ftl->debug_read_repromotion = NULL;
 	}
 
@@ -2115,6 +2426,10 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		conv_ftl->debug_access_count = NULL;
 		conv_ftl->debug_access_inject = NULL;
 		conv_ftl->debug_page_tier = NULL;
+		conv_ftl->debug_page_die = NULL;
+		conv_ftl->debug_die_affinity_stats = NULL;
+		conv_ftl->debug_test_phase = NULL;
+		conv_ftl->debug_test_phase_stats = NULL;
 		conv_ftl->debug_read_repromotion = NULL;
 	} else {
 		if (conv_ftl->debug_access_count) {
@@ -2128,6 +2443,22 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		if (conv_ftl->debug_page_tier) {
 			debugfs_remove(conv_ftl->debug_page_tier);
 			conv_ftl->debug_page_tier = NULL;
+		}
+		if (conv_ftl->debug_page_die) {
+			debugfs_remove(conv_ftl->debug_page_die);
+			conv_ftl->debug_page_die = NULL;
+		}
+		if (conv_ftl->debug_die_affinity_stats) {
+			debugfs_remove(conv_ftl->debug_die_affinity_stats);
+			conv_ftl->debug_die_affinity_stats = NULL;
+		}
+		if (conv_ftl->debug_test_phase) {
+			debugfs_remove(conv_ftl->debug_test_phase);
+			conv_ftl->debug_test_phase = NULL;
+		}
+		if (conv_ftl->debug_test_phase_stats) {
+			debugfs_remove(conv_ftl->debug_test_phase_stats);
+			conv_ftl->debug_test_phase_stats = NULL;
 		}
 		if (conv_ftl->debug_read_repromotion) {
 			debugfs_remove(conv_ftl->debug_read_repromotion);
@@ -3859,11 +4190,15 @@ static int migrate_page_within_qlc(struct conv_ftl *conv_ftl, uint64_t lpn,
 	uint32_t zone_hint;
 	uint8_t old_zone, actual_new_zone;
 	unsigned long flags;
+	bool test_phase_bg_tracked = false;
 
 	if (!conv_ftl || !src_ppa || !mapped_ppa(src_ppa) || !valid_ppa(conv_ftl, src_ppa))
 		return -EINVAL;
 	if (is_slc_block(conv_ftl, src_ppa->g.blk))
 		return -EINVAL;
+
+	test_phase_note_bg_begin(conv_ftl, &conv_ftl->test_phase_bg_qlc_rebalance_ops,
+				 &test_phase_bg_tracked);
 
 	src_pg = get_pg(conv_ftl->ssd, src_ppa);
 	if (!src_pg || src_pg->status != PG_VALID)
@@ -3923,6 +4258,7 @@ static int migrate_page_within_qlc(struct conv_ftl *conv_ftl, uint64_t lpn,
 		    zone_hint,
 		    new_zone_out ? *new_zone_out : (new_ppa.g.pg % QLC_PAGE_PATTERN));
 
+	test_phase_note_bg_end(conv_ftl, test_phase_bg_tracked);
 	return 0;
 }
 
@@ -4199,6 +4535,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 {
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
 	struct conv_ftl *conv_ftl = &conv_ftls[0];
+	struct conv_ftl *stats_ftl = conv_ftl;
 	/* spp are shared by all instances*/
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 
@@ -4216,6 +4553,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	uint64_t rd_seq;
 	struct ppa prev_ppa;
 	uint64_t prev_lpn = INVALID_LPN;
+	bool test_phase_read_tracked = false;
 	struct nand_cmd srd = {
 		.type = USER_IO,
 		.cmd = NAND_READ,
@@ -4246,6 +4584,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
     }
 
 	rd_seq = atomic64_inc_return(&conv_ftl->total_host_reads);
+	test_phase_note_read_begin(stats_ftl, &test_phase_read_tracked);
 
 	if (LBA_TO_BYTE(nr_lba) <= (KB(4) * nr_parts)) {
 		srd.stime += spp->fw_4kb_rd_lat;
@@ -4448,6 +4787,7 @@ ret->nsecs_target = nsecs_latest;
 		lba, nr_lba, nsecs_latest - nsecs_start,
 		conv_ftl->migration_read_path_count);
 
+	test_phase_note_read_end(stats_ftl, test_phase_read_tracked);
 	return true;
 }
 
@@ -4464,17 +4804,22 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	struct nand_page *pg;
 	unsigned long flags;
 	struct line_pool_stats slc_stats;
+	bool test_phase_bg_tracked = false;
 
 	if (!conv_ftl || !qlc_ppa)
 		return;
 	if (!mapped_ppa(qlc_ppa) || !valid_ppa(conv_ftl, qlc_ppa))
 		return;
 
+	test_phase_note_bg_begin(conv_ftl, &conv_ftl->test_phase_bg_repromote_ops,
+				 &test_phase_bg_tracked);
+
 	if (conv_ftl->slc_repromote_guard_lines) {
 		collect_slc_stats(conv_ftl, &slc_stats);
 		if (slc_stats.free <= conv_ftl->slc_repromote_guard_lines) {
 			NVMEV_DEBUG("migrate_page_to_slc: skip due to low SLC free lines (%u <= %u)\n",
 				    slc_stats.free, conv_ftl->slc_repromote_guard_lines);
+			test_phase_note_bg_end(conv_ftl, test_phase_bg_tracked);
 			return;
 		}
 	}
@@ -4509,6 +4854,7 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	new_ppa = get_new_gc_slc_page(conv_ftl, die_index);
 	if (!mapped_ppa(&new_ppa)) {
 		NVMEV_ERROR("migrate_page_to_slc: Failed to allocate SLC page for back-migration\n");
+		test_phase_note_bg_end(conv_ftl, test_phase_bg_tracked);
 		return;
 	}
 
@@ -4574,6 +4920,7 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 
 	NVMEV_DEBUG("Migrated LPN %llu from QLC to SLC (req_die=%u actual_die=%u)\n",
 		    lpn, die_index, encode_die(spp, &new_ppa));
+	test_phase_note_bg_end(conv_ftl, test_phase_bg_tracked);
 }
 
 /* 扫描 QLC 热数据并迁移回 SLC */
@@ -4623,6 +4970,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	NVMEV_DEBUG("[DEBUG] conv_write: Function entry\n");
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
 	struct conv_ftl *conv_ftl = &conv_ftls[0];
+	struct conv_ftl *stats_ftl = conv_ftl;
 
 	/* wbuf and spp are shared by all instances */
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -4655,6 +5003,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint64_t wbuf_needed = 0;
 	uint64_t prev_link_lpn = INVALID_LPN;
 	bool need_fgc = false;
+	bool test_phase_overwrite_tracked = false;
 //66f1
 
 	struct ppa ppa;
@@ -4766,8 +5115,14 @@ retry_wb_alloc:
 	nsecs_xfer_completed = nsecs_latest;
 
 	swr.stime = nsecs_latest;
+	if (bOverwrite)
+		test_phase_note_overwrite_begin(stats_ftl, &test_phase_overwrite_tracked);
     
 	for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+		bool aff_append_req = false;
+		bool aff_overwrite_req = false;
+		bool aff_target_valid = false;
+		uint32_t aff_target_die = 0;
 		        /* 调试：检查是否进入了写入循环 */
 		if (lpn == start_lpn) {
 			NVMEV_DEBUG("[DEBUG] conv_write: Starting write loop, lpn=%llu to %llu\n", start_lpn, end_lpn);
@@ -4819,12 +5174,19 @@ retry_wb_alloc:
 				ppa = get_maptbl_ent(p_conv_ftl,p_local_lpn); 
 				if (mapped_ppa(&ppa)) {		
 					uint32_t originlun = conv_ftl->lunpointer;
-					conv_ftl->lunpointer = get_glun(conv_ftl, &ppa); 
-					//advance lun for append
-					conv_ftl->lunpointer++;
-					if (conv_ftl->lunpointer == (conv_ftl->ssd->sp.nchs * conv_ftl->ssd->sp.luns_per_ch))
-						conv_ftl->lunpointer = 0;
-					//					
+					uint32_t hinted_die = get_glun(conv_ftl, &ppa);
+					uint32_t total_die = conv_ftl->ssd->sp.nchs *
+							      conv_ftl->ssd->sp.luns_per_ch;
+
+					if (total_die) {
+						hinted_die = (hinted_die + 1) % total_die;
+						conv_ftl->lunpointer = hinted_die;
+						conv_ftl->die_aff_append_requests++;
+						aff_append_req = true;
+						aff_target_valid = true;
+						aff_target_die = hinted_die;
+					}
+					(void)originlun;
 					//NVMEV_ERROR("target lun: %d -> %d\n", originlun, conv_ftl->lunpointer);
 				}
 			}
@@ -4834,7 +5196,14 @@ retry_wb_alloc:
 				ppa = get_maptbl_ent(conv_ftl,local_lpn); 
 				if (mapped_ppa(&ppa)) {
 					uint32_t originlun = conv_ftl->lunpointer;
-					conv_ftl->lunpointer = get_glun(conv_ftl, &ppa); 
+					uint32_t hinted_die = get_glun(conv_ftl, &ppa);
+
+					conv_ftl->lunpointer = hinted_die;
+					conv_ftl->die_aff_overwrite_requests++;
+					aff_overwrite_req = true;
+					aff_target_valid = true;
+					aff_target_die = hinted_die;
+					(void)originlun;
 					//NVMEV_ERROR("target lun: %d -> %d\n", originlun, conv_ftl->lunpointer);
 				}
 			}
@@ -4868,6 +5237,15 @@ retry_wb_alloc:
             ret->nsecs_target = nsecs_latest;
             goto slc_fail_release;
         }
+
+		if (aff_target_valid) {
+			uint32_t actual_die = encode_die(spp, &ppa);
+
+			if (aff_append_req && actual_die == aff_target_die)
+				conv_ftl->die_aff_append_effective++;
+			if (aff_overwrite_req && actual_die == aff_target_die)
+				conv_ftl->die_aff_overwrite_effective++;
+		}
 
         /* 记录页面在 SLC 中 */
         conv_ftl->page_in_slc[local_lpn] = true;
@@ -4999,7 +5377,8 @@ retry_wb_alloc:
 		NVMEV_INFO("Write Stats: SLC writes=%llu, QLC writes=%llu, Migrations=%llu\n",
 			   conv_ftl->slc_write_cnt, conv_ftl->qlc_write_cnt, conv_ftl->migration_cnt);
 	}
-	
+
+	test_phase_note_overwrite_end(stats_ftl, test_phase_overwrite_tracked);
 	return true;
 
 slc_fail_release:
@@ -5008,6 +5387,7 @@ slc_fail_release:
 				(unsigned int)stripe_bytes);
 		stripe_bytes = 0;
 	}
+	test_phase_note_overwrite_end(stats_ftl, test_phase_overwrite_tracked);
 	return true;
 }
 

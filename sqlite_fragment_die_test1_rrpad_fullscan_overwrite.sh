@@ -1,11 +1,11 @@
 #!/bin/bash -e
 #
-# sqlite_fragment_die_test1_rrpad_fullscan.sh
+# sqlite_fragment_die_test1_rrpad_fullscan_overwrite.sh
 #
-# Die-affinity test 1 (RRPAD + FULL SCAN):
+# Die-affinity test 1 (RRPAD + FULL SCAN + OVERWRITE):
 #   - init uses sqlite_append_die_affinity_rrpad.c
-#   - cold read uses full-scan mode instead of random-concurrent
-#   - original test1 / test1_rrpad scripts remain unchanged
+#   - cold read phase enables test_phase instrumentation
+#   - before each cold table scan, overwrite 10% of rows by default
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +31,7 @@ SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
 SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
 SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-1}
 SQLITE_COLD_FULL_READ_ITERS=${SQLITE_COLD_FULL_READ_ITERS:-1}
+SQLITE_COLD_OVERWRITE_PCT=${SQLITE_COLD_OVERWRITE_PCT:-10}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
 NORMAL_STDDEV=${NORMAL_STDDEV:-400}
 NORMAL_SEED=${NORMAL_SEED:-314159}
@@ -42,13 +43,13 @@ EXP_LAMBDA=${EXP_LAMBDA:-0.0008}
 
 SRC_PATH="sqlite"
 NVMEV_DIR="${SCRIPT_DIR}/../nvmevirt_DA"
-DIE_RESULT_BASE="${RESULT_FOLDER%/}/die_test1_natural_rrpad_fullscan"
+DIE_RESULT_BASE="${RESULT_FOLDER%/}/die_test1_natural_rrpad_fullscan_overwrite"
 
 EXE_NAME="sqlite_append_die_affinity_rrpad"
 SRC_FILE="./$SRC_PATH/sqlite_append_die_affinity_rrpad.c"
 
 if [[ ! -f ./${EXE_NAME} ]] || [[ $FORCE_REBUILD == 1 ]]; then
-    echo "=== Compiling ${EXE_NAME} (32KB rows, rrpad full-scan test) ==="
+    echo "=== Compiling ${EXE_NAME} (32KB rows, rrpad overwrite full-scan test) ==="
     gcc -D_GNU_SOURCE \
         -DTARGET_FOLDER="\"$TARGET_FOLDER\"" \
         -DRESULT_FOLDER="\"$RESULT_FOLDER\"" \
@@ -87,17 +88,18 @@ load_die_module() {
 run_one_test() {
     local variant="$1"
     local threads="$2"
-    local tag="die_natural_rrpad_fullscan_${variant}_t${threads}"
-    local init_txt="${RESULT_FOLDER%/}/sqlite_die_natural_rrpad_fullscan_init_${variant}_t${threads}.txt"
+    local tag="die_natural_rrpad_fullscan_overwrite_${variant}_t${threads}"
+    local init_txt="${RESULT_FOLDER%/}/sqlite_die_natural_rrpad_fullscan_overwrite_init_${variant}_t${threads}.txt"
     local out_dir="${DIE_RESULT_BASE}/${variant}/t${threads}"
 
     mkdir -p "$out_dir"
 
     echo ""
     echo "================================================================"
-    echo "  [TEST1-NATURAL-RRPAD-FULLSCAN] variant=$variant  threads=$threads  tag=$tag"
+    echo "  [TEST1-NATURAL-RRPAD-FULLSCAN-OVERWRITE] variant=$variant  threads=$threads  tag=$tag"
     echo "  row_bytes=32KB  tables=$SQLITE_TABLE_COUNT  rows/tbl=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  phase_pad=ON  cold_mode=FULL_SCAN"
+    echo "  target=$SQLITE_TARGET_BYTES  phase_pad=ON  cold_mode=FULL_SCAN_OVERWRITE"
+    echo "  cold_overwrite_pct=$SQLITE_COLD_OVERWRITE_PCT"
     echo "================================================================"
 
     load_die_module "$variant"
@@ -136,8 +138,9 @@ run_one_test() {
         --lambda "$EXP_LAMBDA" \
         --normal-mean "$NORMAL_MEAN" \
         --normal-stddev "$NORMAL_STDDEV" \
-        --cold-full-read-mode full-scan \
+        --cold-full-read-mode full-scan-overwrite \
         --cold-full-read-iters "$SQLITE_COLD_FULL_READ_ITERS" \
+        --cold-overwrite-pct "$SQLITE_COLD_OVERWRITE_PCT" \
         --test-phase-path "$SQLITE_TEST_PHASE_PATH" \
         --strict-cold-per-select \
         "${extra_args[@]}" \
@@ -190,6 +193,6 @@ done
 
 echo ""
 echo "========================================"
-echo "  [TEST1-RRPAD-FULLSCAN] All tests completed."
+echo "  [TEST1-RRPAD-FULLSCAN-OVERWRITE] All tests completed."
 echo "  Results in: $DIE_RESULT_BASE"
 echo "========================================"

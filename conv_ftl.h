@@ -175,12 +175,30 @@ struct conv_ftl {
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
 	uint64_t migration_cnt;      /* 迁移计数 */
 	uint64_t total_host_writes;  /* 总写入块数 */
+	uint64_t die_aff_append_requests;   /* append hint requested */
+	uint64_t die_aff_append_effective;  /* append hint landed on requested die */
+	uint64_t die_aff_overwrite_requests;  /* overwrite hint requested */
+	uint64_t die_aff_overwrite_effective; /* overwrite hint landed on requested die */
+	bool test_phase_active;                 /* whether cold-test phase is active */
+	atomic64_t test_phase_read_reqs;        /* read requests observed during test phase */
+	atomic64_t test_phase_overwrite_reqs;   /* overwrite requests observed during test phase */
+	atomic64_t test_phase_bg_repromote_ops; /* QLC->SLC repromotions during test phase */
+	atomic64_t test_phase_bg_qlc_rebalance_ops; /* QLC internal migrations during test phase */
+	atomic64_t test_phase_read_bg_conflicts;    /* read overlapped bg migration/repromotion */
+	atomic64_t test_phase_read_overwrite_conflicts; /* read overlapped overwrite */
+	atomic_t test_phase_active_reads;       /* currently active host reads */
+	atomic_t test_phase_active_overwrites;  /* currently active overwrite writes */
+	atomic_t test_phase_active_bg_ops;      /* currently active bg migration ops */
 	atomic64_t slc_resident_page_cnt; /* 当前驻留在 SLC 的页面数 */
 	atomic_t slc_recover_lock;        /* 序列化 SLC 回收 */
 	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
 	struct dentry *debug_access_inject; /* debugfs entry for counter injection */
 	struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
+	struct dentry *debug_page_die;     /* debugfs entry for mapped page die */
+	struct dentry *debug_die_affinity_stats; /* debugfs entry for die-affinity counters */
+	struct dentry *debug_test_phase;   /* debugfs entry for toggling test phase */
+	struct dentry *debug_test_phase_stats; /* debugfs entry for test phase counters */
 	struct dentry *debug_read_repromotion; /* debugfs entry for read repromotion toggle */
 	
 	/* 初始化状态标记 */
