@@ -4,7 +4,7 @@
 #
 # Die-affinity test 1 (RRPAD + FULL SCAN):
 #   - init uses sqlite_append_die_affinity_rrpad.c
-#   - cold read uses full-scan mode instead of random-concurrent
+#   - cold read uses full-scan-concurrent mode by default
 #   - original test1 / test1_rrpad scripts remain unchanged
 #
 
@@ -31,6 +31,7 @@ SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
 SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
 SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-1}
 SQLITE_COLD_FULL_READ_ITERS=${SQLITE_COLD_FULL_READ_ITERS:-1}
+SQLITE_COLD_FULL_READ_MODE=${SQLITE_COLD_FULL_READ_MODE:-full-scan-concurrent}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
 NORMAL_STDDEV=${NORMAL_STDDEV:-400}
 NORMAL_SEED=${NORMAL_SEED:-314159}
@@ -97,7 +98,7 @@ run_one_test() {
     echo "================================================================"
     echo "  [TEST1-NATURAL-RRPAD-FULLSCAN] variant=$variant  threads=$threads  tag=$tag"
     echo "  row_bytes=32KB  tables=$SQLITE_TABLE_COUNT  rows/tbl=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  phase_pad=ON  cold_mode=FULL_SCAN"
+    echo "  target=$SQLITE_TARGET_BYTES  phase_pad=ON  cold_mode=$SQLITE_COLD_FULL_READ_MODE"
     echo "================================================================"
 
     load_die_module "$variant"
@@ -136,8 +137,9 @@ run_one_test() {
         --lambda "$EXP_LAMBDA" \
         --normal-mean "$NORMAL_MEAN" \
         --normal-stddev "$NORMAL_STDDEV" \
-        --cold-full-read-mode full-scan \
+        --cold-full-read-mode "$SQLITE_COLD_FULL_READ_MODE" \
         --cold-full-read-iters "$SQLITE_COLD_FULL_READ_ITERS" \
+        --cold-concurrent-threads "$threads" \
         --test-phase-path "$SQLITE_TEST_PHASE_PATH" \
         --strict-cold-per-select \
         "${extra_args[@]}" \
