@@ -852,6 +852,8 @@ static const struct file_operations page_tier_fops = {
 	.release = single_release,
 };
 
+static inline uint32_t encode_die(struct ssdparams *spp, const struct ppa *ppa);
+
 static int page_die_show(struct seq_file *m, void *v)
 {
 	struct conv_ftl *conv_ftl = m->private;
@@ -2328,12 +2330,14 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->qlc_promote_cursor = 0;
 	conv_ftl->qlc_demote_cursor = 0;
 	conv_ftl->qlc_rebalance_period_writes = 2048;
-	conv_ftl->qlc_rebalance_promote_budget = 8;
+	conv_ftl->qlc_rebalance_promote_budget = 32;
 	conv_ftl->qlc_rebalance_demote_budget = 16;
 	conv_ftl->qlc_fast_drain_active = false;
 	conv_ftl->qlc_fast_count = 0;
 	conv_ftl->qlc_slow_count = 0;
 	conv_ftl->enable_read_repromotion = false;
+	conv_ftl->repromote_period_reads = 100;
+	conv_ftl->repromote_budget_per_run = 32;
 	spin_lock_init(&conv_ftl->qlc_zone_lock);
 
 	/* 后台迁移 workqueue 初始化 */

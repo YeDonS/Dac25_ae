@@ -15,6 +15,13 @@ module_param(gc_nand_timing, int, 0664);
 static atomic_long_t die_read_total[DIE_STAT_MAX];
 static atomic_long_t die_read_conflict[DIE_STAT_MAX];
 static atomic_long_t die_read_wait_ns[DIE_STAT_MAX];
+static atomic64_t bg_nand_busy_time_ns;
+static atomic64_t bg_nand_read_time_ns;
+static atomic64_t bg_nand_write_time_ns;
+static atomic64_t bg_nand_erase_time_ns;
+static atomic64_t bg_nand_read_ops;
+static atomic64_t bg_nand_write_ops;
+static atomic64_t bg_nand_erase_ops;
 
 static int die_stats_reset = 0;
 static int die_stats_set_reset(const char *val, const struct kernel_param *kp) {
@@ -24,6 +31,13 @@ static int die_stats_set_reset(const char *val, const struct kernel_param *kp) {
 		atomic_long_set(&die_read_conflict[i], 0);
 		atomic_long_set(&die_read_wait_ns[i], 0);
 	}
+	atomic64_set(&bg_nand_busy_time_ns, 0);
+	atomic64_set(&bg_nand_read_time_ns, 0);
+	atomic64_set(&bg_nand_write_time_ns, 0);
+	atomic64_set(&bg_nand_erase_time_ns, 0);
+	atomic64_set(&bg_nand_read_ops, 0);
+	atomic64_set(&bg_nand_write_ops, 0);
+	atomic64_set(&bg_nand_erase_ops, 0);
 	return 0;
 }
 static const struct kernel_param_ops die_stats_reset_ops = {
@@ -51,6 +65,25 @@ static const struct kernel_param_ops die_stats_show_ops = {
 	.get = die_stats_get,
 };
 module_param_cb(die_stats, &die_stats_show_ops, &die_stats_buf, 0664);
+
+static char bg_nand_stats_buf[256];
+static int bg_nand_stats_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE,
+			 "busy_ns=%lld read_ns=%lld write_ns=%lld erase_ns=%lld read_ops=%lld write_ops=%lld erase_ops=%lld\n",
+			 atomic64_read(&bg_nand_busy_time_ns),
+			 atomic64_read(&bg_nand_read_time_ns),
+			 atomic64_read(&bg_nand_write_time_ns),
+			 atomic64_read(&bg_nand_erase_time_ns),
+			 atomic64_read(&bg_nand_read_ops),
+			 atomic64_read(&bg_nand_write_ops),
+			 atomic64_read(&bg_nand_erase_ops));
+}
+static const struct kernel_param_ops bg_nand_stats_ops = {
+	.set = die_stats_set_reset,
+	.get = bg_nand_stats_get,
+};
+module_param_cb(bg_nand_stats, &bg_nand_stats_ops, &bg_nand_stats_buf, 0664);
 
 static inline void compute_line_distribution(uint32_t total_lines,
 					     uint32_t *slc_lines,
@@ -846,6 +879,28 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 	default:
 		NVMEV_ERROR("Unsupported NAND command: 0x%x\n", c);
 		return 0;
+	}
+
+	if (ncmd->type == GC_IO && completed_time > cmd_stime) {
+		uint64_t delta = completed_time - cmd_stime;
+
+		atomic64_add(delta, &bg_nand_busy_time_ns);
+		switch (c) {
+		case NAND_READ:
+			atomic64_add(delta, &bg_nand_read_time_ns);
+			atomic64_inc(&bg_nand_read_ops);
+			break;
+		case NAND_WRITE:
+			atomic64_add(delta, &bg_nand_write_time_ns);
+			atomic64_inc(&bg_nand_write_ops);
+			break;
+		case NAND_ERASE:
+			atomic64_add(delta, &bg_nand_erase_time_ns);
+			atomic64_inc(&bg_nand_erase_ops);
+			break;
+		default:
+			break;
+		}
 	}
 
 	return completed_time;

@@ -182,6 +182,7 @@ enum cold_full_read_mode {
 	COLD_FULL_READ_FULL_SCAN,
 	COLD_FULL_READ_FULL_SCAN_CONCURRENT,
 	COLD_FULL_READ_FULL_SCAN_OVERWRITE,
+	COLD_FULL_READ_FULL_SCAN_OVERWRITE_CONCURRENT,
 	COLD_FULL_READ_RANDOM_CONCURRENT,
 };
 
@@ -639,7 +640,7 @@ static void usage(const char *prog)
 		"                 [--init-latency-profile NAME]\n"
 		"                 [--cold-latency-profile NAME]\n"
 		"                 [--latency-profile-settle-ms N]\n"
-		"                 [--cold-full-read-mode per-table|full-scan|full-scan-concurrent|full-scan-overwrite|random-concurrent]\n"
+		"                 [--cold-full-read-mode per-table|full-scan|full-scan-concurrent|full-scan-overwrite|full-scan-overwrite-concurrent|random-concurrent]\n"
 		"                 [--cold-full-read-iters N]\n"
 		"                 [--cold-disable-read-repromotion]\n"
 		"                 [--read-repromotion-ctrl-path PATH]\n"
@@ -688,6 +689,8 @@ static const char *cold_full_read_mode_name(enum cold_full_read_mode mode)
 		return "full-scan-concurrent";
 	case COLD_FULL_READ_FULL_SCAN_OVERWRITE:
 		return "full-scan-overwrite";
+	case COLD_FULL_READ_FULL_SCAN_OVERWRITE_CONCURRENT:
+		return "full-scan-overwrite-concurrent";
 	case COLD_FULL_READ_RANDOM_CONCURRENT:
 		return "random-concurrent";
 	case COLD_FULL_READ_PER_TABLE:
@@ -708,6 +711,9 @@ static enum cold_full_read_mode parse_cold_full_read_mode(const char *value)
 	if (strcasecmp(value, "full-scan-overwrite") == 0 ||
 	    strcasecmp(value, "full_scan_overwrite") == 0)
 		return COLD_FULL_READ_FULL_SCAN_OVERWRITE;
+	if (strcasecmp(value, "full-scan-overwrite-concurrent") == 0 ||
+	    strcasecmp(value, "full_scan_overwrite_concurrent") == 0)
+		return COLD_FULL_READ_FULL_SCAN_OVERWRITE_CONCURRENT;
 	if (strcasecmp(value, "per-table") == 0 || strcasecmp(value, "per_table") == 0)
 		return COLD_FULL_READ_PER_TABLE;
 	if (strcasecmp(value, "random-concurrent") == 0 || strcasecmp(value, "random_concurrent") == 0)
@@ -2034,15 +2040,13 @@ struct concurrent_read_ctx {
 	unsigned int thread_id;
 	const char *db_path;
 	const struct dataset_layout *layout;
-	const unsigned int *read_plan;
-	double *per_table_out;
-	unsigned int tbl_start;
-	unsigned int tbl_end;
+	unsigned int table_id;
+	unsigned int record_id_begin;
+	unsigned int record_id_end;
 	unsigned int reads_per_tbl;
 	unsigned int seed;
 	double elapsed_sec;
 	unsigned long long rows_read;
-	bool full_scan_mode;
 };
 
 static void *random_read_worker(void *arg)
@@ -2064,16 +2068,16 @@ static void *random_read_worker(void *arg)
 
 	start = monotonic_sec();
 
-	for (unsigned int tbl = ctx->tbl_start; tbl < ctx->tbl_end; ++tbl) {
+	{
 		char table_name[MAX_TABLE_NAME];
 		char sql[256];
 		sqlite3_stmt *stmt = NULL;
-		unsigned int max_row = ctx->layout->rows_per_table[tbl];
+		unsigned int max_row = ctx->layout->rows_per_table[ctx->table_id];
 
 		if (max_row == 0)
-			continue;
+			goto out_close;
 
-		build_table_name(table_name, sizeof(table_name), tbl);
+		build_table_name(table_name, sizeof(table_name), ctx->table_id);
 		snprintf(sql, sizeof(sql),
 			 "SELECT str1,str2,str3,str4 FROM %s WHERE id = ?;",
 			 table_name);
@@ -2081,7 +2085,7 @@ static void *random_read_worker(void *arg)
 		if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
 			fprintf(stderr, "[thread %u] prepare failed for %s: %s\n",
 				ctx->thread_id, table_name, sqlite3_errmsg(db));
-			continue;
+			goto out_close;
 		}
 
 		for (unsigned int r = 0; r < ctx->reads_per_tbl; ++r) {
@@ -2096,6 +2100,7 @@ static void *random_read_worker(void *arg)
 		sqlite3_finalize(stmt);
 	}
 
+out_close:
 	end = monotonic_sec();
 	ctx->elapsed_sec = end - start;
 	ctx->rows_read = total_rows;
@@ -2122,31 +2127,29 @@ static void *full_scan_read_worker(void *arg)
 
 	start = monotonic_sec();
 
-	for (unsigned int tbl = ctx->tbl_start; tbl < ctx->tbl_end; ++tbl) {
+	{
 		char table_name[MAX_TABLE_NAME];
 		char sql[256];
 		sqlite3_stmt *stmt = NULL;
-		unsigned int reads = ctx->read_plan ? ctx->read_plan[tbl] : 1U;
-		double tbl_start, tbl_end;
 
-		if (reads == 0)
-			continue;
-
-		build_table_name(table_name, sizeof(table_name), tbl);
+		build_table_name(table_name, sizeof(table_name), ctx->table_id);
 		snprintf(sql, sizeof(sql),
-			 "SELECT str1,str2,str3,str4 FROM %s ORDER BY id;", table_name);
+			 "SELECT str1,str2,str3,str4 FROM %s WHERE id >= ? AND id < ? ORDER BY id;",
+			 table_name);
 
 		if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
 			fprintf(stderr, "[thread %u] prepare failed for %s: %s\n",
 				ctx->thread_id, table_name, sqlite3_errmsg(db));
-			continue;
+			goto out_close;
 		}
 
-		tbl_start = monotonic_sec();
-		for (unsigned int r = 0; r < reads; ++r) {
+		for (unsigned int r = 0; r < ctx->reads_per_tbl; ++r) {
 			int rc;
 
 			sqlite3_reset(stmt);
+			sqlite3_clear_bindings(stmt);
+			sqlite3_bind_int(stmt, 1, (int)ctx->record_id_begin);
+			sqlite3_bind_int(stmt, 2, (int)ctx->record_id_end);
 			while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
 				total_rows++;
 			if (rc != SQLITE_DONE) {
@@ -2155,14 +2158,11 @@ static void *full_scan_read_worker(void *arg)
 				break;
 			}
 		}
-		tbl_end = monotonic_sec();
-
-		if (ctx->per_table_out)
-			ctx->per_table_out[tbl] += tbl_end - tbl_start;
 
 		sqlite3_finalize(stmt);
 	}
 
+out_close:
 	end = monotonic_sec();
 	ctx->elapsed_sec = end - start;
 	ctx->rows_read = total_rows;
@@ -2199,35 +2199,25 @@ static double run_cold_random_concurrent_read(const char *db_path,
 
 	drop_page_cache();
 
-	unsigned int tbl_count = layout->table_count;
-	unsigned int base_per_thread = tbl_count / threads;
-	unsigned int remainder = tbl_count % threads;
-	unsigned int tbl_off = 0;
-
 	wall_start = monotonic_sec();
 
-	for (unsigned int i = 0; i < threads; ++i) {
-		unsigned int n = base_per_thread + (i < remainder ? 1 : 0);
-		ctxs[i].thread_id = i;
-		ctxs[i].db_path = db_path;
-		ctxs[i].layout = layout;
-		ctxs[i].tbl_start = tbl_off;
-		ctxs[i].tbl_end = tbl_off + n;
-		ctxs[i].reads_per_tbl = reads_per_tbl;
-		ctxs[i].seed = base_seed + i * 1000;
-		ctxs[i].elapsed_sec = 0.0;
-		ctxs[i].rows_read = 0;
-		printf("[sqlite_cold_random] thread=%u tables=[%u,%u)\n",
-		       i, ctxs[i].tbl_start, ctxs[i].tbl_end);
-		tbl_off += n;
-		pthread_create(&tids[i], NULL, random_read_worker, &ctxs[i]);
-	}
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		for (unsigned int i = 0; i < threads; ++i) {
+			ctxs[i].thread_id = i;
+			ctxs[i].db_path = db_path;
+			ctxs[i].layout = layout;
+			ctxs[i].table_id = tbl;
+			ctxs[i].reads_per_tbl = reads_per_tbl;
+			ctxs[i].seed = base_seed + tbl * 10007U + i * 1000U;
+			ctxs[i].elapsed_sec = 0.0;
+			ctxs[i].rows_read = 0;
+			pthread_create(&tids[i], NULL, random_read_worker, &ctxs[i]);
+		}
 
-	for (unsigned int i = 0; i < threads; ++i) {
-		pthread_join(tids[i], NULL);
-		total_rows += ctxs[i].rows_read;
-		printf("[sqlite_cold_random] thread=%u time=%.6fs rows=%llu\n",
-		       i, ctxs[i].elapsed_sec, ctxs[i].rows_read);
+		for (unsigned int i = 0; i < threads; ++i) {
+			pthread_join(tids[i], NULL);
+			total_rows += ctxs[i].rows_read;
+		}
 	}
 
 	wall_end = monotonic_sec();
@@ -2274,38 +2264,172 @@ static double run_cold_full_scan_concurrent_read(const char *db_path,
 
 	drop_page_cache();
 
-	unsigned int tbl_count = layout->table_count;
-	unsigned int base_per_thread = tbl_count / threads;
-	unsigned int remainder = tbl_count % threads;
-	unsigned int tbl_off = 0;
-
 	wall_start = monotonic_sec();
 
-	for (unsigned int i = 0; i < threads; ++i) {
-		unsigned int n = base_per_thread + (i < remainder ? 1 : 0);
-		ctxs[i].thread_id = i;
-		ctxs[i].db_path = db_path;
-		ctxs[i].layout = layout;
-		ctxs[i].read_plan = read_plan;
-		ctxs[i].per_table_out = per_table_out;
-		ctxs[i].tbl_start = tbl_off;
-		ctxs[i].tbl_end = tbl_off + n;
-		ctxs[i].reads_per_tbl = 0;
-		ctxs[i].seed = 0;
-		ctxs[i].elapsed_sec = 0.0;
-		ctxs[i].rows_read = 0;
-		ctxs[i].full_scan_mode = true;
-		printf("[sqlite_cold_full_scan] thread=%u tables=[%u,%u)\n",
-		       i, ctxs[i].tbl_start, ctxs[i].tbl_end);
-		tbl_off += n;
-		pthread_create(&tids[i], NULL, full_scan_read_worker, &ctxs[i]);
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned int row_count = layout->rows_per_table[tbl];
+		unsigned int reads = read_plan ? read_plan[tbl] : 1U;
+		unsigned int base_rows;
+		unsigned int remainder;
+		unsigned int row_off = 0;
+		double tbl_start, tbl_end;
+
+		if (reads == 0 || row_count == 0) {
+			if (per_table_out)
+				per_table_out[tbl] = 0.0;
+			continue;
+		}
+
+		base_rows = row_count / threads;
+		remainder = row_count % threads;
+		tbl_start = monotonic_sec();
+
+		for (unsigned int i = 0; i < threads; ++i) {
+			unsigned int n = base_rows + (i < remainder ? 1U : 0U);
+
+			ctxs[i].thread_id = i;
+			ctxs[i].db_path = db_path;
+			ctxs[i].layout = layout;
+			ctxs[i].table_id = tbl;
+			ctxs[i].record_id_begin = row_off;
+			ctxs[i].record_id_end = row_off + n;
+			ctxs[i].reads_per_tbl = reads;
+			ctxs[i].seed = 0;
+			ctxs[i].elapsed_sec = 0.0;
+			ctxs[i].rows_read = 0;
+			printf("[sqlite_cold_full_scan] table=%u thread=%u ids=[%u,%u)\n",
+			       tbl, i, ctxs[i].record_id_begin, ctxs[i].record_id_end);
+			row_off += n;
+			pthread_create(&tids[i], NULL, full_scan_read_worker, &ctxs[i]);
+		}
+
+		for (unsigned int i = 0; i < threads; ++i) {
+			pthread_join(tids[i], NULL);
+			total_rows += ctxs[i].rows_read;
+		}
+
+		tbl_end = monotonic_sec();
+		if (per_table_out)
+			per_table_out[tbl] += tbl_end - tbl_start;
+
+		for (unsigned int i = 0; i < threads; ++i) {
+			printf("[sqlite_cold_full_scan] table=%u thread=%u time=%.6fs rows=%llu\n",
+			       tbl, i, ctxs[i].elapsed_sec, ctxs[i].rows_read);
+		}
 	}
 
-	for (unsigned int i = 0; i < threads; ++i) {
-		pthread_join(tids[i], NULL);
-		total_rows += ctxs[i].rows_read;
-		printf("[sqlite_cold_full_scan] thread=%u time=%.6fs rows=%llu\n",
-		       i, ctxs[i].elapsed_sec, ctxs[i].rows_read);
+	wall_end = monotonic_sec();
+
+	double wall_elapsed = wall_end - wall_start;
+	double data_mb = (double)total_rows * ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+
+	printf("[sqlite_cold_full_scan] threads=%u total_rows=%llu wall_time=%.6fs throughput=%.2fMB/s\n",
+	       threads, total_rows, wall_elapsed,
+	       wall_elapsed > 0 ? data_mb / wall_elapsed : 0.0);
+
+	if (total_rows_out)
+		*total_rows_out = total_rows;
+
+	free(tids);
+	free(ctxs);
+	return wall_elapsed;
+}
+
+static double run_cold_full_scan_overwrite_concurrent_read(sqlite3 *db,
+							   const char *db_path,
+							   const struct dataset_layout *layout,
+							   unsigned int threads,
+							   const unsigned int *read_plan,
+							   unsigned int cold_overwrite_pct,
+							   double *per_table_out,
+							   unsigned long long *total_rows_out)
+{
+	pthread_t *tids;
+	struct concurrent_read_ctx *ctxs;
+	double wall_start, wall_end;
+	unsigned long long total_rows = 0;
+	unsigned int overwrite_seed;
+
+	if (!db || !layout)
+		return 0.0;
+	if (!threads)
+		threads = 1;
+
+	tids = calloc(threads, sizeof(pthread_t));
+	ctxs = calloc(threads, sizeof(struct concurrent_read_ctx));
+	if (!tids || !ctxs) {
+		fprintf(stderr, "alloc failed for concurrent overwrite full-scan contexts\n");
+		free(tids);
+		free(ctxs);
+		return 0.0;
+	}
+
+	overwrite_seed = (unsigned int)time(NULL) ^ 0x1d4f8a77U;
+	wall_start = monotonic_sec();
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned int row_count = layout->rows_per_table[tbl];
+		unsigned int reads = read_plan ? read_plan[tbl] : 1U;
+		unsigned int base_rows;
+		unsigned int remainder;
+		unsigned int row_off = 0;
+		unsigned int overwritten_rows = 0;
+		double tbl_start, tbl_end;
+		int rc;
+
+		if (reads == 0 || row_count == 0) {
+			if (per_table_out)
+				per_table_out[tbl] = 0.0;
+			continue;
+		}
+
+		rc = overwrite_table_rows(db, layout, tbl, cold_overwrite_pct,
+					  &overwrite_seed, &overwritten_rows);
+		if (rc != 0) {
+			fprintf(stderr, "[sqlite_cold_overwrite] concurrent overwrite failed for table=%u\n",
+				tbl);
+			continue;
+		}
+		printf("[sqlite_cold_overwrite] table=%u rows=%u pct=%u\n",
+		       tbl, overwritten_rows, cold_overwrite_pct);
+
+		drop_page_cache();
+		base_rows = row_count / threads;
+		remainder = row_count % threads;
+		tbl_start = monotonic_sec();
+
+		for (unsigned int i = 0; i < threads; ++i) {
+			unsigned int n = base_rows + (i < remainder ? 1U : 0U);
+
+			ctxs[i].thread_id = i;
+			ctxs[i].db_path = db_path;
+			ctxs[i].layout = layout;
+			ctxs[i].table_id = tbl;
+			ctxs[i].record_id_begin = row_off;
+			ctxs[i].record_id_end = row_off + n;
+			ctxs[i].reads_per_tbl = reads;
+			ctxs[i].seed = 0;
+			ctxs[i].elapsed_sec = 0.0;
+			ctxs[i].rows_read = 0;
+			printf("[sqlite_cold_full_scan] table=%u thread=%u ids=[%u,%u)\n",
+			       tbl, i, ctxs[i].record_id_begin, ctxs[i].record_id_end);
+			row_off += n;
+			pthread_create(&tids[i], NULL, full_scan_read_worker, &ctxs[i]);
+		}
+
+		for (unsigned int i = 0; i < threads; ++i) {
+			pthread_join(tids[i], NULL);
+			total_rows += ctxs[i].rows_read;
+		}
+
+		tbl_end = monotonic_sec();
+		if (per_table_out)
+			per_table_out[tbl] += tbl_end - tbl_start;
+
+		for (unsigned int i = 0; i < threads; ++i) {
+			printf("[sqlite_cold_full_scan] table=%u thread=%u time=%.6fs rows=%llu\n",
+			       tbl, i, ctxs[i].elapsed_sec, ctxs[i].rows_read);
+		}
 	}
 
 	wall_end = monotonic_sec();
@@ -3910,6 +4034,14 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 			read_plan,
 			cold_per_table,
 			&concurrent_rows_read);
+	} else if (opts->cold_full_read_mode == COLD_FULL_READ_FULL_SCAN_OVERWRITE_CONCURRENT) {
+		cold_read_time = run_cold_full_scan_overwrite_concurrent_read(
+			db, db_path, layout,
+			opts->cold_concurrent_threads,
+			read_plan,
+			opts->cold_overwrite_pct,
+			cold_per_table,
+			&concurrent_rows_read);
 	} else {
 		cold_read_time = run_cold_full_read(db, layout, opts->cold_full_read_mode,
 						    cold_read_iters, read_plan,
@@ -3994,6 +4126,7 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 
 	double cold_bytes_mb = 0.0;
 	if (opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CONCURRENT ||
+	    opts->cold_full_read_mode == COLD_FULL_READ_FULL_SCAN_OVERWRITE_CONCURRENT ||
 	    opts->cold_full_read_mode == COLD_FULL_READ_FULL_SCAN_CONCURRENT) {
 		cold_bytes_mb = (double)concurrent_rows_read *
 				ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
@@ -4961,7 +5094,8 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		opts->trace_path = opts->trace_path_buf;
 	}
 
-	if (opts->cold_full_read_mode == COLD_FULL_READ_FULL_SCAN_OVERWRITE &&
+	if ((opts->cold_full_read_mode == COLD_FULL_READ_FULL_SCAN_OVERWRITE ||
+	     opts->cold_full_read_mode == COLD_FULL_READ_FULL_SCAN_OVERWRITE_CONCURRENT) &&
 	    opts->cold_overwrite_pct == 0)
 		opts->cold_overwrite_pct = 10;
 }

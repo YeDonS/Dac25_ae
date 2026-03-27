@@ -6,6 +6,7 @@
 #   - init uses sqlite_append_die_affinity_rrpad.c
 #   - cold read phase enables test_phase instrumentation
 #   - before each cold table scan, overwrite 10% of rows by default
+#   - all threads then scan the same table together before moving on
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +32,7 @@ SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
 SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
 SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-1}
 SQLITE_COLD_FULL_READ_ITERS=${SQLITE_COLD_FULL_READ_ITERS:-1}
+SQLITE_COLD_FULL_READ_MODE=${SQLITE_COLD_FULL_READ_MODE:-full-scan-overwrite-concurrent}
 SQLITE_COLD_OVERWRITE_PCT=${SQLITE_COLD_OVERWRITE_PCT:-10}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
 NORMAL_STDDEV=${NORMAL_STDDEV:-400}
@@ -98,7 +100,7 @@ run_one_test() {
     echo "================================================================"
     echo "  [TEST1-NATURAL-RRPAD-FULLSCAN-OVERWRITE] variant=$variant  threads=$threads  tag=$tag"
     echo "  row_bytes=32KB  tables=$SQLITE_TABLE_COUNT  rows/tbl=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  phase_pad=ON  cold_mode=FULL_SCAN_OVERWRITE"
+    echo "  target=$SQLITE_TARGET_BYTES  phase_pad=ON  cold_mode=$SQLITE_COLD_FULL_READ_MODE"
     echo "  cold_overwrite_pct=$SQLITE_COLD_OVERWRITE_PCT"
     echo "================================================================"
 
@@ -138,8 +140,9 @@ run_one_test() {
         --lambda "$EXP_LAMBDA" \
         --normal-mean "$NORMAL_MEAN" \
         --normal-stddev "$NORMAL_STDDEV" \
-        --cold-full-read-mode full-scan-overwrite \
+        --cold-full-read-mode "$SQLITE_COLD_FULL_READ_MODE" \
         --cold-full-read-iters "$SQLITE_COLD_FULL_READ_ITERS" \
+        --cold-concurrent-threads "$threads" \
         --cold-overwrite-pct "$SQLITE_COLD_OVERWRITE_PCT" \
         --test-phase-path "$SQLITE_TEST_PHASE_PATH" \
         --strict-cold-per-select \

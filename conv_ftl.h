@@ -161,6 +161,8 @@ struct conv_ftl {
 	struct work_struct repromotion_work;
 	struct work_struct qlc_rebalance_work;
 	atomic64_t total_host_reads;
+	uint32_t repromote_period_reads;       /* 每多少次主机读触发一次回迁 worker */
+	uint32_t repromote_budget_per_run;     /* 每轮回迁最多处理多少页 */
 
 	/* 异步回迁请求环形队列 */
 	spinlock_t repromote_queue_lock;

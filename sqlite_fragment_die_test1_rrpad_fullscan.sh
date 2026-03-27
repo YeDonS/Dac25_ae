@@ -4,7 +4,8 @@
 #
 # Die-affinity test 1 (RRPAD + FULL SCAN):
 #   - init uses sqlite_append_die_affinity_rrpad.c
-#   - cold read uses full-scan-concurrent mode by default
+#   - cold read uses per-table full-scan-concurrent mode by default
+#     (all threads scan the same table, then move to the next table)
 #   - original test1 / test1_rrpad scripts remain unchanged
 #
 
