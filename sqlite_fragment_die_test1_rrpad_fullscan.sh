@@ -26,6 +26,7 @@ SQLITE_INTERLEAVE_READS=${SQLITE_INTERLEAVE_READS:-8000}
 SQLITE_PAGE_TIER_PATH=${SQLITE_PAGE_TIER_PATH:-/sys/kernel/debug/nvmev/ftl0/page_tier}
 SQLITE_ACCESS_COUNT_PATH=${SQLITE_ACCESS_COUNT_PATH:-/sys/kernel/debug/nvmev/ftl0/access_count}
 SQLITE_DIE_AFFINITY_STATS_PATH=${SQLITE_DIE_AFFINITY_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/die_affinity_stats}
+SQLITE_LPN_DIE_CHANGE_STATS_PATH=${SQLITE_LPN_DIE_CHANGE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/lpn_die_change_stats}
 SQLITE_TEST_PHASE_PATH=${SQLITE_TEST_PHASE_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase}
 SQLITE_TEST_PHASE_STATS_PATH=${SQLITE_TEST_PHASE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase_stats}
 SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
@@ -160,6 +161,15 @@ run_one_test() {
         cp "$SQLITE_DIE_AFFINITY_STATS_PATH" \
            "${RESULT_FOLDER%/}/sqlite_die_affinity_stats_${tag}.txt" 2>/dev/null || true
         cp "${RESULT_FOLDER%/}/sqlite_die_affinity_stats_${tag}.txt" "${out_dir}/" 2>/dev/null || true
+    fi
+    if [[ -r "$SQLITE_LPN_DIE_CHANGE_STATS_PATH" ]]; then
+        {
+            echo "[lpn_die_change_stats]"
+            cat "$SQLITE_LPN_DIE_CHANGE_STATS_PATH"
+        } >>"$init_txt" 2>/dev/null || true
+        cp "$SQLITE_LPN_DIE_CHANGE_STATS_PATH" \
+           "${RESULT_FOLDER%/}/sqlite_lpn_die_change_stats_${tag}.txt" 2>/dev/null || true
+        cp "${RESULT_FOLDER%/}/sqlite_lpn_die_change_stats_${tag}.txt" "${out_dir}/" 2>/dev/null || true
     fi
     if [[ -r "$SQLITE_TEST_PHASE_STATS_PATH" ]]; then
         {

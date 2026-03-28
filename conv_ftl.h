@@ -15,6 +15,16 @@ struct dentry;
 
 #define QLC_ZONE_COUNT 4
 
+enum nvmev_die_change_reason {
+	NVMEV_DIE_CHANGE_NONE = 0,
+	NVMEV_DIE_CHANGE_HOST_APPEND,
+	NVMEV_DIE_CHANGE_HOST_OVERWRITE,
+	NVMEV_DIE_CHANGE_GC,
+	NVMEV_DIE_CHANGE_SLC_TO_QLC,
+	NVMEV_DIE_CHANGE_REPROMOTE,
+	NVMEV_DIE_CHANGE_QLC_REBALANCE,
+};
+
 struct convparams {
 	uint32_t gc_thres_lines;
 	uint32_t gc_thres_lines_high;
@@ -181,6 +191,17 @@ struct conv_ftl {
 	uint64_t die_aff_append_effective;  /* append hint landed on requested die */
 	uint64_t die_aff_overwrite_requests;  /* overwrite hint requested */
 	uint64_t die_aff_overwrite_effective; /* overwrite hint landed on requested die */
+	uint16_t *lpn_initial_die;          /* first die ever assigned to this LPN */
+	uint8_t *lpn_die_changed;           /* current mapping differs from initial die */
+	uint8_t *lpn_die_change_reason;     /* reason for the current changed state */
+	uint64_t lpn_initial_die_tracked;   /* LPNs that have ever been assigned an initial die */
+	uint64_t lpn_current_die_changed;   /* currently mapped LPNs whose die != initial die */
+	uint64_t lpn_changed_host_append;
+	uint64_t lpn_changed_host_overwrite;
+	uint64_t lpn_changed_gc;
+	uint64_t lpn_changed_slc_to_qlc;
+	uint64_t lpn_changed_repromote;
+	uint64_t lpn_changed_qlc_rebalance;
 	bool test_phase_active;                 /* whether cold-test phase is active */
 	atomic64_t test_phase_read_reqs;        /* read requests observed during test phase */
 	atomic64_t test_phase_overwrite_reqs;   /* overwrite requests observed during test phase */
@@ -199,6 +220,7 @@ struct conv_ftl {
 	struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
 	struct dentry *debug_page_die;     /* debugfs entry for mapped page die */
 	struct dentry *debug_die_affinity_stats; /* debugfs entry for die-affinity counters */
+	struct dentry *debug_lpn_die_change_stats; /* debugfs entry for current die-change counts */
 	struct dentry *debug_test_phase;   /* debugfs entry for toggling test phase */
 	struct dentry *debug_test_phase_stats; /* debugfs entry for test phase counters */
 	struct dentry *debug_read_repromotion; /* debugfs entry for read repromotion toggle */

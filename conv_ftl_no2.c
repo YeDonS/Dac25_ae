@@ -586,8 +586,70 @@ static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lp
 	return entry;
 }
 
-static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
+static inline void die_change_reason_inc(struct conv_ftl *conv_ftl, uint8_t reason)
 {
+	switch (reason) {
+	case NVMEV_DIE_CHANGE_HOST_APPEND:
+		conv_ftl->lpn_changed_host_append++;
+		break;
+	case NVMEV_DIE_CHANGE_HOST_OVERWRITE:
+		conv_ftl->lpn_changed_host_overwrite++;
+		break;
+	case NVMEV_DIE_CHANGE_GC:
+		conv_ftl->lpn_changed_gc++;
+		break;
+	case NVMEV_DIE_CHANGE_SLC_TO_QLC:
+		conv_ftl->lpn_changed_slc_to_qlc++;
+		break;
+	case NVMEV_DIE_CHANGE_REPROMOTE:
+		conv_ftl->lpn_changed_repromote++;
+		break;
+	case NVMEV_DIE_CHANGE_QLC_REBALANCE:
+		conv_ftl->lpn_changed_qlc_rebalance++;
+		break;
+	default:
+		break;
+	}
+}
+
+static inline void die_change_reason_dec(struct conv_ftl *conv_ftl, uint8_t reason)
+{
+	switch (reason) {
+	case NVMEV_DIE_CHANGE_HOST_APPEND:
+		conv_ftl->lpn_changed_host_append--;
+		break;
+	case NVMEV_DIE_CHANGE_HOST_OVERWRITE:
+		conv_ftl->lpn_changed_host_overwrite--;
+		break;
+	case NVMEV_DIE_CHANGE_GC:
+		conv_ftl->lpn_changed_gc--;
+		break;
+	case NVMEV_DIE_CHANGE_SLC_TO_QLC:
+		conv_ftl->lpn_changed_slc_to_qlc--;
+		break;
+	case NVMEV_DIE_CHANGE_REPROMOTE:
+		conv_ftl->lpn_changed_repromote--;
+		break;
+	case NVMEV_DIE_CHANGE_QLC_REBALANCE:
+		conv_ftl->lpn_changed_qlc_rebalance--;
+		break;
+	default:
+		break;
+	}
+}
+
+static inline void set_maptbl_ent_reason(struct conv_ftl *conv_ftl, uint64_t lpn,
+					 struct ppa *ppa, uint8_t reason)
+{
+	uint32_t new_die = 0;
+	uint32_t old_die = 0;
+	bool new_mapped;
+	bool old_mapped;
+	bool new_changed = false;
+	bool old_changed = false;
+	uint8_t old_reason = NVMEV_DIE_CHANGE_NONE;
+	uint8_t new_reason = NVMEV_DIE_CHANGE_NONE;
+
 	if (unlikely(!conv_ftl || !conv_ftl->maptbl || !conv_ftl->ssd)) {
 		if (printk_ratelimit()) {
 			NVMEV_ERROR("set_maptbl_ent: bad state conv_ftl=%p maptbl=%p ssd=%p lpn=%llu\n",
@@ -600,8 +662,51 @@ static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struc
 	}
 	NVMEV_ASSERT(lpn < conv_ftl->ssd->sp.tt_pgs);
 	write_seqlock(&conv_ftl->maptbl_lock);
+	old_mapped = mapped_ppa(&conv_ftl->maptbl[lpn]) && valid_ppa(conv_ftl, &conv_ftl->maptbl[lpn]);
+	if (old_mapped)
+		old_die = conv_ftl->maptbl[lpn].g.lun * conv_ftl->ssd->sp.nchs +
+			  conv_ftl->maptbl[lpn].g.ch;
+	new_mapped = mapped_ppa(ppa) && valid_ppa(conv_ftl, ppa);
+	if (conv_ftl->lpn_die_changed)
+		old_changed = conv_ftl->lpn_die_changed[lpn] != 0;
+	if (conv_ftl->lpn_die_change_reason)
+		old_reason = conv_ftl->lpn_die_change_reason[lpn];
+
+	if (new_mapped && conv_ftl->lpn_initial_die) {
+		new_die = ppa->g.lun * conv_ftl->ssd->sp.nchs + ppa->g.ch;
+		if (conv_ftl->lpn_initial_die[lpn] == U16_MAX) {
+			conv_ftl->lpn_initial_die[lpn] = (uint16_t)new_die;
+			conv_ftl->lpn_initial_die_tracked++;
+		}
+		new_changed = ((uint16_t)new_die != conv_ftl->lpn_initial_die[lpn]);
+	}
+
+	if (conv_ftl->lpn_die_changed) {
+		if (old_changed && !new_changed) {
+			conv_ftl->lpn_current_die_changed--;
+			die_change_reason_dec(conv_ftl, old_reason);
+		} else if (!old_changed && new_changed) {
+			conv_ftl->lpn_current_die_changed++;
+			die_change_reason_inc(conv_ftl, reason);
+		} else if (old_changed && new_changed && old_reason != reason &&
+			   (!old_mapped || old_die != new_die)) {
+			die_change_reason_dec(conv_ftl, old_reason);
+			die_change_reason_inc(conv_ftl, reason);
+		}
+		conv_ftl->lpn_die_changed[lpn] = new_changed ? 1 : 0;
+	}
+	if (conv_ftl->lpn_die_change_reason) {
+		if (new_changed)
+			new_reason = reason;
+		conv_ftl->lpn_die_change_reason[lpn] = new_reason;
+	}
 	conv_ftl->maptbl[lpn] = *ppa;
 	write_sequnlock(&conv_ftl->maptbl_lock);
+}
+
+static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
+{
+	set_maptbl_ent_reason(conv_ftl, lpn, ppa, NVMEV_DIE_CHANGE_NONE);
 }
 
 static inline void clear_lpn_mapping(struct conv_ftl *conv_ftl, uint64_t lpn)
@@ -892,6 +997,47 @@ static int page_die_open(struct inode *inode, struct file *file)
 static const struct file_operations page_die_fops = {
 	.owner = THIS_MODULE,
 	.open = page_die_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static int lpn_die_change_stats_show(struct seq_file *m, void *v)
+{
+	struct conv_ftl *conv_ftl = m->private;
+
+	(void)v;
+
+	if (!conv_ftl)
+		return 0;
+
+	seq_printf(m, "tracked_lpns %llu\n",
+		   (unsigned long long)conv_ftl->lpn_initial_die_tracked);
+	seq_printf(m, "current_changed_lpns %llu\n",
+		   (unsigned long long)conv_ftl->lpn_current_die_changed);
+	seq_printf(m, "host_append_die_changed %llu\n",
+		   (unsigned long long)conv_ftl->lpn_changed_host_append);
+	seq_printf(m, "host_overwrite_die_changed %llu\n",
+		   (unsigned long long)conv_ftl->lpn_changed_host_overwrite);
+	seq_printf(m, "gc_die_changed %llu\n",
+		   (unsigned long long)conv_ftl->lpn_changed_gc);
+	seq_printf(m, "slc_to_qlc_die_changed %llu\n",
+		   (unsigned long long)conv_ftl->lpn_changed_slc_to_qlc);
+	seq_printf(m, "repromote_die_changed %llu\n",
+		   (unsigned long long)conv_ftl->lpn_changed_repromote);
+	seq_printf(m, "qlc_rebalance_die_changed %llu\n",
+		   (unsigned long long)conv_ftl->lpn_changed_qlc_rebalance);
+	return 0;
+}
+
+static int lpn_die_change_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, lpn_die_change_stats_show, inode->i_private);
+}
+
+static const struct file_operations lpn_die_change_stats_fops = {
+	.owner = THIS_MODULE,
+	.open = lpn_die_change_stats_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = single_release,
@@ -1738,24 +1884,60 @@ static void init_write_flow_control(struct conv_ftl *conv_ftl)
 static void init_maptbl(struct conv_ftl *conv_ftl)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-    int i;
+	int i;
 
 	conv_ftl->maptbl = vmalloc(sizeof(struct ppa) * spp->tt_pgs);
 	if (!conv_ftl->maptbl) {
 		NVMEV_ERROR("Failed to allocate mapping table memory\n");
-        conv_ftl->maptbl_initialized = false;
+		conv_ftl->maptbl_initialized = false;
+		return;
+	}
+	conv_ftl->lpn_initial_die = vmalloc(sizeof(*conv_ftl->lpn_initial_die) * spp->tt_pgs);
+	conv_ftl->lpn_die_changed = vzalloc(sizeof(*conv_ftl->lpn_die_changed) * spp->tt_pgs);
+	conv_ftl->lpn_die_change_reason = vzalloc(sizeof(*conv_ftl->lpn_die_change_reason) * spp->tt_pgs);
+	if (!conv_ftl->lpn_initial_die || !conv_ftl->lpn_die_changed ||
+	    !conv_ftl->lpn_die_change_reason) {
+		NVMEV_ERROR("Failed to allocate LPN die-change tracking memory\n");
+		vfree(conv_ftl->maptbl);
+		conv_ftl->maptbl = NULL;
+		if (conv_ftl->lpn_initial_die)
+			vfree(conv_ftl->lpn_initial_die);
+		if (conv_ftl->lpn_die_changed)
+			vfree(conv_ftl->lpn_die_changed);
+		if (conv_ftl->lpn_die_change_reason)
+			vfree(conv_ftl->lpn_die_change_reason);
+		conv_ftl->lpn_initial_die = NULL;
+		conv_ftl->lpn_die_changed = NULL;
+		conv_ftl->lpn_die_change_reason = NULL;
+		conv_ftl->maptbl_initialized = false;
 		return;
 	}
 
-    for (i = 0; i < spp->tt_pgs; i++) {
+	for (i = 0; i < spp->tt_pgs; i++) {
 		conv_ftl->maptbl[i].ppa = UNMAPPED_PPA;
+		conv_ftl->lpn_initial_die[i] = U16_MAX;
 	}
-    conv_ftl->maptbl_initialized = true;
+	conv_ftl->lpn_initial_die_tracked = 0;
+	conv_ftl->lpn_current_die_changed = 0;
+	conv_ftl->lpn_changed_host_append = 0;
+	conv_ftl->lpn_changed_host_overwrite = 0;
+	conv_ftl->lpn_changed_gc = 0;
+	conv_ftl->lpn_changed_slc_to_qlc = 0;
+	conv_ftl->lpn_changed_repromote = 0;
+	conv_ftl->lpn_changed_qlc_rebalance = 0;
+	conv_ftl->maptbl_initialized = true;
 }
 
 static void remove_maptbl(struct conv_ftl *conv_ftl)
 {
 	vfree(conv_ftl->maptbl);
+	vfree(conv_ftl->lpn_initial_die);
+	vfree(conv_ftl->lpn_die_changed);
+	vfree(conv_ftl->lpn_die_change_reason);
+	conv_ftl->maptbl = NULL;
+	conv_ftl->lpn_initial_die = NULL;
+	conv_ftl->lpn_die_changed = NULL;
+	conv_ftl->lpn_die_change_reason = NULL;
 }
 
 static void init_rmap(struct conv_ftl *conv_ftl)
@@ -2224,6 +2406,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->debug_page_tier = NULL;
 	conv_ftl->debug_page_die = NULL;
 	conv_ftl->debug_die_affinity_stats = NULL;
+	conv_ftl->debug_lpn_die_change_stats = NULL;
 	conv_ftl->debug_test_phase = NULL;
 	conv_ftl->debug_test_phase_stats = NULL;
 
@@ -2404,6 +2587,9 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		conv_ftl->debug_die_affinity_stats =
 			debugfs_create_file("die_affinity_stats", 0440, parent,
 					    conv_ftl, &die_affinity_stats_fops);
+		conv_ftl->debug_lpn_die_change_stats =
+			debugfs_create_file("lpn_die_change_stats", 0440, parent,
+					    conv_ftl, &lpn_die_change_stats_fops);
 		conv_ftl->debug_test_phase =
 			debugfs_create_file("test_phase", 0640, parent,
 					    conv_ftl, &test_phase_fops);
@@ -2432,6 +2618,7 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		conv_ftl->debug_page_tier = NULL;
 		conv_ftl->debug_page_die = NULL;
 		conv_ftl->debug_die_affinity_stats = NULL;
+		conv_ftl->debug_lpn_die_change_stats = NULL;
 		conv_ftl->debug_test_phase = NULL;
 		conv_ftl->debug_test_phase_stats = NULL;
 		conv_ftl->debug_read_repromotion = NULL;
@@ -2455,6 +2642,10 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		if (conv_ftl->debug_die_affinity_stats) {
 			debugfs_remove(conv_ftl->debug_die_affinity_stats);
 			conv_ftl->debug_die_affinity_stats = NULL;
+		}
+		if (conv_ftl->debug_lpn_die_change_stats) {
+			debugfs_remove(conv_ftl->debug_lpn_die_change_stats);
+			conv_ftl->debug_lpn_die_change_stats = NULL;
 		}
 		if (conv_ftl->debug_test_phase) {
 			debugfs_remove(conv_ftl->debug_test_phase);
@@ -3068,7 +3259,7 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 				return -1;
 			return 0;
 		}
-			set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+			set_maptbl_ent_reason(conv_ftl, lpn, &new_ppa, NVMEV_DIE_CHANGE_GC);
 			set_rmap_ent(conv_ftl, lpn, &new_ppa);
 			mark_page_valid(conv_ftl, &new_ppa);
 			slc_resident_track_page(conv_ftl, lpn, encode_die(spp, &new_ppa));
@@ -3114,7 +3305,7 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 				    zone_hint);
 			return -1;
 		}
-		set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+			set_maptbl_ent_reason(conv_ftl, lpn, &new_ppa, NVMEV_DIE_CHANGE_GC);
 		set_rmap_ent(conv_ftl, lpn, &new_ppa);
 		mark_page_valid(conv_ftl, &new_ppa);
 		set_page_prev_link(conv_ftl, lpn, &new_ppa, stored_prev_lpn);
@@ -4218,7 +4409,7 @@ static int migrate_page_within_qlc(struct conv_ftl *conv_ftl, uint64_t lpn,
 	if (qlc_get_new_gc_page(conv_ftl, src_die, zone_hint, &new_ppa) != 0)
 		return -ENOSPC;
 
-	set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+		set_maptbl_ent_reason(conv_ftl, lpn, &new_ppa, NVMEV_DIE_CHANGE_QLC_REBALANCE);
 	set_rmap_ent(conv_ftl, lpn, &new_ppa);
 	mark_page_invalid(conv_ftl, src_ppa);
 	set_rmap_ent(conv_ftl, INVALID_LPN, src_ppa);
@@ -4465,7 +4656,7 @@ static int migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct p
     ssd_advance_nand(conv_ftl->ssd, &swr);
     
     /* 更新映射表 */
-    set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+    set_maptbl_ent_reason(conv_ftl, lpn, &new_ppa, NVMEV_DIE_CHANGE_SLC_TO_QLC);
 	set_rmap_ent(conv_ftl, lpn, &new_ppa);
     
     /* 标记旧页面无效 */
@@ -4884,7 +5075,7 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	}
 
 	/* Update mappings */
-	set_maptbl_ent(conv_ftl, lpn, &new_ppa);
+		set_maptbl_ent_reason(conv_ftl, lpn, &new_ppa, NVMEV_DIE_CHANGE_REPROMOTE);
 	set_rmap_ent(conv_ftl, lpn, &new_ppa);
 
 	/* Mark old QLC invalid */
@@ -5254,7 +5445,9 @@ retry_wb_alloc:
 //66f1
 
 		/* update maptbl */
-		set_maptbl_ent(conv_ftl, local_lpn, &ppa);
+			set_maptbl_ent_reason(conv_ftl, local_lpn, &ppa,
+					      bOverwrite ? NVMEV_DIE_CHANGE_HOST_OVERWRITE :
+					      NVMEV_DIE_CHANGE_HOST_APPEND);
 		NVMEV_DEBUG("conv_write: got new ppa %lld, ", ppa2pgidx(conv_ftl, &ppa));
 		/* update rmap */
 		set_rmap_ent(conv_ftl, local_lpn, &ppa);
