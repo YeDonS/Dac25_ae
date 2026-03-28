@@ -1,4 +1,5 @@
-#!/bin/bash -e
+#!/bin/bash
+set -e
 #
 # sqlite_fragment_die_test1_pageflow_fullscan_overwrite.sh
 #
@@ -68,6 +69,39 @@ fi
 mkdir -p "$RESULT_FOLDER"
 mkdir -p "$TARGET_FOLDER"
 
+print_init_log_tail() {
+    local path="$1"
+    if [[ -f "$path" ]]; then
+        echo "----- tail: $path -----" >&2
+        tail -n 40 "$path" >&2 || true
+        echo "------------------------" >&2
+    fi
+}
+
+validate_workload_outputs() {
+    local tag="$1"
+    local init_txt="$2"
+    local ok=0
+
+    if [[ -f "${RESULT_FOLDER}/sqlite_table_tier_${tag}.csv" ]]; then
+        ok=1
+    fi
+    if [[ -f "${RESULT_FOLDER}/sqlite_table_die_${tag}.csv" ]]; then
+        ok=1
+    fi
+    if [[ -f "${RESULT_FOLDER}/sqlite_table_${tag}.csv" ]]; then
+        ok=1
+    fi
+    if [[ -f "${RESULT_FOLDER}/sqlite_row_${tag}.csv" ]]; then
+        ok=1
+    fi
+    if grep -q "\\[sqlite_init\\] tag=${tag}" "$init_txt" 2>/dev/null; then
+        ok=1
+    fi
+
+    return $(( ok == 1 ? 0 : 1 ))
+}
+
 drop_caches() {
     sync
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
@@ -128,7 +162,7 @@ run_one_test() {
         extra_args+=(--fast-init-profile)
     fi
 
-    numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./${EXE_NAME} --mode init \
+    if ! numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./${EXE_NAME} --mode init \
         --target-bytes "$SQLITE_TARGET_BYTES" \
         --table-count "$SQLITE_TABLE_COUNT" \
         --rows-per-table "$SQLITE_ROWS_PER_TABLE" \
@@ -155,7 +189,17 @@ run_one_test() {
         --strict-cold-per-select \
         "${extra_args[@]}" \
         --tag "$tag" \
-        >"$init_txt" 2>&1
+        >"$init_txt" 2>&1; then
+        echo "ERROR: workload failed for variant=$variant threads=$threads" >&2
+        print_init_log_tail "$init_txt"
+        return 1
+    fi
+
+    if ! validate_workload_outputs "$tag" "$init_txt"; then
+        echo "ERROR: workload exited without producing expected outputs for variant=$variant threads=$threads" >&2
+        print_init_log_tail "$init_txt"
+        return 1
+    fi
 
     cp "$init_txt" "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_tier_${tag}.csv "${out_dir}/" 2>/dev/null || true
@@ -204,7 +248,7 @@ mkdir -p "$DIE_RESULT_BASE"
 
 for threads in $THREAD_COUNTS; do
     for variant in $VARIANTS; do
-        run_one_test "$variant" "$threads"
+        run_one_test "$variant" "$threads" || exit 1
     done
 done
 

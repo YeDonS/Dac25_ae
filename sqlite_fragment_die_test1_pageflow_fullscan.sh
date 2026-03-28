@@ -1,4 +1,5 @@
-#!/bin/bash -e
+#!/bin/bash
+set -e
 #
 # sqlite_fragment_die_test1_pageflow_fullscan.sh
 #
@@ -244,7 +245,7 @@ mkdir -p "$DIE_RESULT_BASE"
 
 for threads in $THREAD_COUNTS; do
     for variant in $VARIANTS; do
-        run_one_test "$variant" "$threads"
+        run_one_test "$variant" "$threads" || exit 1
     done
 done
 

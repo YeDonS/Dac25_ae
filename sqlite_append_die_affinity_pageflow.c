@@ -1582,7 +1582,8 @@ out:
 	return rc;
 }
 
-static int insert_rows_batch(struct table_state *table, unsigned int rows_this_batch)
+static int insert_rows_range(struct table_state *table, unsigned int start_row,
+			     unsigned int rows_this_batch)
 {
 	char rstr1[STR1_LEN + 1];
 	char rstr2[STR2_LEN + 1];
@@ -1598,9 +1599,9 @@ static int insert_rows_batch(struct table_state *table, unsigned int rows_this_b
 		return 0;
 
 	stmt = table->insert_stmt;
-	limit = table->rows_inserted + rows_this_batch;
+	limit = start_row + rows_this_batch;
 
-	for (unsigned int row = table->rows_inserted; row < limit; ++row) {
+	for (unsigned int row = start_row; row < limit; ++row) {
 		int record_id = (int)(table->total_rows - 1U - row);
 
 		random_string(rstr1, STR1_LEN);
@@ -1625,6 +1626,13 @@ static int insert_rows_batch(struct table_state *table, unsigned int rows_this_b
 	}
 
 	return 0;
+}
+
+static int insert_rows_batch(struct table_state *table, unsigned int rows_this_batch)
+{
+	if (!table)
+		return -EINVAL;
+	return insert_rows_range(table, table->rows_inserted, rows_this_batch);
 }
 
 static int get_db_page_count(sqlite3 *db, unsigned int *pages_out)
@@ -1671,7 +1679,7 @@ static int insert_table_window_by_pages(sqlite3 *db, struct table_state *table,
 		return rc;
 
 	while (table->rows_inserted + rows_done < table->total_rows) {
-		rc = insert_rows_batch(table, 1);
+		rc = insert_rows_range(table, table->rows_inserted + rows_done, 1);
 		if (rc != 0)
 			return rc;
 		rows_done++;
