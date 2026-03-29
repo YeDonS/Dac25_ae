@@ -5160,11 +5160,6 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	if (bAppend) {
 		plba = cmd->rw.pslba;
 		plpn = plba / spp->secs_per_pg;
-		if (printk_ratelimit()) {
-			NVMEV_ERROR("[append] opcode=0x%x control=0x%x slba=%llu pslba=%llu sqid=%d\n",
-				    cmd->rw.opcode, le16_to_cpu(cmd->rw.control),
-				    cmd->rw.slba, plba, req->sq_id);
-		}
 		if (unlikely(plba >= max_lba)) {
 			if (printk_ratelimit()) {
 				NVMEV_ERROR("conv_write: BAD pslba=%llu (slba=%llu len=%u sqid=%d), disable append\n",

@@ -5190,7 +5190,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint32_t xfer_size = 0;  /* 声明缺失的变量 */
 //66f1
 	uint16_t bOverwrite = (cmd->rw.control & NVME_RW_OVERWRITE) ? 1 : 0;
-	uint16_t bAppend = 0;
+	uint16_t bAppend = (cmd->rw.control & NVME_RW_APPEND) ? 1 : 0;
 	bool is_append_opcode = (cmd->rw.opcode == nvme_cmd_zone_append);
 
 	uint64_t plba = 0;
@@ -5214,7 +5214,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
 	};
 //66f1
-	if (is_append_opcode)
+	if (!bAppend && is_append_opcode)
 		bAppend = 1;
 
 	if (bAppend) {
