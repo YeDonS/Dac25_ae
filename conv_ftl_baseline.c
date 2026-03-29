@@ -5130,7 +5130,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 	uint32_t xfer_size = 0;  /* 声明缺失的变量 */
 //66f1
 	uint16_t bOverwrite = (cmd->rw.control & NVME_RW_OVERWRITE) ? 1 : 0;
-	uint16_t bAppend = 0;
+	uint16_t bAppend = (cmd->rw.control & NVME_RW_APPEND) ? 1 : 0;
 	bool is_append_opcode = (cmd->rw.opcode == nvme_cmd_zone_append);
 
 	uint64_t plba = 0;
@@ -5154,12 +5154,17 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		.xfer_size = spp->pgsz * spp->pgs_per_oneshotpg,
 	};
 //66f1
-	if (is_append_opcode)
+	if (!bAppend && is_append_opcode)
 		bAppend = 1;
 
 	if (bAppend) {
 		plba = cmd->rw.pslba;
 		plpn = plba / spp->secs_per_pg;
+		if (printk_ratelimit()) {
+			NVMEV_ERROR("[append] opcode=0x%x control=0x%x slba=%llu pslba=%llu sqid=%d\n",
+				    cmd->rw.opcode, le16_to_cpu(cmd->rw.control),
+				    cmd->rw.slba, plba, req->sq_id);
+		}
 		if (unlikely(plba >= max_lba)) {
 			if (printk_ratelimit()) {
 				NVMEV_ERROR("conv_write: BAD pslba=%llu (slba=%llu len=%u sqid=%d), disable append\n",
