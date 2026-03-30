@@ -50,6 +50,7 @@ TMP_APPEND_F="${SCRIPT_DIR}/filebench/.fileserver_append_runtime.f"
 TMP_READ_F="${SCRIPT_DIR}/filebench/.fileserver_read_runtime.f"
 TMP_WARMUP_F="${SCRIPT_DIR}/filebench/.fileserver_warmup_runtime.f"
 DIST_HELPER="${SCRIPT_DIR}/filebench/fileserver_dist_access.py"
+FILE_TIER_HELPER="${SCRIPT_DIR}/filebench/fileserver_file_tier.py"
 
 drop_caches() {
     sync
@@ -321,12 +322,27 @@ capture_ftl_views() {
         cp /sys/kernel/debug/nvmev/ftl0/page_die \
            "${prefix}_page_die_${variant}.txt" 2>/dev/null || true
     fi
+    if [[ -r /sys/kernel/debug/nvmev/ftl0/test_phase_stats ]]; then
+        cp /sys/kernel/debug/nvmev/ftl0/test_phase_stats \
+           "${prefix}_test_phase_stats_${variant}.txt" 2>/dev/null || true
+    fi
+    if [[ -r /sys/module/nvmev/parameters/bg_nand_stats ]]; then
+        cp /sys/module/nvmev/parameters/bg_nand_stats \
+           "${prefix}_bg_nand_stats_${variant}.txt" 2>/dev/null || true
+    fi
+    if [[ -r /sys/module/nvmev/parameters/die_stats ]]; then
+        cp /sys/module/nvmev/parameters/die_stats \
+           "${prefix}_die_stats_${variant}.txt" 2>/dev/null || true
+    fi
 
     cp "${prefix}_die_affinity_${variant}.txt" "$out_dir/" 2>/dev/null || true
     cp "${prefix}_lpn_die_change_${variant}.txt" "$out_dir/" 2>/dev/null || true
     cp "${prefix}_page_tier_${variant}.txt" "$out_dir/" 2>/dev/null || true
     cp "${prefix}_access_count_${variant}.txt" "$out_dir/" 2>/dev/null || true
     cp "${prefix}_page_die_${variant}.txt" "$out_dir/" 2>/dev/null || true
+    cp "${prefix}_test_phase_stats_${variant}.txt" "$out_dir/" 2>/dev/null || true
+    cp "${prefix}_bg_nand_stats_${variant}.txt" "$out_dir/" 2>/dev/null || true
+    cp "${prefix}_die_stats_${variant}.txt" "$out_dir/" 2>/dev/null || true
 }
 
 run_distribution_access() {
@@ -365,12 +381,57 @@ run_distribution_access() {
     cp "$plan_path" "$out_dir/" 2>/dev/null || true
 }
 
+run_file_tier_analysis() {
+    local state_tag="$1"
+    local plan_tag="$2"
+    local out_dir="$3"
+    local root="$4"
+    local prefix="${RESULT_FOLDER%/}/${RESULT_PREFIX}"
+    local page_tier_path="${prefix}_page_tier_${state_tag}.txt"
+    local page_die_path="${prefix}_page_die_${state_tag}.txt"
+    local access_count_path="${prefix}_access_count_${state_tag}.txt"
+    local out_csv="${prefix}_file_tier_${state_tag}.csv"
+    local out_summary="${prefix}_file_tier_${state_tag}.txt"
+    local plan_csv=""
+
+    if [[ -n "$plan_tag" ]]; then
+        plan_csv="${prefix}_${plan_tag}_plan.csv"
+    fi
+
+    if [[ ! -r "$page_tier_path" || ! -r "$page_die_path" || ! -r "$access_count_path" ]]; then
+        return 0
+    fi
+
+    if [[ -n "$plan_csv" && -r "$plan_csv" ]]; then
+        python3 "$FILE_TIER_HELPER" \
+            --root "$root" \
+            --page-tier "$page_tier_path" \
+            --page-die "$page_die_path" \
+            --access-count "$access_count_path" \
+            --out-csv "$out_csv" \
+            --out-summary "$out_summary" \
+            --plan-csv "$plan_csv"
+    else
+        python3 "$FILE_TIER_HELPER" \
+            --root "$root" \
+            --page-tier "$page_tier_path" \
+            --page-die "$page_die_path" \
+            --access-count "$access_count_path" \
+            --out-csv "$out_csv" \
+            --out-summary "$out_summary"
+    fi
+
+    cp "$out_csv" "$out_dir/" 2>/dev/null || true
+    cp "$out_summary" "$out_dir/" 2>/dev/null || true
+}
+
 run_one_variant() {
     local variant="$1"
     local out_dir="${DIE_RESULT_BASE}/${variant}"
     local append_log="${RESULT_FOLDER%/}/${RESULT_PREFIX}_append_${variant}.txt"
     local read_log="${RESULT_FOLDER%/}/${RESULT_PREFIX}_read_${variant}.txt"
     local size_log="${RESULT_FOLDER%/}/${RESULT_PREFIX}_size_${variant}.txt"
+    local analyze_root="${TARGET_FOLDER%/}/bigfileset"
 
     mkdir -p "$out_dir"
 
@@ -388,6 +449,9 @@ run_one_variant() {
 
     lsblk
     source setdevice.sh
+    if [[ "$APPEND_PROFILE" == "hotcold" ]]; then
+        analyze_root="${TARGET_FOLDER%/}"
+    fi
     sleep 1
 
     generate_runtime_workload "$APPEND_F" "$TMP_APPEND_F" append
@@ -411,6 +475,7 @@ run_one_variant() {
         sleep 2
         run_distribution_access "warmup" "$variant" "$out_dir" "${TARGET_FOLDER%/}" "$DIST_WARMUP_OPS" | tee -a "$read_log"
         capture_ftl_views "${variant}_warmup" "$out_dir"
+        run_file_tier_analysis "${variant}_warmup" "warmup_${variant}" "$out_dir" "$analyze_root"
         drop_caches
         sleep 2
         for reads in $(seq 1 "$READ_RUNS"); do
@@ -418,6 +483,8 @@ run_one_variant() {
             drop_caches
             sleep 2
             run_distribution_access "read${reads}" "$variant" "$out_dir" "${TARGET_FOLDER%/}" "$DIST_READ_OPS" | tee -a "$read_log"
+            capture_ftl_views "${variant}_read${reads}" "$out_dir"
+            run_file_tier_analysis "${variant}_read${reads}" "read${reads}_${variant}" "$out_dir" "$analyze_root"
         done
     else
     if [[ "$APPEND_PROFILE" == "hotcold" ]]; then
@@ -440,6 +507,7 @@ run_one_variant() {
     fi
 
     capture_ftl_views "$variant" "$out_dir"
+    run_file_tier_analysis "$variant" "" "$out_dir" "$analyze_root"
 
     cp "$append_log" "$out_dir/" 2>/dev/null || true
     cp "$read_log" "$out_dir/" 2>/dev/null || true
