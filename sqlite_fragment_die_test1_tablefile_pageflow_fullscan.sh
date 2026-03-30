@@ -25,10 +25,13 @@ SQLITE_WINDOW_TABLES=${SQLITE_WINDOW_TABLES:-80}
 SQLITE_WINDOW_PAGES_PER_TABLE=${SQLITE_WINDOW_PAGES_PER_TABLE:-960}
 SQLITE_INTERLEAVE_PAGES=${SQLITE_INTERLEAVE_PAGES:-209715}
 SQLITE_INTERLEAVE_READS=${SQLITE_INTERLEAVE_READS:-1000}
+SQLITE_REFSTYLE_DUMMY_BYTES=${SQLITE_REFSTYLE_DUMMY_BYTES:-0}
 SQLITE_DIE_AFFINITY_STATS_PATH=${SQLITE_DIE_AFFINITY_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/die_affinity_stats}
 SQLITE_LPN_DIE_CHANGE_STATS_PATH=${SQLITE_LPN_DIE_CHANGE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/lpn_die_change_stats}
 SQLITE_TEST_PHASE_PATH=${SQLITE_TEST_PHASE_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase}
 SQLITE_TEST_PHASE_STATS_PATH=${SQLITE_TEST_PHASE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase_stats}
+SQLITE_DIE_STATS_PATH=${SQLITE_DIE_STATS_PATH:-/sys/module/nvmev/parameters/die_stats}
+SQLITE_BG_NAND_STATS_PATH=${SQLITE_BG_NAND_STATS_PATH:-/sys/module/nvmev/parameters/bg_nand_stats}
 SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
 SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
 SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-0}
@@ -133,7 +136,7 @@ run_one_test() {
     echo "================================================================"
     echo "  [TEST1-TABLEFILE-PAGEFLOW-FULLSCAN] variant=$variant  threads=$threads  tag=$tag"
     echo "  per-table-db=ON  logical_row_bytes~16KB  est_row_pages~5  tables=$SQLITE_TABLE_COUNT  rows/tbl=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  interleave_pages=$SQLITE_INTERLEAVE_PAGES  cold_mode=$SQLITE_COLD_FULL_READ_MODE"
+    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  interleave_pages=$SQLITE_INTERLEAVE_PAGES  cold_mode=$SQLITE_COLD_FULL_READ_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES"
     echo "  note: 8G + 80 tables implies ~32750 SQLite pages/table; ~30-40 rounds needs ~900-1000 pages per table each round"
     echo "================================================================"
 
@@ -154,6 +157,9 @@ run_one_test() {
     fi
     if [[ "$SQLITE_FAST_INIT_PROFILE" == "1" ]]; then
         extra_args+=(--fast-init-profile)
+    fi
+    if [[ "$SQLITE_REFSTYLE_DUMMY_BYTES" != "0" ]]; then
+        extra_args+=(--refstyle-dummy-bytes "$SQLITE_REFSTYLE_DUMMY_BYTES")
     fi
 
     if ! numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./${EXE_NAME} --mode init \
@@ -223,6 +229,24 @@ run_one_test() {
         cp "$SQLITE_TEST_PHASE_STATS_PATH" \
            "${RESULT_FOLDER%/}/sqlite_test_phase_stats_${tag}.txt" 2>/dev/null || true
         cp "${RESULT_FOLDER%/}/sqlite_test_phase_stats_${tag}.txt" "${out_dir}/" 2>/dev/null || true
+    fi
+    if [[ -r "$SQLITE_DIE_STATS_PATH" ]]; then
+        {
+            echo "[die_stats]"
+            cat "$SQLITE_DIE_STATS_PATH"
+        } >>"$init_txt" 2>/dev/null || true
+        cp "$SQLITE_DIE_STATS_PATH" \
+           "${RESULT_FOLDER%/}/sqlite_die_stats_${tag}.txt" 2>/dev/null || true
+        cp "${RESULT_FOLDER%/}/sqlite_die_stats_${tag}.txt" "${out_dir}/" 2>/dev/null || true
+    fi
+    if [[ -r "$SQLITE_BG_NAND_STATS_PATH" ]]; then
+        {
+            echo "[bg_nand_stats]"
+            cat "$SQLITE_BG_NAND_STATS_PATH"
+        } >>"$init_txt" 2>/dev/null || true
+        cp "$SQLITE_BG_NAND_STATS_PATH" \
+           "${RESULT_FOLDER%/}/sqlite_bg_nand_stats_${tag}.txt" 2>/dev/null || true
+        cp "${RESULT_FOLDER%/}/sqlite_bg_nand_stats_${tag}.txt" "${out_dir}/" 2>/dev/null || true
     fi
 
     echo "=== Done: variant=$variant threads=$threads ==="
