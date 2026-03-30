@@ -2515,8 +2515,14 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->die_aff_overwrite_effective = 0;
 	conv_ftl->test_phase_active = false;
 	test_phase_reset_stats(conv_ftl);
+	conv_ftl->bg_slc_rr_die = 0;
+	conv_ftl->bg_slc_rr_pages = 0;
+	conv_ftl->bg_qlc_rr_die = 0;
+	conv_ftl->bg_qlc_rr_pages = 0;
 	conv_ftl->qlc_promote_cursor = 0;
 	conv_ftl->qlc_demote_cursor = 0;
+	conv_ftl->qlc_promote_die_cursor = 0;
+	conv_ftl->qlc_demote_die_cursor = 0;
 	conv_ftl->qlc_rebalance_period_writes = 2048;
 	conv_ftl->qlc_rebalance_promote_budget = 32;
 	conv_ftl->qlc_rebalance_demote_budget = 16;
@@ -2537,6 +2543,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	spin_lock_init(&conv_ftl->repromote_queue_lock);
 	conv_ftl->repromote_head = 0;
 	conv_ftl->repromote_tail = 0;
+	conv_ftl->repromote_die_cursor = 0;
 
 	/* 直接初始化水位线（无后台线程） */
 	{
@@ -4703,29 +4710,66 @@ static int migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct p
 static void bg_repromotion_worker(struct work_struct *work)
 {
 	struct conv_ftl *conv_ftl = container_of(work, struct conv_ftl, repromotion_work);
-	uint64_t lpn;
-	struct ppa ppa, cur;
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint64_t lpns[REPROMOTE_QUEUE_SIZE];
+	struct ppa ppas[REPROMOTE_QUEUE_SIZE];
+	bool consumed[REPROMOTE_QUEUE_SIZE] = { false };
 	uint64_t migration_done = 0;
-	uint32_t budget = conv_ftl->repromote_budget_per_run;
+	uint32_t budget = min_t(uint32_t, conv_ftl->repromote_budget_per_run,
+				 REPROMOTE_QUEUE_SIZE);
+	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	uint32_t start_die = conv_ftl->repromote_die_cursor % die_count;
+	uint32_t pulled = 0;
 	uint32_t processed = 0;
+	uint32_t die_step;
+	uint32_t i;
 
-	while (processed < budget) {
+	while (pulled < budget) {
 		spin_lock(&conv_ftl->repromote_queue_lock);
 		if (conv_ftl->repromote_head == conv_ftl->repromote_tail) {
 			spin_unlock(&conv_ftl->repromote_queue_lock);
 			break;
 		}
-		lpn = conv_ftl->repromote_lpns[conv_ftl->repromote_head];
-		ppa = conv_ftl->repromote_ppas[conv_ftl->repromote_head];
+		lpns[pulled] = conv_ftl->repromote_lpns[conv_ftl->repromote_head];
+		ppas[pulled] = conv_ftl->repromote_ppas[conv_ftl->repromote_head];
 		conv_ftl->repromote_head =
 			(conv_ftl->repromote_head + 1) % REPROMOTE_QUEUE_SIZE;
 		spin_unlock(&conv_ftl->repromote_queue_lock);
-
-		cur = get_maptbl_ent(conv_ftl, lpn);
-		if (cur.ppa == ppa.ppa && !is_slc_block(conv_ftl, cur.g.blk))
-			migrate_page_to_slc(conv_ftl, lpn, &cur, &migration_done);
-		processed++;
+		pulled++;
 	}
+
+	for (die_step = 0; die_step < die_count && processed < pulled; die_step++) {
+		uint32_t target_die = (start_die + die_step) % die_count;
+
+		for (i = 0; i < pulled; i++) {
+			struct ppa cur;
+
+			if (consumed[i])
+				continue;
+			if ((encode_die(spp, &ppas[i]) % die_count) != target_die)
+				continue;
+
+			consumed[i] = true;
+			processed++;
+			cur = get_maptbl_ent(conv_ftl, lpns[i]);
+			if (cur.ppa == ppas[i].ppa && !is_slc_block(conv_ftl, cur.g.blk))
+				migrate_page_to_slc(conv_ftl, lpns[i], &cur, &migration_done);
+		}
+	}
+
+	for (i = 0; i < pulled && processed < pulled; i++) {
+		struct ppa cur;
+
+		if (consumed[i])
+			continue;
+
+		processed++;
+		cur = get_maptbl_ent(conv_ftl, lpns[i]);
+		if (cur.ppa == ppas[i].ppa && !is_slc_block(conv_ftl, cur.g.blk))
+			migrate_page_to_slc(conv_ftl, lpns[i], &cur, &migration_done);
+	}
+
+	conv_ftl->repromote_die_cursor = (start_die + 1) % die_count;
 }
 
 static void bg_qlc_rebalance_worker(struct work_struct *work)

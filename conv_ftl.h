@@ -100,6 +100,10 @@ struct conv_ftl {
 	struct write_flow_control wfc;
 	//66f1 - 删除了冲突的旧 line_mgmt 结构
 	uint32_t lunpointer;
+	uint32_t bg_slc_rr_die;      /* baseline/no2: RR selector for internal writes targeting SLC */
+	uint32_t bg_slc_rr_pages;    /* pages already placed on current internal SLC RR die */
+	uint32_t bg_qlc_rr_die;      /* baseline/no2: RR selector for internal writes targeting QLC */
+	uint32_t bg_qlc_rr_pages;    /* pages already placed on current internal QLC RR die */
 	uint32_t die_count;
 
 	/* SLC/QLC 混合存储相关字段 */
@@ -158,6 +162,8 @@ struct conv_ftl {
 	uint64_t migration_read_path_time_ns;  /* 读路径迁移耗时累计 */
 	uint64_t qlc_promote_cursor;      /* QLC 内部 slow->fast 扫描游标 */
 	uint64_t qlc_demote_cursor;       /* QLC 内部 fast->slow 扫描游标 */
+	uint32_t qlc_promote_die_cursor;  /* affinity variants: die-batched promote start die */
+	uint32_t qlc_demote_die_cursor;   /* affinity variants: die-batched demote start die */
 	uint32_t qlc_rebalance_period_writes;  /* 每多少次主机写触发一次内部重平衡 */
 	uint32_t qlc_rebalance_promote_budget; /* 每轮 slow->fast 预算页数 */
 	uint32_t qlc_rebalance_demote_budget;  /* 每轮 fast->slow 预算页数 */
@@ -181,6 +187,7 @@ struct conv_ftl {
 	struct ppa repromote_ppas[REPROMOTE_QUEUE_SIZE];
 	uint32_t repromote_head;
 	uint32_t repromote_tail;
+	uint32_t repromote_die_cursor;    /* affinity variants: die-batched repromotion start die */
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */

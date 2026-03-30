@@ -2510,8 +2510,14 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->die_aff_overwrite_effective = 0;
 	conv_ftl->test_phase_active = false;
 	test_phase_reset_stats(conv_ftl);
+	conv_ftl->bg_slc_rr_die = 0;
+	conv_ftl->bg_slc_rr_pages = 0;
+	conv_ftl->bg_qlc_rr_die = 0;
+	conv_ftl->bg_qlc_rr_pages = 0;
 	conv_ftl->qlc_promote_cursor = 0;
 	conv_ftl->qlc_demote_cursor = 0;
+	conv_ftl->qlc_promote_die_cursor = 0;
+	conv_ftl->qlc_demote_die_cursor = 0;
 	conv_ftl->qlc_rebalance_period_writes = 2048;
 	conv_ftl->qlc_rebalance_promote_budget = 32;
 	conv_ftl->qlc_rebalance_demote_budget = 16;
@@ -2532,6 +2538,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	spin_lock_init(&conv_ftl->repromote_queue_lock);
 	conv_ftl->repromote_head = 0;
 	conv_ftl->repromote_tail = 0;
+	conv_ftl->repromote_die_cursor = 0;
 
 	/* 直接初始化水位线（无后台线程） */
 	{

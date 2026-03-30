@@ -341,6 +341,44 @@ static inline uint32_t pick_locked_qlc_page_type(struct conv_ftl *conv_ftl, bool
 	return type;
 }
 
+static inline uint32_t baseline_bg_rr_die(struct conv_ftl *conv_ftl, bool qlc_dest)
+{
+	uint32_t die;
+
+	if (!conv_ftl || !conv_ftl->die_count)
+		return 0;
+
+	die = qlc_dest ? conv_ftl->bg_qlc_rr_die : conv_ftl->bg_slc_rr_die;
+	return die % conv_ftl->die_count;
+}
+
+static void baseline_bg_rr_note_write(struct conv_ftl *conv_ftl, bool qlc_dest,
+				       uint32_t actual_die)
+{
+	uint32_t unit;
+	uint32_t *die_cursor;
+	uint32_t *page_cursor;
+
+	if (!conv_ftl || !conv_ftl->die_count || !conv_ftl->ssd)
+		return;
+
+	actual_die %= conv_ftl->die_count;
+	unit = conv_ftl->ssd->sp.pgs_per_oneshotpg ? conv_ftl->ssd->sp.pgs_per_oneshotpg : 1;
+	die_cursor = qlc_dest ? &conv_ftl->bg_qlc_rr_die : &conv_ftl->bg_slc_rr_die;
+	page_cursor = qlc_dest ? &conv_ftl->bg_qlc_rr_pages : &conv_ftl->bg_slc_rr_pages;
+
+	if (*page_cursor >= unit)
+		*page_cursor = 0;
+
+	(*page_cursor)++;
+	if (*page_cursor >= unit) {
+		*page_cursor = 0;
+		*die_cursor = (actual_die + 1) % conv_ftl->die_count;
+	} else {
+		*die_cursor = actual_die;
+	}
+}
+
 static inline bool qlc_zone_is_fast(uint8_t zone)
 {
 	return zone == QLC_PAGE_TYPE_L || zone == QLC_PAGE_TYPE_CL;
@@ -362,7 +400,8 @@ static int qlc_get_new_gc_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t
 static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
 static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
 /* 新增：GC 专用 SLC 写指针函数声明（仅在本文件使用） */
-static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
+static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die,
+					 bool count_rr);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
 static void qlc_maybe_rebalance_internal(struct conv_ftl *conv_ftl);
@@ -2477,8 +2516,14 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	/* DEPRECATED: prepare_write_pointer calls removed - using dynamic SLC/QLC allocation */
 	/* SLC/QLC write pointers will be initialized on first write operation */
 
-    /* SLC Die-Affinity uses per-instance lunpointer */
+    /* Host writes and internal GC/migration maintain separate RR state. */
     conv_ftl->lunpointer = 0;
+	conv_ftl->bg_slc_rr_die = 0;
+	conv_ftl->bg_slc_rr_pages = 0;
+	conv_ftl->bg_qlc_rr_die = 0;
+	conv_ftl->bg_qlc_rr_pages = 0;
+	conv_ftl->qlc_promote_die_cursor = 0;
+	conv_ftl->qlc_demote_die_cursor = 0;
 
 	/* 初始化 SLC 写指针 - 使用 Die Affinity */
 	/* 注意：SLC 写指针将在第一次写入时初始化 */
@@ -2532,6 +2577,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	spin_lock_init(&conv_ftl->repromote_queue_lock);
 	conv_ftl->repromote_head = 0;
 	conv_ftl->repromote_tail = 0;
+	conv_ftl->repromote_die_cursor = 0;
 
 	/* 直接初始化水位线（无后台线程） */
 	{
@@ -3234,10 +3280,8 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 			return 0;
 		}
 
-		/* [DISABLED] Mechanism 2: no die affinity for SLC GC */
-		uint32_t die_index = conv_ftl->die_count ? (uint32_t)(lpn % conv_ftl->die_count) : 0;
-
-		conv_ftl->lunpointer = die_index;
+		/* Baseline internal placement: oneshot-level RR to the SLC pool. */
+		uint32_t die_index = baseline_bg_rr_die(conv_ftl, false);
 
 		if (conv_ftl->gc_slc_lunwp) {
 			struct write_pointer *gc_wp = &conv_ftl->gc_slc_lunwp[die_index];
@@ -3247,7 +3291,7 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 			}
 		}
 
-		new_ppa = get_new_gc_slc_page(conv_ftl, die_index);
+			new_ppa = get_new_gc_slc_page(conv_ftl, die_index);
 		if (!mapped_ppa(&new_ppa)) {
 			NVMEV_ERROR("gc_write_page: Failed to get new SLC page, flushing to QLC.\n");
 			if (migrate_page_to_qlc(conv_ftl, lpn, old_ppa) < 0)
@@ -3259,8 +3303,8 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 			mark_page_valid(conv_ftl, &new_ppa);
 			slc_resident_track_page(conv_ftl, lpn, encode_die(spp, &new_ppa));
 			set_page_prev_link(conv_ftl, lpn, &new_ppa, stored_prev_lpn);
-			actual_die = encode_die(spp, &new_ppa);
-			advance_gc_slc_write_pointer(conv_ftl, actual_die);
+				actual_die = encode_die(spp, &new_ppa);
+				advance_gc_slc_write_pointer(conv_ftl, actual_die, true);
 			mark_page_invalid(conv_ftl, old_ppa);
 		set_rmap_ent(conv_ftl, INVALID_LPN, old_ppa);
 		NVMEV_DEBUG("[TASK2][GC-SLC] lpn=%llu prev_lpn=%lld src_die=%u dst_die=%u",
@@ -3292,14 +3336,14 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 		if (zone_hint >= QLC_ZONE_COUNT)
 			zone_hint = QLC_ZONE_COUNT - 1;
 
-		/* [DISABLED] Mechanism 2: no die affinity for QLC GC */
+		/* Baseline internal placement: oneshot-level RR to the QLC pool. */
 		{
-			uint32_t qlc_gc_die = conv_ftl->die_count ? (uint32_t)(lpn % conv_ftl->die_count) : 0;
-		if (qlc_get_new_gc_page(conv_ftl, qlc_gc_die, zone_hint, &new_ppa) != 0) {
-			NVMEV_ERROR("gc_write_page: Failed to get new QLC GC page (zone_hint=%u).\n",
-				    zone_hint);
-			return -1;
-		}
+			uint32_t qlc_gc_die = baseline_bg_rr_die(conv_ftl, true);
+			if (qlc_get_new_gc_page(conv_ftl, qlc_gc_die, zone_hint, &new_ppa) != 0) {
+				NVMEV_ERROR("gc_write_page: Failed to get new QLC GC page (zone_hint=%u).\n",
+					    zone_hint);
+				return -1;
+			}
 			set_maptbl_ent_reason(conv_ftl, lpn, &new_ppa, NVMEV_DIE_CHANGE_GC);
 		set_rmap_ent(conv_ftl, lpn, &new_ppa);
 		mark_page_valid(conv_ftl, &new_ppa);
@@ -3307,7 +3351,8 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 		update_qlc_latency_zone(conv_ftl, lpn, &new_ppa);
 		mark_page_invalid(conv_ftl, old_ppa);
 		set_rmap_ent(conv_ftl, INVALID_LPN, old_ppa);
-		NVMEV_DEBUG("[TASK2][GC-QLC] lpn=%llu prev_lpn=%lld src_die=%u dst_die=%u zone_hint=%u",
+			baseline_bg_rr_note_write(conv_ftl, true, encode_die(spp, &new_ppa));
+			NVMEV_DEBUG("[TASK2][GC-QLC] lpn=%llu prev_lpn=%lld src_die=%u dst_die=%u zone_hint=%u",
 			lpn,
 			stored_prev_lpn == INVALID_LPN ? -1LL : (long long)stored_prev_lpn,
 			//prev_die_log,
@@ -3949,7 +3994,7 @@ retry_gc_get_page:
 			continue;
 
 		if (pg->status != PG_FREE) {
-			advance_gc_slc_write_pointer(conv_ftl, candidate);
+				advance_gc_slc_write_pointer(conv_ftl, candidate, false);
 			if (!wp->curline)
 				continue;
 			goto retry_gc_get_page;
@@ -3962,7 +4007,8 @@ retry_gc_get_page:
 }
 
 /* 新增：GC 专用 SLC 写指针推进（使用 per-die GC 写指针） */
-static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die)
+static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die,
+					 bool count_rr)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct write_pointer *wp;
@@ -4012,8 +4058,8 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 		spin_unlock(&conv_ftl->slc_lock);
 	}
 
-	if ((wp->pg % spp->pgs_per_oneshotpg) == 0)
-		conv_ftl->lunpointer = (die + 1) % conv_ftl->die_count;
+	if (count_rr)
+		baseline_bg_rr_note_write(conv_ftl, false, die);
 }
 
 static void qlc_reset_die_progress(struct write_pointer *wp)
@@ -4394,15 +4440,15 @@ static int migrate_page_within_qlc(struct conv_ftl *conv_ftl, uint64_t lpn,
 	if (prev_lpn >= conv_ftl->ssd->sp.tt_pgs)
 		prev_lpn = INVALID_LPN;
 
-	/* [DISABLED] Mechanism 2: no die affinity for QLC internal migration */
-	src_die = conv_ftl->die_count ? (uint32_t)(lpn % conv_ftl->die_count) : 0;
+	/* Baseline internal placement: oneshot-level RR to the QLC pool. */
+	src_die = baseline_bg_rr_die(conv_ftl, true);
 
 	spin_lock_irqsave(&conv_ftl->qlc_zone_lock, flags);
 	zone_hint = pick_locked_qlc_page_type(conv_ftl, promote);
 	spin_unlock_irqrestore(&conv_ftl->qlc_zone_lock, flags);
 
-	if (qlc_get_new_gc_page(conv_ftl, src_die, zone_hint, &new_ppa) != 0)
-		return -ENOSPC;
+		if (qlc_get_new_gc_page(conv_ftl, src_die, zone_hint, &new_ppa) != 0)
+			return -ENOSPC;
 
 		set_maptbl_ent_reason(conv_ftl, lpn, &new_ppa, NVMEV_DIE_CHANGE_QLC_REBALANCE);
 	set_rmap_ent(conv_ftl, lpn, &new_ppa);
@@ -4432,6 +4478,7 @@ static int migrate_page_within_qlc(struct conv_ftl *conv_ftl, uint64_t lpn,
 	if (new_zone_out)
 		*new_zone_out = actual_new_zone;
 
+	baseline_bg_rr_note_write(conv_ftl, true, encode_die(spp, &new_ppa));
 	NVMEV_DEBUG("[QLC-REBAL] %s lpn=%llu src(ch=%u,lun=%u,blk=%u,pg=%u) dst(ch=%u,lun=%u,blk=%u,pg=%u) zone_hint=%u zone_new=%u",
 		    promote ? "promote" : "demote",
 		    lpn,
@@ -4590,10 +4637,9 @@ static int migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct p
         return -1;
     }
     
-	/* [DISABLED] Mechanism 2: no die affinity, round-robin by lpn */
 	uint64_t stored_prev_lpn = pg->oob_prev_lpn;
 	uint32_t src_die = encode_die(spp, slc_ppa);
-	uint32_t target_die = conv_ftl->die_count ? (uint32_t)(lpn % conv_ftl->die_count) : 0;
+	uint32_t target_die = baseline_bg_rr_die(conv_ftl, true);
 	struct ppa prev_ppa = { .ppa = UNMAPPED_PPA };
 
 	struct heat_tracking *ht = &conv_ftl->heat_track;
@@ -4675,12 +4721,13 @@ static int migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct p
 	conv_ftl->qlc_migration_page_cnt++;
 	spin_unlock_irqrestore(&conv_ftl->qlc_zone_lock, mig_flags);
 
+	baseline_bg_rr_note_write(conv_ftl, true, encode_die(spp, &new_ppa));
 	NVMEV_DEBUG("[TASK2][MIGRATE] lpn=%llu prev_lpn=%lld src_die=%u dst_die=%u zone_hint=%u",
-		  lpn,
-		  stored_prev_lpn == INVALID_LPN ? -1LL : (long long)stored_prev_lpn,
-		  src_die,
-		  encode_die(spp, &new_ppa),
-		  zone_hint);
+		    lpn,
+		    stored_prev_lpn == INVALID_LPN ? -1LL : (long long)stored_prev_lpn,
+		    src_die,
+		    encode_die(spp, &new_ppa),
+		    zone_hint);
 
     conv_ftl->migration_cnt++;
     
@@ -4973,8 +5020,8 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 
 	nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
 
-	/* [DISABLED] Mechanism 2: no die affinity for QLC->SLC repromotion */
-	die_index = conv_ftl->die_count ? (uint32_t)(lpn % conv_ftl->die_count) : 0;
+	/* Baseline internal placement: oneshot-level RR to the SLC pool. */
+	die_index = baseline_bg_rr_die(conv_ftl, false);
 	target_ch = die_index % spp->nchs;
 	target_lun = die_index / spp->nchs;
 
@@ -5044,7 +5091,7 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 		slc_resident_track_page(conv_ftl, lpn, encode_die(spp, &new_ppa));
 
 	/* Advance GC WP */
-	advance_gc_slc_write_pointer(conv_ftl, encode_die(spp, &new_ppa));
+		advance_gc_slc_write_pointer(conv_ftl, encode_die(spp, &new_ppa), true);
 
 	/* Update prev link */
 	pg = get_pg(conv_ftl->ssd, qlc_ppa);
