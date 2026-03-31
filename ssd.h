@@ -4,6 +4,7 @@
 #define _NVMEVIRT_SSD_H
 
 #include <linux/types.h>
+#include <linux/atomic.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "channel_model.h"
@@ -140,6 +141,8 @@ struct nand_cmd {
 	uint64_t stime; /* Coperd: request arrival time */
 	bool interleave_pci_dma;
 	struct ppa *ppa;
+	atomic64_t *tracked_read_die_conflicts;
+	atomic64_t *tracked_read_die_wait_ns;
 };
 
 struct buffer {
