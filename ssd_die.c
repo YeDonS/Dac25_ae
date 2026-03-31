@@ -774,17 +774,23 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 		/* read: perform NAND cmd first */
 		nand_stime = max(lun->next_lun_avail_time, cmd_stime);
 
-		if (ncmd->type != GC_IO) {
-			int die_idx = ppa->g.lun * spp->nchs + ppa->g.ch;
-			if (die_idx >= 0 && die_idx < DIE_STAT_MAX) {
-				atomic_long_inc(&die_read_total[die_idx]);
-				if (nand_stime > cmd_stime) {
-					atomic_long_inc(&die_read_conflict[die_idx]);
-					atomic_long_add((long)(nand_stime - cmd_stime),
-							&die_read_wait_ns[die_idx]);
+			if (ncmd->type != GC_IO) {
+				int die_idx = ppa->g.lun * spp->nchs + ppa->g.ch;
+				if (die_idx >= 0 && die_idx < DIE_STAT_MAX) {
+					atomic_long_inc(&die_read_total[die_idx]);
+					if (nand_stime > cmd_stime) {
+						uint64_t wait_ns = nand_stime - cmd_stime;
+
+						atomic_long_inc(&die_read_conflict[die_idx]);
+						atomic_long_add((long)wait_ns,
+								&die_read_wait_ns[die_idx]);
+						if (ncmd->tracked_read_die_conflicts)
+							atomic64_inc(ncmd->tracked_read_die_conflicts);
+						if (ncmd->tracked_read_die_wait_ns)
+							atomic64_add(wait_ns, ncmd->tracked_read_die_wait_ns);
+					}
 				}
 			}
-		}
 
 		if (is_qlc) {
 			/* QLC 读延迟 */

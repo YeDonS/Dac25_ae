@@ -1087,6 +1087,8 @@ static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
 	atomic64_set(&conv_ftl->test_phase_bg_qlc_rebalance_ops, 0);
 	atomic64_set(&conv_ftl->test_phase_read_bg_conflicts, 0);
 	atomic64_set(&conv_ftl->test_phase_read_overwrite_conflicts, 0);
+	atomic64_set(&conv_ftl->test_phase_read_die_conflicts, 0);
+	atomic64_set(&conv_ftl->test_phase_read_die_wait_ns, 0);
 	atomic_set(&conv_ftl->test_phase_active_reads, 0);
 	atomic_set(&conv_ftl->test_phase_active_overwrites, 0);
 	atomic_set(&conv_ftl->test_phase_active_bg_ops, 0);
@@ -1098,14 +1100,17 @@ static void test_phase_log_summary(struct conv_ftl *conv_ftl, const char *phase)
 		return;
 
 	NVMEV_INFO("[TEST_PHASE] %s reads=%lld overwrites=%lld bg_repromote=%lld "
-		   "bg_qlc_rebalance=%lld read_bg_conflicts=%lld read_overwrite_conflicts=%lld\n",
+		   "bg_qlc_rebalance=%lld read_bg_conflicts=%lld read_overwrite_conflicts=%lld "
+		   "read_die_conflicts=%lld read_die_wait_ns=%lld\n",
 		   phase ? phase : "summary",
 		   atomic64_read(&conv_ftl->test_phase_read_reqs),
 		   atomic64_read(&conv_ftl->test_phase_overwrite_reqs),
 		   atomic64_read(&conv_ftl->test_phase_bg_repromote_ops),
 		   atomic64_read(&conv_ftl->test_phase_bg_qlc_rebalance_ops),
 		   atomic64_read(&conv_ftl->test_phase_read_bg_conflicts),
-		   atomic64_read(&conv_ftl->test_phase_read_overwrite_conflicts));
+		   atomic64_read(&conv_ftl->test_phase_read_overwrite_conflicts),
+		   atomic64_read(&conv_ftl->test_phase_read_die_conflicts),
+		   atomic64_read(&conv_ftl->test_phase_read_die_wait_ns));
 }
 
 static void test_phase_note_read_begin(struct conv_ftl *conv_ftl, bool *tracked)
@@ -1267,6 +1272,10 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   atomic64_read(&conv_ftl->test_phase_read_bg_conflicts));
 	seq_printf(m, "read_overwrite_conflicts %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_overwrite_conflicts));
+	seq_printf(m, "read_die_conflicts %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_die_conflicts));
+	seq_printf(m, "read_die_wait_ns %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_die_wait_ns));
 	seq_printf(m, "active_reads %d\n",
 		   atomic_read(&conv_ftl->test_phase_active_reads));
 	seq_printf(m, "active_overwrites %d\n",
@@ -4771,6 +4780,10 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	}
 
 	test_phase_note_read_begin(stats_ftl, &test_phase_read_tracked);
+	if (test_phase_read_tracked && stats_ftl) {
+		srd.tracked_read_die_conflicts = &stats_ftl->test_phase_read_die_conflicts;
+		srd.tracked_read_die_wait_ns = &stats_ftl->test_phase_read_die_wait_ns;
+	}
 
 	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
 		uint64_t avg_reads = 0;

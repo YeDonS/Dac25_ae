@@ -216,6 +216,8 @@ struct conv_ftl {
 	atomic64_t test_phase_bg_qlc_rebalance_ops; /* QLC internal migrations during test phase */
 	atomic64_t test_phase_read_bg_conflicts;    /* read overlapped bg migration/repromotion */
 	atomic64_t test_phase_read_overwrite_conflicts; /* read overlapped overwrite */
+	atomic64_t test_phase_read_die_conflicts;   /* reads delayed because target die was busy */
+	atomic64_t test_phase_read_die_wait_ns;     /* cumulative die-busy wait added to reads */
 	atomic_t test_phase_active_reads;       /* currently active host reads */
 	atomic_t test_phase_active_overwrites;  /* currently active overwrite writes */
 	atomic_t test_phase_active_bg_ops;      /* currently active bg migration ops */
