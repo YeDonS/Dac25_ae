@@ -1804,6 +1804,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		case 1019:
 		case 1020:
 		case 1021:
+			break;
 		case 1022:
 			opts->test_phase_path = optarg;
 			break;

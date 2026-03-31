@@ -57,11 +57,15 @@
 #define DEFAULT_TABLE_COUNT 80U
 #define DEFAULT_WINDOW_TABLES 80U
 #define DEFAULT_WINDOW_PAGES_PER_TABLE 960U
+#define DEFAULT_WINDOW_PASSES_PER_ROUND 1U
 #define DEFAULT_INTERLEAVE_PAGES 209715U
 #define DEFAULT_INTERLEAVE_READS 1000U
+#define DEFAULT_REFSTYLE_DUMMY_BYTES (100ULL * 1024ULL)
 #define DEFAULT_TAG "default"
 #define DEFAULT_PAGE_DIE_PATH "/sys/kernel/debug/nvmev/ftl0/page_die"
 #define DEFAULT_FTL_HOST_PAGE_BYTES 4096ULL
+#define DEFAULT_TEST_PHASE_PATH "/sys/kernel/debug/nvmev/ftl0/test_phase"
+#define DIE_STATS_RESET_PATH "/sys/module/nvmev/parameters/die_stats_reset"
 
 struct page_die_entry {
 	unsigned long long lpn;
@@ -87,6 +91,7 @@ struct workload_options {
 	unsigned long long target_bytes;
 	unsigned int window_tables;
 	unsigned int window_pages_per_table;
+	unsigned int window_passes_per_round;
 	unsigned int interleave_pages;
 	unsigned int interleave_reads;
 	unsigned int cold_concurrent_threads;
@@ -100,6 +105,14 @@ struct workload_options {
 	double normal_mean;
 	double normal_stddev;
 	bool direct_io;
+	unsigned long long refstyle_dummy_bytes;
+	const char *test_phase_path;
+};
+
+struct refstyle_dummy_state {
+	int fd;
+	void *buf;
+	unsigned long long bytes_per_insert;
 };
 
 struct table_file_state {
@@ -132,6 +145,7 @@ static const struct option long_opts[] = {
 	{"target-bytes", required_argument, NULL, 1003},
 	{"window-tables", required_argument, NULL, 1004},
 	{"window-pages-per-table", required_argument, NULL, 1005},
+	{"window-passes-per-round", required_argument, NULL, 1028},
 	{"interleave-pages", required_argument, NULL, 1006},
 	{"interleave-reads", required_argument, NULL, 1007},
 	{"cold-concurrent-threads", required_argument, NULL, 1008},
@@ -154,6 +168,7 @@ static const struct option long_opts[] = {
 	{"access-count-path", required_argument, NULL, 1024},
 	{"direct-io", no_argument, NULL, 1025},
 	{"fast-init-profile", no_argument, NULL, 1026},
+	{"refstyle-dummy-bytes", required_argument, NULL, 1027},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -243,6 +258,61 @@ static int ensure_directory(const char *path)
 	return -errno;
 }
 
+static int write_string_file(const char *path, const char *value)
+{
+	FILE *fp;
+
+	if (!path || !*path || !value)
+		return -EINVAL;
+
+	fp = fopen(path, "w");
+	if (!fp)
+		return -errno;
+	if (fputs(value, fp) == EOF) {
+		int err = errno ? -errno : -EIO;
+		fclose(fp);
+		return err;
+	}
+	if (fclose(fp) != 0)
+		return -errno;
+	return 0;
+}
+
+static int set_test_phase_state(const struct workload_options *opts,
+				bool enabled, const char *phase)
+{
+	const char *value = enabled ? "1" : "0";
+	int rc;
+
+	if (!opts || !opts->test_phase_path || !opts->test_phase_path[0])
+		return -EINVAL;
+
+	rc = write_string_file(opts->test_phase_path, value);
+	if (rc != 0) {
+		fprintf(stderr,
+			"[sqlite_init] failed to set test_phase '%s' for %s via %s (%d)\n",
+			enabled ? "on" : "off",
+			phase ? phase : "phase",
+			opts->test_phase_path,
+			rc);
+		return rc;
+	}
+
+	printf("[sqlite_init] test_phase=%s phase=%s path=%s\n",
+	       enabled ? "on" : "off",
+	       phase ? phase : "phase",
+	       opts->test_phase_path);
+	return 0;
+}
+
+static void reset_die_stats(void)
+{
+	int rc = write_string_file(DIE_STATS_RESET_PATH, "1");
+
+	if (rc != 0)
+		fprintf(stderr, "[die_test] failed to reset die_stats (%d)\n", rc);
+}
+
 static void build_table_name(char *buf, size_t len, unsigned int table_id)
 {
 	snprintf(buf, len, "tbl_%02u", table_id);
@@ -257,6 +327,69 @@ static void build_table_db_path(char *buf, size_t len,
 	snprintf(name, sizeof(name), "sqlite_tablefile_%s_tbl_%02u.db",
 		 opts->tag ? opts->tag : DEFAULT_TAG, table_id);
 	join_path(buf, len, TARGET_FOLDER, name);
+}
+
+static int open_refstyle_dummy_file(const struct workload_options *opts,
+				    struct refstyle_dummy_state *dummy)
+{
+	char path[PATH_MAX];
+
+	if (!dummy || opts->refstyle_dummy_bytes == 0)
+		return 0;
+
+	memset(dummy, 0, sizeof(*dummy));
+	dummy->fd = -1;
+	snprintf(path, sizeof(path), "%s/dummy_refstyle_%s.bin",
+		 TARGET_FOLDER, opts->tag ? opts->tag : DEFAULT_TAG);
+	dummy->fd = open(path, O_CREAT | O_TRUNC | O_RDWR | O_APPEND, 0666);
+	if (dummy->fd < 0)
+		return -errno;
+
+	dummy->bytes_per_insert = opts->refstyle_dummy_bytes;
+	if (posix_memalign(&dummy->buf, 4096, 4096) != 0) {
+		close(dummy->fd);
+		dummy->fd = -1;
+		return -ENOMEM;
+	}
+	memset(dummy->buf, 0x5A, 4096);
+	return 0;
+}
+
+static void close_refstyle_dummy_file(struct refstyle_dummy_state *dummy)
+{
+	if (!dummy)
+		return;
+	if (dummy->fd >= 0)
+		close(dummy->fd);
+	free(dummy->buf);
+	memset(dummy, 0, sizeof(*dummy));
+	dummy->fd = -1;
+}
+
+static int write_refstyle_dummy(struct refstyle_dummy_state *dummy)
+{
+	unsigned long long left;
+
+	if (!dummy || dummy->fd < 0 || dummy->bytes_per_insert == 0)
+		return 0;
+
+	left = dummy->bytes_per_insert;
+	while (left > 0) {
+		size_t chunk = left > 4096ULL ? 4096U : (size_t)left;
+		ssize_t ret = write(dummy->fd, dummy->buf, chunk);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		if (ret == 0)
+			return -EIO;
+		left -= (unsigned long long)ret;
+	}
+	if (fdatasync(dummy->fd) != 0)
+		return -errno;
+	return 0;
 }
 
 static void build_layout_path(char *buf, size_t len, const struct workload_options *opts)
@@ -712,7 +845,9 @@ static int get_db_page_count(sqlite3 *db, unsigned int *pages_out)
 }
 
 static int insert_rows_range(struct table_file_state *table, unsigned int start_row,
-			     unsigned int rows_this_batch)
+			     unsigned int rows_this_batch,
+			     const struct workload_options *opts,
+			     struct refstyle_dummy_state *dummy)
 {
 	char rstr1[STR1_LEN + 1];
 	char rstr2[STR2_LEN + 1];
@@ -741,12 +876,19 @@ static int insert_rows_range(struct table_file_state *table, unsigned int start_
 				table->table_id, row, sqlite3_errmsg(table->db));
 			return -EIO;
 		}
+		if (opts->refstyle_dummy_bytes > 0) {
+			rc = write_refstyle_dummy(dummy);
+			if (rc != 0)
+				return rc;
+		}
 	}
 	return 0;
 }
 
 static int insert_table_window_by_pages(struct table_file_state *table,
 					unsigned int page_budget,
+					const struct workload_options *opts,
+					struct refstyle_dummy_state *dummy,
 					unsigned int *rows_done_out,
 					unsigned int *pages_delta_out)
 {
@@ -761,29 +903,35 @@ static int insert_table_window_by_pages(struct table_file_state *table,
 	if (rc != 0)
 		return rc;
 
-	rc = sqlite3_exec(table->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
-	if (rc != SQLITE_OK)
-		return -EIO;
+	if (opts->refstyle_dummy_bytes == 0) {
+		rc = sqlite3_exec(table->db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+		if (rc != SQLITE_OK)
+			return -EIO;
+	}
 
 	while (table->rows_inserted + rows_done < table->total_rows) {
-		rc = insert_rows_range(table, table->rows_inserted + rows_done, 1);
+		rc = insert_rows_range(table, table->rows_inserted + rows_done, 1, opts, dummy);
 		if (rc != 0) {
-			sqlite3_exec(table->db, "ROLLBACK;", NULL, NULL, NULL);
+			if (opts->refstyle_dummy_bytes == 0)
+				sqlite3_exec(table->db, "ROLLBACK;", NULL, NULL, NULL);
 			return rc;
 		}
 		rows_done++;
 		rc = get_db_page_count(table->db, &current_pages);
 		if (rc != 0) {
-			sqlite3_exec(table->db, "ROLLBACK;", NULL, NULL, NULL);
+			if (opts->refstyle_dummy_bytes == 0)
+				sqlite3_exec(table->db, "ROLLBACK;", NULL, NULL, NULL);
 			return rc;
 		}
 		if (current_pages >= start_pages + page_budget)
 			break;
 	}
 
-	rc = sqlite3_exec(table->db, "COMMIT;", NULL, NULL, NULL);
-	if (rc != SQLITE_OK)
-		return -EIO;
+	if (opts->refstyle_dummy_bytes == 0) {
+		rc = sqlite3_exec(table->db, "COMMIT;", NULL, NULL, NULL);
+		if (rc != SQLITE_OK)
+			return -EIO;
+	}
 
 	*rows_done_out = rows_done;
 	*pages_delta_out = current_pages >= start_pages ? current_pages - start_pages : 0U;
@@ -1293,6 +1441,7 @@ static int run_init_mode(const struct workload_options *opts)
 	unsigned int active_count;
 	unsigned int round_size = 0;
 	unsigned int round_index = 0;
+	unsigned int round_pass = 0;
 	unsigned int window_cursor = 0;
 	unsigned int read_events = 0;
 	double estimated_pages_per_table = 0.0;
@@ -1300,12 +1449,14 @@ static int run_init_mode(const struct workload_options *opts)
 	double total_read_time = 0.0;
 	double cold_read_time = 0.0;
 	unsigned long long cold_rows = 0;
+	struct refstyle_dummy_state ref_dummy = { .fd = -1 };
 	char layout_path[PATH_MAX];
 	char row_stats_path[PATH_MAX];
 	char table_stats_path[PATH_MAX];
 	char table_tier_path[PATH_MAX];
 	char table_die_path[PATH_MAX];
 	int rc = 0;
+	bool test_phase_toggled = false;
 
 	rc = dataset_layout_build(opts, &layout);
 	if (rc != 0)
@@ -1351,32 +1502,60 @@ static int run_init_mode(const struct workload_options *opts)
 	rc = build_table_read_plan(&layout, opts, &read_plan);
 	if (rc != 0)
 		goto out;
+	rc = open_refstyle_dummy_file(opts, &ref_dummy);
+	if (rc != 0) {
+		fprintf(stderr, "Failed to open refstyle dummy file (%d)\n", rc);
+		goto out;
+	}
 
 	estimated_pages_per_table =
 		(double)layout.rows_per_table[0] * (double)ROW_EST_PAGES;
-	estimated_rounds = estimated_pages_per_table /
-		(double)(opts->window_pages_per_table ?
-			 opts->window_pages_per_table :
-			 DEFAULT_WINDOW_PAGES_PER_TABLE);
+	{
+		unsigned int pages_per_pass = opts->window_pages_per_table ?
+			opts->window_pages_per_table : DEFAULT_WINDOW_PAGES_PER_TABLE;
+		unsigned int passes_per_round = opts->window_passes_per_round ?
+			opts->window_passes_per_round : DEFAULT_WINDOW_PASSES_PER_ROUND;
+		double macro_pages_per_table = (double)pages_per_pass * (double)passes_per_round;
+		estimated_rounds = macro_pages_per_table > 0.0 ?
+			(estimated_pages_per_table / macro_pages_per_table) : 0.0;
+	}
 
 	printf("[sqlite_init] config tables=%u total_rows=%llu logical_row_bytes=%llu est_row_pages=%u interleave_pages=%u "
-	       "window_tables=%u window_pages_per_table=%u read_ops_per_event=%u direct_io=%u multifile=1\n",
+	       "window_tables=%u window_pages_per_table=%u window_passes_per_round=%u read_ops_per_event=%u direct_io=%u multifile=1\n",
 	       layout.table_count, total_rows, (unsigned long long)ROW_PAYLOAD_BYTES,
 	       ROW_EST_PAGES, opts->interleave_pages, opts->window_tables,
-	       opts->window_pages_per_table, opts->interleave_reads,
+	       opts->window_pages_per_table, opts->window_passes_per_round, opts->interleave_reads,
 	       opts->direct_io ? 1U : 0U);
 	printf("[sqlite_init] tablefile_pageflow=1 table_files=%u target=%llu rows_per_table=%u\n",
 	       layout.table_count,
 	       opts->target_bytes ? opts->target_bytes : DEFAULT_TARGET_BYTES,
 	       opts->rows_per_table);
+		printf("[sqlite_init] refstyle_dummy_bytes=%llu mode=%s\n",
+		       opts->refstyle_dummy_bytes,
+		       opts->refstyle_dummy_bytes ? "per-row-autocommit-dummy" : "window-transaction");
+		printf("[sqlite_init] test_phase_path=%s\n",
+		       opts->test_phase_path ? opts->test_phase_path : "(null)");
 	printf("[sqlite_init] estimated_pages_per_table=%.0f estimated_rounds=%.2f "
-	       "(one round = each active table grows by ~%u SQLite pages)\n",
+	       "(one macro round = each active table grows by ~%u SQLite pages via %u passes x %u pages)\n",
 	       estimated_pages_per_table, estimated_rounds,
+	       (opts->window_pages_per_table ? opts->window_pages_per_table :
+		DEFAULT_WINDOW_PAGES_PER_TABLE) *
+	       (opts->window_passes_per_round ? opts->window_passes_per_round :
+		DEFAULT_WINDOW_PASSES_PER_ROUND),
+	       opts->window_passes_per_round ? opts->window_passes_per_round :
+	       DEFAULT_WINDOW_PASSES_PER_ROUND,
 	       opts->window_pages_per_table ? opts->window_pages_per_table :
 	       DEFAULT_WINDOW_PAGES_PER_TABLE);
 
 	while (rows_written < total_rows) {
-		if (!round_order || round_index >= round_size) {
+		unsigned int passes_per_round = opts->window_passes_per_round ?
+			opts->window_passes_per_round : DEFAULT_WINDOW_PASSES_PER_ROUND;
+
+		if (round_order && round_index >= round_size) {
+			round_index = 0;
+			round_pass++;
+		}
+		if (!round_order || round_pass >= passes_per_round) {
 			free(round_order);
 			round_size = opts->window_tables ? opts->window_tables : DEFAULT_WINDOW_TABLES;
 			if (round_size > active_count)
@@ -1390,6 +1569,7 @@ static int run_init_mode(const struct workload_options *opts)
 				round_order[i] = active[(window_cursor + i) % active_count];
 			window_cursor = active_count ? ((window_cursor + round_size) % active_count) : 0;
 			round_index = 0;
+			round_pass = 0;
 		}
 
 		unsigned int table_id = round_order[round_index++];
@@ -1403,6 +1583,7 @@ static int run_init_mode(const struct workload_options *opts)
 		rc = insert_table_window_by_pages(table,
 						  opts->window_pages_per_table ? opts->window_pages_per_table :
 						  DEFAULT_WINDOW_PAGES_PER_TABLE,
+						  opts, &ref_dummy,
 						  &rows_step, &pages_step);
 		if (rc != 0)
 			goto out;
@@ -1436,9 +1617,20 @@ static int run_init_mode(const struct workload_options *opts)
 		}
 	}
 
+	rc = set_test_phase_state(opts, true, "cold-read-start");
+	if (rc != 0)
+		goto out;
+	test_phase_toggled = true;
+	reset_die_stats();
+
 	cold_read_time = run_cold_full_scan_concurrent(&layout, tables,
 						       opts->cold_concurrent_threads,
 						       read_plan, cold_per_table, &cold_rows);
+
+	rc = set_test_phase_state(opts, false, "cold-read-end");
+	if (rc != 0)
+		goto out;
+	test_phase_toggled = false;
 
 	rc = load_page_die_entries(opts->page_die_path, &page_die_entries, &page_die_count, &die_slots);
 	if (rc != 0)
@@ -1470,6 +1662,8 @@ static int run_init_mode(const struct workload_options *opts)
 	}
 
 out:
+	if (test_phase_toggled)
+		set_test_phase_state(opts, false, "cleanup");
 	free(page_die_entries);
 	free(read_plan);
 	free(round_order);
@@ -1477,6 +1671,7 @@ out:
 	free(table_latency);
 	free(cold_per_table);
 	free(table_read_ops);
+	close_refstyle_dummy_file(&ref_dummy);
 	if (tables) {
 		for (unsigned int i = 0; i < layout.table_count; ++i)
 			close_table_db(&tables[i]);
@@ -1495,6 +1690,7 @@ static void usage(const char *prog)
 		"  --target-bytes SIZE\n"
 		"  --window-tables N\n"
 		"  --window-pages-per-table N\n"
+		"  --window-passes-per-round N\n"
 		"  --interleave-pages N\n"
 		"  --interleave-reads N\n"
 		"  --cold-concurrent-threads N\n"
@@ -1511,6 +1707,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->target_bytes = DEFAULT_TARGET_BYTES;
 	opts->window_tables = DEFAULT_WINDOW_TABLES;
 	opts->window_pages_per_table = DEFAULT_WINDOW_PAGES_PER_TABLE;
+	opts->window_passes_per_round = DEFAULT_WINDOW_PASSES_PER_ROUND;
 	opts->interleave_pages = DEFAULT_INTERLEAVE_PAGES;
 	opts->interleave_reads = DEFAULT_INTERLEAVE_READS;
 	opts->cold_concurrent_threads = 1U;
@@ -1524,6 +1721,8 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->normal_mean = -1.0;
 	opts->normal_stddev = 8.0;
 	opts->direct_io = false;
+	opts->refstyle_dummy_bytes = 0;
+	opts->test_phase_path = DEFAULT_TEST_PHASE_PATH;
 
 	while ((c = getopt_long(argc, argv, "m:s:h", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -1553,6 +1752,11 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			break;
 		case 1005:
 			opts->window_pages_per_table = (unsigned int)strtoul(optarg, NULL, 10);
+			break;
+		case 1028:
+			opts->window_passes_per_round = (unsigned int)strtoul(optarg, NULL, 10);
+			if (opts->window_passes_per_round == 0)
+				opts->window_passes_per_round = DEFAULT_WINDOW_PASSES_PER_ROUND;
 			break;
 		case 1006:
 			opts->interleave_pages = (unsigned int)strtoul(optarg, NULL, 10);
@@ -1593,7 +1797,10 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		case 1019:
 		case 1020:
 		case 1021:
+			break;
 		case 1022:
+			opts->test_phase_path = optarg;
+			break;
 		case 1023:
 		case 1024:
 			break;
@@ -1601,6 +1808,11 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			opts->direct_io = true;
 			break;
 		case 1026:
+			break;
+		case 1027:
+			opts->refstyle_dummy_bytes = parse_size_arg(optarg);
+			if (opts->refstyle_dummy_bytes == 0)
+				opts->refstyle_dummy_bytes = DEFAULT_REFSTYLE_DUMMY_BYTES;
 			break;
 		case 'h':
 		default:
