@@ -6,7 +6,6 @@ import os
 import re
 import statistics
 import subprocess
-from bisect import bisect_left
 from collections import Counter
 
 
@@ -69,6 +68,48 @@ def load_plan(path):
     return plan
 
 
+def load_lpn_manifest(path):
+    rows = []
+    with open(path, "r", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            lpns = []
+            raw = row.get("lpns", "")
+            if raw:
+                lpns = [int(x) for x in raw.split(";") if x]
+            rows.append(
+                {
+                    "rank": int(row["rank"]),
+                    "path": row["path"],
+                    "size_bytes": int(row["size_bytes"]),
+                    "lpns": lpns,
+                }
+            )
+    return rows
+
+
+def manifest_has_lpns(rows):
+    for row in rows:
+        if row.get("lpns"):
+            return True
+    return False
+
+
+def write_lpn_manifest(path, rows):
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["rank", "path", "size_bytes", "lpns"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "rank": row["rank"],
+                    "path": row["path"],
+                    "size_bytes": row["size_bytes"],
+                    "lpns": ";".join(str(x) for x in row["lpns"]),
+                }
+            )
+
+
 def find_partition_offset_bytes(root):
     st = os.stat(root)
     sysfs = f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}/start"
@@ -109,7 +150,7 @@ def filefrag_extents(path):
             text=True,
         )
     except Exception:
-        return None
+        return None, "filefrag_exec_failed"
     extents = []
     for line in proc.stdout.splitlines():
         m = FILEFRAG_RE.match(line)
@@ -120,16 +161,18 @@ def filefrag_extents(path):
         physical_start = int(m.group(3))
         physical_end = int(m.group(4))
         extents.append((logical_start, logical_end, physical_start, physical_end))
-    return extents or None
+    if not extents:
+        return None, "filefrag_parse_empty"
+    return extents, None
 
 
 def lpns_for_file(path, part_offset_bytes, fs_block_bytes, host_page_bytes):
-    extents = filefrag_extents(path)
+    extents, err = filefrag_extents(path)
     if not extents:
-        return []
+        return [], err
     lpns = []
     for logical_start, logical_end, physical_start, physical_end in extents:
-        del logical_start, logical_end, physical_end
+        del logical_start, logical_end
         blocks = physical_end - physical_start + 1
         phys_start = part_offset_bytes + physical_start * fs_block_bytes
         phys_end = phys_start + blocks * fs_block_bytes - 1
@@ -137,7 +180,7 @@ def lpns_for_file(path, part_offset_bytes, fs_block_bytes, host_page_bytes):
         lpn_end = phys_end // host_page_bytes
         lpns.extend(range(lpn_start, lpn_end + 1))
     lpns = sorted(set(lpns))
-    return lpns
+    return lpns, None
 
 
 def percentile(vals, p):
@@ -212,6 +255,8 @@ def main():
     ap.add_argument("--out-csv", required=True)
     ap.add_argument("--out-summary", required=True)
     ap.add_argument("--plan-csv")
+    ap.add_argument("--lpn-manifest-in")
+    ap.add_argument("--lpn-manifest-out")
     ap.add_argument("--host-page-bytes", type=int, default=4096)
     args = ap.parse_args()
 
@@ -219,15 +264,45 @@ def main():
     die = load_page_die(args.page_die)
     acc = load_access_count(args.access_count)
     plan = load_plan(args.plan_csv)
-    files = list_files(args.root)
-    part_off = find_partition_offset_bytes(args.root)
-    fs_block = find_block_size(args.root)
+    diag = Counter()
+    file_rows = []
+    use_manifest = False
+    if args.lpn_manifest_in and os.path.exists(args.lpn_manifest_in):
+        file_rows = load_lpn_manifest(args.lpn_manifest_in)
+        diag["manifest_loaded"] = len(file_rows)
+        if file_rows and manifest_has_lpns(file_rows):
+            use_manifest = True
+        else:
+            diag["manifest_rebuild"] += 1
+            file_rows = []
+
+    if not use_manifest:
+        files = list_files(args.root)
+        diag["files_seen"] = len(files)
+        part_off = find_partition_offset_bytes(args.root)
+        fs_block = find_block_size(args.root)
+        for rank, path in enumerate(files):
+            lpns, err = lpns_for_file(path, part_off, fs_block, args.host_page_bytes)
+            if not lpns:
+                diag[err or "lpns_empty"] += 1
+                continue
+            file_rows.append(
+                {
+                    "rank": rank,
+                    "path": path,
+                    "size_bytes": os.path.getsize(path),
+                    "lpns": lpns,
+                }
+            )
+        diag["files_with_lpns"] = len(file_rows)
+        if args.lpn_manifest_out:
+            write_lpn_manifest(args.lpn_manifest_out, file_rows)
 
     rows = []
-    for rank, path in enumerate(files):
-        lpns = lpns_for_file(path, part_off, fs_block, args.host_page_bytes)
-        if not lpns:
-            continue
+    for file_row in file_rows:
+        rank = file_row["rank"]
+        path = file_row["path"]
+        lpns = file_row["lpns"]
         slc_lpn = 0
         qlc_lpn = 0
         qlc_fast_lpn = 0
@@ -262,7 +337,7 @@ def main():
         row = {
             "rank": rank,
             "path": path,
-            "size_bytes": os.path.getsize(path),
+            "size_bytes": file_row["size_bytes"],
             "planned_count": plan.get(path, 0),
             "lpn_count": total,
             "known_tier_lpn": known_tier,
@@ -317,6 +392,10 @@ def main():
         writer.writerows(rows)
 
     write_summary(args.out_summary, rows)
+    with open(args.out_summary, "a") as fh:
+        fh.write("[diagnostics]\n")
+        for k in sorted(diag):
+            fh.write(f"{k}={diag[k]}\n")
     print(f"[file-tier] files={len(rows)} root={args.root}")
     print(f"[file-tier] out_csv={args.out_csv}")
     print(f"[file-tier] out_summary={args.out_summary}")
