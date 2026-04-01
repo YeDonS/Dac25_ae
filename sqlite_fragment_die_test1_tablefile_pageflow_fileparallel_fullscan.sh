@@ -5,7 +5,7 @@ set -e
 #
 # Die-affinity test 1 (TABLEFILE PAGEFLOW + FILE-PARALLEL FULL SCAN):
 #   - one SQLite DB file per logical table
-#   - init appends each file in small page windows, rotating across files
+#   - init appends each file in row-sized steps, rotating across files
 #   - cold read runs one thread per table file within each batch
 #
 
@@ -20,13 +20,13 @@ VARIANTS="${VARIANTS:-die_base die_no1 die_no2 die_no3 die_all}"
 
 SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-8G}
 SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-80}
-SQLITE_ROWS_PER_TABLE=${SQLITE_ROWS_PER_TABLE:-6550}
+SQLITE_ROWS_PER_TABLE=${SQLITE_ROWS_PER_TABLE:-0}
 SQLITE_WINDOW_TABLES=${SQLITE_WINDOW_TABLES:-80}
 SQLITE_WINDOW_PAGES_PER_TABLE=${SQLITE_WINDOW_PAGES_PER_TABLE:-960}
 SQLITE_WINDOW_PASSES_PER_ROUND=${SQLITE_WINDOW_PASSES_PER_ROUND:-1}
 SQLITE_INTERLEAVE_PAGES=${SQLITE_INTERLEAVE_PAGES:-209715}
 SQLITE_INTERLEAVE_READS=${SQLITE_INTERLEAVE_READS:-1000}
-SQLITE_REFSTYLE_DUMMY_BYTES=${SQLITE_REFSTYLE_DUMMY_BYTES:-0}
+SQLITE_REFSTYLE_DUMMY_BYTES=${SQLITE_REFSTYLE_DUMMY_BYTES:-88K}
 SQLITE_DIE_AFFINITY_STATS_PATH=${SQLITE_DIE_AFFINITY_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/die_affinity_stats}
 SQLITE_LPN_DIE_CHANGE_STATS_PATH=${SQLITE_LPN_DIE_CHANGE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/lpn_die_change_stats}
 SQLITE_TEST_PHASE_PATH=${SQLITE_TEST_PHASE_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase}
@@ -136,9 +136,9 @@ run_one_test() {
     echo ""
     echo "================================================================"
     echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  tag=$tag"
-    echo "  per-table-db=ON  logical_row_bytes~16KB  est_row_pages~5  tables=$SQLITE_TABLE_COUNT  rows/tbl=$SQLITE_ROWS_PER_TABLE"
+    echo "  per-table-db=ON  logical_row_bytes~32KB  est_row_pages~8  tables=$SQLITE_TABLE_COUNT  rows/tbl_override=$SQLITE_ROWS_PER_TABLE"
     echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  cold_mode=$SQLITE_COLD_FULL_READ_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES"
-    echo "  note: cold scan uses one thread per table file within each batch"
+    echo "  note: dummy mode uses per-row round-robin across table files; cold scan uses one thread per table file within each batch"
     echo "================================================================"
 
     load_die_module "$variant"
