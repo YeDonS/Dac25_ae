@@ -84,6 +84,9 @@ validate_workload_outputs() {
     if [[ -f "${RESULT_FOLDER}/sqlite_table_tier_${tag}.csv" ]]; then
         ok=1
     fi
+    if [[ -f "${RESULT_FOLDER}/sqlite_page_tier_${tag}.csv" ]]; then
+        ok=1
+    fi
     if [[ -f "${RESULT_FOLDER}/sqlite_table_die_${tag}.csv" ]]; then
         ok=1
     fi
@@ -202,6 +205,7 @@ run_one_test() {
 
     cp "$init_txt" "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_tier_${tag}.csv "${out_dir}/" 2>/dev/null || true
+    cp "${RESULT_FOLDER}"/sqlite_page_tier_${tag}.csv  "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_die_${tag}.csv  "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_${tag}.csv      "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_row_${tag}.csv        "${out_dir}/" 2>/dev/null || true
