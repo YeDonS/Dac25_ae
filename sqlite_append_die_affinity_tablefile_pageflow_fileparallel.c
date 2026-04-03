@@ -64,6 +64,7 @@
 #define DEFAULT_TAG "default"
 #define DEFAULT_PAGE_TIER_PATH "/sys/kernel/debug/nvmev/ftl0/page_tier"
 #define DEFAULT_PAGE_DIE_PATH "/sys/kernel/debug/nvmev/ftl0/page_die"
+#define DEFAULT_PAGE_DIE_TRANSITION_PATH "/sys/kernel/debug/nvmev/ftl0/page_die_transition"
 #define DEFAULT_FTL_HOST_PAGE_BYTES 4096ULL
 #define DEFAULT_TEST_PHASE_PATH "/sys/kernel/debug/nvmev/ftl0/test_phase"
 #define DIE_STATS_RESET_PATH "/sys/module/nvmev/parameters/die_stats_reset"
@@ -78,6 +79,14 @@ struct page_tier_entry {
 	unsigned int in_slc;
 	unsigned int qlc_zone;
 	unsigned int qlc_zone_known;
+};
+
+struct page_die_transition_entry {
+	unsigned long long lpn;
+	int initial_die;
+	unsigned int current_die;
+	unsigned int die_changed;
+	unsigned int reason;
 };
 
 struct file_extent {
@@ -107,6 +116,7 @@ struct workload_options {
 	const char *tag;
 	const char *page_tier_path;
 	const char *page_die_path;
+	const char *page_die_transition_path;
 	unsigned int seed;
 	const char *dist_name;
 	double zipf_alpha;
@@ -162,6 +172,7 @@ static const struct option long_opts[] = {
 	{"cold-concurrent-threads", required_argument, NULL, 1008},
 	{"ftl-host-page-bytes", required_argument, NULL, 1009},
 	{"page-die-path", required_argument, NULL, 1010},
+	{"page-die-transition-path", required_argument, NULL, 1030},
 	{"distribution", required_argument, NULL, 1011},
 	{"seed", required_argument, NULL, 's'},
 	{"zipf-seed", required_argument, NULL, 1012},
@@ -483,11 +494,31 @@ static void build_page_tier_path(char *buf, size_t len, const struct workload_op
 	join_path(buf, len, RESULT_FOLDER, name);
 }
 
+static void build_page_die_transition_csv_path(char *buf, size_t len,
+					       const struct workload_options *opts)
+{
+	char name[128];
+
+	snprintf(name, sizeof(name), "sqlite_page_die_transition_%s.csv",
+		 opts->tag ? opts->tag : DEFAULT_TAG);
+	join_path(buf, len, RESULT_FOLDER, name);
+}
+
 static void build_table_die_path(char *buf, size_t len, const struct workload_options *opts)
 {
 	char name[128];
 
 	snprintf(name, sizeof(name), "sqlite_table_die_%s.csv",
+		 opts->tag ? opts->tag : DEFAULT_TAG);
+	join_path(buf, len, RESULT_FOLDER, name);
+}
+
+static void build_table_die_transition_csv_path(char *buf, size_t len,
+						const struct workload_options *opts)
+{
+	char name[128];
+
+	snprintf(name, sizeof(name), "sqlite_table_die_transition_%s.csv",
 		 opts->tag ? opts->tag : DEFAULT_TAG);
 	join_path(buf, len, RESULT_FOLDER, name);
 }
@@ -513,6 +544,18 @@ static int cmp_tier_entry_lpn(const void *a, const void *b)
 {
 	const struct page_tier_entry *ea = a;
 	const struct page_tier_entry *eb = b;
+
+	if (ea->lpn < eb->lpn)
+		return -1;
+	if (ea->lpn > eb->lpn)
+		return 1;
+	return 0;
+}
+
+static int cmp_transition_entry_lpn(const void *a, const void *b)
+{
+	const struct page_die_transition_entry *ea = a;
+	const struct page_die_transition_entry *eb = b;
 
 	if (ea->lpn < eb->lpn)
 		return -1;
@@ -611,8 +654,11 @@ static int load_page_die_entries(const char *path, struct page_die_entry **entri
 		return 0;
 
 	fp = fopen(path, "r");
-	if (!fp)
+	if (!fp) {
+		if (errno == ENOENT)
+			return 0;
 		return -errno;
+	}
 
 	while (fgets(line, sizeof(line), fp)) {
 		unsigned long long lpn;
@@ -667,8 +713,11 @@ static int load_page_tier_entries(const char *path, struct page_tier_entry **ent
 		return 0;
 
 	fp = fopen(path, "r");
-	if (!fp)
+	if (!fp) {
+		if (errno == ENOENT)
+			return 0;
 		return -errno;
+	}
 
 	while (fgets(line, sizeof(line), fp)) {
 		unsigned long long lpn;
@@ -727,6 +776,91 @@ static int load_page_tier_entries(const char *path, struct page_tier_entry **ent
 	return 0;
 }
 
+static int load_page_die_transition_entries(const char *path,
+					    struct page_die_transition_entry **entries_out,
+					    size_t *count_out,
+					    unsigned int *die_slots_out)
+{
+	FILE *fp;
+	struct page_die_transition_entry *entries = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+	unsigned int max_die = 0;
+	char line[160];
+
+	*entries_out = NULL;
+	*count_out = 0;
+	*die_slots_out = 0;
+	if (!path || !*path)
+		return 0;
+
+	fp = fopen(path, "r");
+	if (!fp) {
+		if (errno == ENOENT)
+			return 0;
+		return -errno;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		unsigned long long lpn;
+		int initial_die;
+		unsigned int current_die;
+		unsigned int die_changed;
+		unsigned int reason;
+
+		if (sscanf(line, "%llu %d %u %u %u",
+			   &lpn, &initial_die, &current_die, &die_changed, &reason) != 5)
+			continue;
+		if (count == cap) {
+			size_t new_cap = cap ? cap * 2 : 4096;
+			struct page_die_transition_entry *tmp =
+				realloc(entries, new_cap * sizeof(*entries));
+
+			if (!tmp) {
+				free(entries);
+				fclose(fp);
+				return -ENOMEM;
+			}
+			entries = tmp;
+			cap = new_cap;
+		}
+
+		entries[count].lpn = lpn;
+		entries[count].initial_die = initial_die;
+		entries[count].current_die = current_die;
+		entries[count].die_changed = die_changed ? 1U : 0U;
+		entries[count].reason = reason;
+		if (current_die > max_die)
+			max_die = current_die;
+		if (initial_die >= 0 && (unsigned int)initial_die > max_die)
+			max_die = (unsigned int)initial_die;
+		count++;
+	}
+
+	fclose(fp);
+	if (!count) {
+		free(entries);
+		return 0;
+	}
+
+	qsort(entries, count, sizeof(*entries), cmp_transition_entry_lpn);
+	{
+		size_t unique = 1;
+		for (size_t i = 1; i < count; ++i) {
+			if (entries[i].lpn != entries[unique - 1].lpn)
+				entries[unique++] = entries[i];
+			else
+				entries[unique - 1] = entries[i];
+		}
+		count = unique;
+	}
+
+	*entries_out = entries;
+	*count_out = count;
+	*die_slots_out = max_die + 1U;
+	return 0;
+}
+
 static bool lookup_page_die(const struct page_die_entry *entries, size_t count,
 			    unsigned long long lpn, unsigned int *die_out)
 {
@@ -768,6 +902,28 @@ static bool lookup_page_tier(const struct page_tier_entry *entries, size_t count
 		*qlc_zone_out = entries[lo].qlc_zone;
 	if (qlc_zone_known_out)
 		*qlc_zone_known_out = entries[lo].qlc_zone_known != 0U;
+	return true;
+}
+
+static bool lookup_page_die_transition(const struct page_die_transition_entry *entries,
+				       size_t count,
+				       unsigned long long lpn,
+				       struct page_die_transition_entry *entry_out)
+{
+	size_t lo = 0;
+	size_t hi = count;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (entries[mid].lpn < lpn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo >= count || entries[lo].lpn != lpn)
+		return false;
+	if (entry_out)
+		*entry_out = entries[lo];
 	return true;
 }
 
@@ -1575,6 +1731,28 @@ static const char *page_tier_label(unsigned int in_slc, bool qlc_zone_known,
 	return page_tier_zone_is_fast(qlc_zone) ? "qlc-fast" : "qlc-slow";
 }
 
+static const char *die_change_reason_label(unsigned int reason)
+{
+	switch (reason) {
+	case 0U:
+		return "none";
+	case 1U:
+		return "host-append";
+	case 2U:
+		return "host-overwrite";
+	case 3U:
+		return "gc";
+	case 4U:
+		return "slc-to-qlc";
+	case 5U:
+		return "repromote";
+	case 6U:
+		return "qlc-rebalance";
+	default:
+		return "unknown";
+	}
+}
+
 static int write_page_tier_csv(const char *path, const struct workload_options *opts,
 			       const struct dataset_layout *layout,
 			       const struct table_file_state *tables,
@@ -1621,6 +1799,148 @@ static int write_page_tier_csv(const char *path, const struct workload_options *
 				tier_known ? page_tier_label(in_slc, qlc_zone_known, qlc_zone) : "unknown");
 		}
 
+		free(lpns);
+	}
+
+	fclose(fp);
+	return 0;
+}
+
+static int write_page_die_transition_csv(const char *path,
+					 const struct workload_options *opts,
+					 const struct dataset_layout *layout,
+					 const struct table_file_state *tables,
+					 const struct page_die_transition_entry *transition_entries,
+					 size_t transition_count,
+					 const struct page_tier_entry *tier_entries,
+					 size_t tier_count)
+{
+	FILE *fp = fopen(path, "w");
+
+	if (!fp)
+		return -errno;
+
+	fprintf(fp,
+		"table_id,table_name,lpn,initial_die,initial_die_known,final_die,final_die_known,"
+		"die_changed,change_reason,change_reason_label,in_slc,qlc_zone,qlc_zone_known,tier_label\n");
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned long long *lpns = NULL;
+		size_t lpn_count = 0;
+		char table_name[64];
+		int rc;
+
+		rc = collect_file_lpns(tables[tbl].db_path, opts->ftl_host_page_bytes, &lpns, &lpn_count);
+		if (rc != 0)
+			continue;
+
+		build_table_name(table_name, sizeof(table_name), tbl);
+		for (size_t i = 0; i < lpn_count; ++i) {
+			struct page_die_transition_entry transition;
+			unsigned int in_slc = 0;
+			unsigned int qlc_zone = 0;
+			bool transition_known = false;
+			bool initial_known = false;
+			bool qlc_zone_known = false;
+			bool tier_known = false;
+
+			transition_known = lookup_page_die_transition(transition_entries, transition_count,
+							      lpns[i], &transition);
+			initial_known = transition_known && transition.initial_die >= 0;
+			tier_known = lookup_page_tier(tier_entries, tier_count, lpns[i],
+						      &in_slc, &qlc_zone, &qlc_zone_known);
+			fprintf(fp, "%u,%s,%llu,%d,%u,%d,%u,%u,%u,%s,%u,%d,%u,%s\n",
+				tbl, table_name, lpns[i],
+				initial_known ? transition.initial_die : -1,
+				initial_known ? 1U : 0U,
+				transition_known ? (int)transition.current_die : -1,
+				transition_known ? 1U : 0U,
+				transition_known ? transition.die_changed : 0U,
+				transition_known ? transition.reason : 0U,
+				transition_known ? die_change_reason_label(transition.reason) : "unknown",
+				tier_known ? in_slc : 0U,
+				(tier_known && !in_slc && qlc_zone_known) ? (int)qlc_zone : -1,
+				(tier_known && !in_slc && qlc_zone_known) ? 1U : 0U,
+				tier_known ? page_tier_label(in_slc, qlc_zone_known, qlc_zone) : "unknown");
+		}
+
+		free(lpns);
+	}
+
+	fclose(fp);
+	return 0;
+}
+
+static int write_table_die_transition_csv(const char *path,
+					  const struct workload_options *opts,
+					  const struct dataset_layout *layout,
+					  const struct table_file_state *tables,
+					  const struct page_die_transition_entry *transition_entries,
+					  size_t transition_count,
+					  unsigned int die_slots)
+{
+	FILE *fp = fopen(path, "w");
+
+	if (!fp)
+		return -errno;
+
+	fprintf(fp,
+		"table_id,table_name,initial_die,initial_die_known,final_die,page_count,page_ratio\n");
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned long long *lpns = NULL;
+		size_t lpn_count = 0;
+		unsigned long long *matrix = NULL;
+		unsigned int row_count = die_slots + 1U;
+		char table_name[64];
+		int rc;
+
+		rc = collect_file_lpns(tables[tbl].db_path, opts->ftl_host_page_bytes, &lpns, &lpn_count);
+		if (rc != 0)
+			continue;
+
+		matrix = calloc((size_t)row_count * die_slots, sizeof(*matrix));
+		if (!matrix) {
+			free(lpns);
+			fclose(fp);
+			return -ENOMEM;
+		}
+
+		for (size_t i = 0; i < lpn_count; ++i) {
+			struct page_die_transition_entry transition;
+			unsigned int initial_bucket;
+
+			if (!lookup_page_die_transition(transition_entries, transition_count,
+							lpns[i], &transition))
+				continue;
+			if (transition.current_die >= die_slots)
+				continue;
+
+			if (transition.initial_die >= 0 &&
+			    (unsigned int)transition.initial_die < die_slots)
+				initial_bucket = (unsigned int)transition.initial_die + 1U;
+			else
+				initial_bucket = 0U;
+
+			matrix[(size_t)initial_bucket * die_slots + transition.current_die]++;
+		}
+
+		build_table_name(table_name, sizeof(table_name), tbl);
+		for (unsigned int initial_bucket = 0; initial_bucket < row_count; ++initial_bucket) {
+			for (unsigned int final_die = 0; final_die < die_slots; ++final_die) {
+				unsigned long long count =
+					matrix[(size_t)initial_bucket * die_slots + final_die];
+				int initial_die = initial_bucket == 0U ?
+					-1 : (int)(initial_bucket - 1U);
+
+				if (count == 0)
+					continue;
+				fprintf(fp, "%u,%s,%d,%u,%u,%llu,%.9f\n",
+					tbl, table_name, initial_die,
+					initial_bucket == 0U ? 0U : 1U, final_die, count,
+					lpn_count ? (double)count / (double)lpn_count : 0.0);
+			}
+		}
+
+		free(matrix);
 		free(lpns);
 	}
 
@@ -1688,9 +2008,12 @@ static int run_init_mode(const struct workload_options *opts)
 	unsigned long long *table_read_ops = NULL;
 	struct page_die_entry *page_die_entries = NULL;
 	struct page_tier_entry *page_tier_entries = NULL;
+	struct page_die_transition_entry *page_die_transition_entries = NULL;
 	size_t page_die_count = 0;
 	size_t page_tier_count = 0;
+	size_t page_die_transition_count = 0;
 	unsigned int die_slots = 0;
+	unsigned int transition_die_slots = 0;
 	unsigned long long total_rows = 0;
 	unsigned long long rows_written = 0;
 	unsigned long long grown_pages_total = 0;
@@ -1714,6 +2037,8 @@ static int run_init_mode(const struct workload_options *opts)
 	char table_tier_path[PATH_MAX];
 	char table_die_path[PATH_MAX];
 	char page_tier_csv_path[PATH_MAX];
+	char page_die_transition_csv_path[PATH_MAX];
+	char table_die_transition_csv_path[PATH_MAX];
 	int rc = 0;
 	bool test_phase_toggled = false;
 
@@ -1758,6 +2083,10 @@ static int run_init_mode(const struct workload_options *opts)
 	build_table_tier_path(table_tier_path, sizeof(table_tier_path), opts);
 	build_table_die_path(table_die_path, sizeof(table_die_path), opts);
 	build_page_tier_path(page_tier_csv_path, sizeof(page_tier_csv_path), opts);
+	build_page_die_transition_csv_path(page_die_transition_csv_path,
+					    sizeof(page_die_transition_csv_path), opts);
+	build_table_die_transition_csv_path(table_die_transition_csv_path,
+					     sizeof(table_die_transition_csv_path), opts);
 
 	rc = build_table_read_plan(&layout, opts, &read_plan);
 	if (rc != 0)
@@ -1928,6 +2257,15 @@ static int run_init_mode(const struct workload_options *opts)
 	if (rc != 0)
 		fprintf(stderr, "warning: failed to load page_tier entries (%d)\n", rc);
 	rc = 0;
+	rc = load_page_die_transition_entries(opts->page_die_transition_path,
+					      &page_die_transition_entries,
+					      &page_die_transition_count,
+					      &transition_die_slots);
+	if (rc != 0)
+		fprintf(stderr, "warning: failed to load page_die_transition entries (%d)\n", rc);
+	rc = 0;
+	if (transition_die_slots > die_slots)
+		die_slots = transition_die_slots;
 
 	write_row_stats_csv(row_stats_path, &layout, tables);
 	write_table_stats_csv(table_stats_path, &layout, table_latency, table_read_ops);
@@ -1941,6 +2279,15 @@ static int run_init_mode(const struct workload_options *opts)
 	write_page_tier_csv(page_tier_csv_path, opts, &layout, tables,
 			   page_tier_entries, page_tier_count,
 			   page_die_entries, page_die_count);
+	if (page_die_transition_entries && die_slots > 0)
+		write_table_die_transition_csv(table_die_transition_csv_path, opts, &layout, tables,
+					       page_die_transition_entries,
+					       page_die_transition_count, die_slots);
+	if (page_die_transition_entries)
+		write_page_die_transition_csv(page_die_transition_csv_path, opts, &layout, tables,
+					      page_die_transition_entries,
+					      page_die_transition_count,
+					      page_tier_entries, page_tier_count);
 	report_cold_tail_latency(&layout, tables, table_latency, table_read_ops);
 	dataset_layout_to_file(layout_path, &layout);
 
@@ -1951,6 +2298,10 @@ static int run_init_mode(const struct workload_options *opts)
 				   (1024.0 * 1024.0 * 1024.0);
 		double dummy_gib = (double)ref_dummy.total_bytes_written /
 				   (1024.0 * 1024.0 * 1024.0);
+		const char *table_die_transition_out = page_die_transition_entries ?
+			table_die_transition_csv_path : "(unavailable)";
+		const char *page_die_transition_out = page_die_transition_entries ?
+			page_die_transition_csv_path : "(unavailable)";
 
 		printf("[sqlite_init] table_bytes=%.2fGiB dummy_bytes=%.2fGiB combined_write_bytes=%.2fGiB\n",
 		       table_gib, dummy_gib, table_gib + dummy_gib);
@@ -1958,9 +2309,11 @@ static int run_init_mode(const struct workload_options *opts)
 		       "cold_full_read=%.6fs cold_full_read_tp=%.2fMB/s cold_mode=full-scan-concurrent multifile=1\n",
 		       opts->tag, layout.table_count, layout.total_rows, read_events,
 		       total_read_time, cold_read_time, tp);
-		printf("[sqlite_init] row_stats=%s table_stats=%s table_tier=%s table_die=%s page_tier=%s\n",
+		printf("[sqlite_init] row_stats=%s table_stats=%s table_tier=%s table_die=%s "
+		       "page_tier=%s table_die_transition=%s page_die_transition=%s\n",
 		       row_stats_path, table_stats_path, table_tier_path, table_die_path,
-		       page_tier_csv_path);
+		       page_tier_csv_path, table_die_transition_out,
+		       page_die_transition_out);
 	}
 
 out:
@@ -1968,6 +2321,7 @@ out:
 		set_test_phase_state(opts, false, "cleanup");
 	free(page_die_entries);
 	free(page_tier_entries);
+	free(page_die_transition_entries);
 	free(read_plan);
 	free(round_order);
 	free(active);
@@ -1999,6 +2353,7 @@ static void usage(const char *prog)
 		"  --interleave-pages N\n"
 		"  --interleave-reads N\n"
 		"  --cold-concurrent-threads N\n"
+		"  --page-die-transition-path PATH\n"
 		"  --tag TAG\n", prog);
 }
 
@@ -2020,6 +2375,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->tag = DEFAULT_TAG;
 	opts->page_tier_path = DEFAULT_PAGE_TIER_PATH;
 	opts->page_die_path = DEFAULT_PAGE_DIE_PATH;
+	opts->page_die_transition_path = DEFAULT_PAGE_DIE_TRANSITION_PATH;
 	opts->seed = 42U;
 	opts->dist_name = "normal";
 	opts->zipf_alpha = 1.2;
@@ -2081,6 +2437,9 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			break;
 		case 1010:
 			opts->page_die_path = optarg;
+			break;
+		case 1030:
+			opts->page_die_transition_path = optarg;
 			break;
 		case 1011:
 			opts->dist_name = optarg;
