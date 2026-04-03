@@ -228,6 +228,7 @@ struct conv_ftl {
 	struct dentry *debug_access_inject; /* debugfs entry for counter injection */
 	struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
 	struct dentry *debug_page_die;     /* debugfs entry for mapped page die */
+	struct dentry *debug_page_die_transition; /* debugfs entry for initial/current die transitions */
 	struct dentry *debug_die_affinity_stats; /* debugfs entry for die-affinity counters */
 	struct dentry *debug_lpn_die_change_stats; /* debugfs entry for current die-change counts */
 	struct dentry *debug_test_phase;   /* debugfs entry for toggling test phase */

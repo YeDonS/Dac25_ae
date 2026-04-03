@@ -1036,6 +1036,57 @@ static const struct file_operations page_die_fops = {
 	.release = single_release,
 };
 
+static int page_die_transition_show(struct seq_file *m, void *v)
+{
+	struct conv_ftl *conv_ftl = m->private;
+	struct ssdparams *spp;
+	uint64_t lpn;
+
+	(void)v;
+
+	if (!conv_ftl || !conv_ftl->ssd)
+		return 0;
+
+	spp = &conv_ftl->ssd->sp;
+	for (lpn = 0; lpn < spp->tt_pgs; lpn++) {
+		struct ppa ppa = get_maptbl_ent(conv_ftl, lpn);
+		int initial_die = -1;
+		unsigned int current_die;
+		unsigned int changed = 0;
+		unsigned int reason = 0;
+
+		if (!mapped_ppa(&ppa) || !valid_ppa(conv_ftl, &ppa))
+			continue;
+
+		current_die = (unsigned int)encode_die(spp, &ppa);
+		if (conv_ftl->lpn_initial_die &&
+		    conv_ftl->lpn_initial_die[lpn] != U16_MAX)
+			initial_die = (int)conv_ftl->lpn_initial_die[lpn];
+		if (conv_ftl->lpn_die_changed)
+			changed = conv_ftl->lpn_die_changed[lpn] ? 1U : 0U;
+		if (conv_ftl->lpn_die_change_reason)
+			reason = (unsigned int)conv_ftl->lpn_die_change_reason[lpn];
+
+		seq_printf(m, "%llu %d %u %u %u\n", lpn, initial_die,
+			   current_die, changed, reason);
+	}
+
+	return 0;
+}
+
+static int page_die_transition_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, page_die_transition_show, inode->i_private);
+}
+
+static const struct file_operations page_die_transition_fops = {
+	.owner = THIS_MODULE,
+	.open = page_die_transition_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int lpn_die_change_stats_show(struct seq_file *m, void *v)
 {
 	struct conv_ftl *conv_ftl = m->private;
@@ -2448,6 +2499,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->debug_access_inject = NULL;
 	conv_ftl->debug_page_tier = NULL;
 	conv_ftl->debug_page_die = NULL;
+	conv_ftl->debug_page_die_transition = NULL;
 	conv_ftl->debug_die_affinity_stats = NULL;
 	conv_ftl->debug_lpn_die_change_stats = NULL;
 	conv_ftl->debug_test_phase = NULL;
@@ -2634,6 +2686,9 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		conv_ftl->debug_page_die =
 			debugfs_create_file("page_die", 0440, parent,
 					    conv_ftl, &page_die_fops);
+		conv_ftl->debug_page_die_transition =
+			debugfs_create_file("page_die_transition", 0440, parent,
+					    conv_ftl, &page_die_transition_fops);
 		conv_ftl->debug_die_affinity_stats =
 			debugfs_create_file("die_affinity_stats", 0440, parent,
 					    conv_ftl, &die_affinity_stats_fops);
@@ -2667,6 +2722,7 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		conv_ftl->debug_access_inject = NULL;
 		conv_ftl->debug_page_tier = NULL;
 		conv_ftl->debug_page_die = NULL;
+		conv_ftl->debug_page_die_transition = NULL;
 		conv_ftl->debug_die_affinity_stats = NULL;
 		conv_ftl->debug_lpn_die_change_stats = NULL;
 		conv_ftl->debug_test_phase = NULL;
@@ -2688,6 +2744,10 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		if (conv_ftl->debug_page_die) {
 			debugfs_remove(conv_ftl->debug_page_die);
 			conv_ftl->debug_page_die = NULL;
+		}
+		if (conv_ftl->debug_page_die_transition) {
+			debugfs_remove(conv_ftl->debug_page_die_transition);
+			conv_ftl->debug_page_die_transition = NULL;
 		}
 		if (conv_ftl->debug_die_affinity_stats) {
 			debugfs_remove(conv_ftl->debug_die_affinity_stats);
