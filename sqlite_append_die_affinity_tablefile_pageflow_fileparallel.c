@@ -20,12 +20,12 @@
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #if defined(__linux__)
+#include <sys/sysmacros.h>
 #include <linux/fiemap.h>
 #include <linux/fs.h>
 #endif
@@ -53,20 +53,22 @@
 #define ROW_PAYLOAD_BYTES 32768ULL
 #define ROW_EST_PAGES 8U
 #define LOGICAL_PAGE_BYTES 4096ULL
-#define DEFAULT_TARGET_BYTES (8ULL << 30)
+#define DEFAULT_TARGET_BYTES (10ULL << 30)
 #define DEFAULT_TABLE_COUNT 80U
 #define DEFAULT_WINDOW_TABLES 80U
 #define DEFAULT_WINDOW_PAGES_PER_TABLE 960U
 #define DEFAULT_WINDOW_PASSES_PER_ROUND 1U
 #define DEFAULT_INTERLEAVE_PAGES 209715U
 #define DEFAULT_INTERLEAVE_READS 1000U
-#define DEFAULT_REFSTYLE_DUMMY_BYTES (88ULL * 1024ULL)
+#define DEFAULT_REFSTYLE_DUMMY_BYTES (0ULL)
 #define DEFAULT_TAG "default"
 #define DEFAULT_PAGE_TIER_PATH "/sys/kernel/debug/nvmev/ftl0/page_tier"
 #define DEFAULT_PAGE_DIE_PATH "/sys/kernel/debug/nvmev/ftl0/page_die"
 #define DEFAULT_PAGE_DIE_TRANSITION_PATH "/sys/kernel/debug/nvmev/ftl0/page_die_transition"
 #define DEFAULT_FTL_HOST_PAGE_BYTES 4096ULL
 #define DEFAULT_TEST_PHASE_PATH "/sys/kernel/debug/nvmev/ftl0/test_phase"
+#define DEFAULT_GC_NAND_TIMING_PATH "/sys/module/nvmev/parameters/gc_nand_timing"
+#define DEFAULT_BG_NAND_STATS_PATH "/sys/module/nvmev/parameters/bg_nand_stats"
 #define DIE_STATS_RESET_PATH "/sys/module/nvmev/parameters/die_stats_reset"
 
 struct page_die_entry {
@@ -87,6 +89,16 @@ struct page_die_transition_entry {
 	unsigned int current_die;
 	unsigned int die_changed;
 	unsigned int reason;
+};
+
+struct bg_nand_stats {
+	unsigned long long busy_ns;
+	unsigned long long read_ns;
+	unsigned long long write_ns;
+	unsigned long long erase_ns;
+	unsigned long long read_ops;
+	unsigned long long write_ops;
+	unsigned long long erase_ops;
 };
 
 struct file_extent {
@@ -127,6 +139,9 @@ struct workload_options {
 	unsigned long long refstyle_dummy_bytes;
 	unsigned int align_pages;
 	const char *test_phase_path;
+	bool enable_gc_nand_timing;
+	const char *gc_nand_timing_path;
+	const char *bg_nand_stats_path;
 };
 
 struct refstyle_dummy_state {
@@ -192,6 +207,9 @@ static const struct option long_opts[] = {
 	{"fast-init-profile", no_argument, NULL, 1026},
 	{"refstyle-dummy-bytes", required_argument, NULL, 1027},
 	{"align-pages", required_argument, NULL, 1029},
+	{"enable-gc-nand-timing", no_argument, NULL, 1031},
+	{"gc-nand-timing-path", required_argument, NULL, 1032},
+	{"bg-nand-stats-path", required_argument, NULL, 1033},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -331,6 +349,35 @@ static int write_string_file(const char *path, const char *value)
 	if (fclose(fp) != 0)
 		return -errno;
 	return 0;
+}
+
+static void set_gc_nand_timing_state(const struct workload_options *opts,
+				     bool enabled, const char *phase)
+{
+	const char *value = enabled ? "1" : "0";
+	int rc;
+
+	if (!opts || !opts->enable_gc_nand_timing)
+		return;
+	if (!opts->gc_nand_timing_path || !opts->gc_nand_timing_path[0]) {
+		fprintf(stderr, "[sqlite_init] missing gc_nand_timing path for %s\n",
+			phase ? phase : "phase");
+		return;
+	}
+
+	rc = write_string_file(opts->gc_nand_timing_path, value);
+	if (rc != 0) {
+		fprintf(stderr,
+			"[sqlite_init] failed to set gc_nand_timing '%s' for %s via %s (%d)\n",
+			value, phase ? phase : "phase",
+			opts->gc_nand_timing_path, rc);
+		return;
+	}
+
+	printf("[sqlite_init] gc_nand_timing=%s phase=%s path=%s\n",
+	       enabled ? "on" : "off",
+	       phase ? phase : "phase",
+	       opts->gc_nand_timing_path);
 }
 
 static int set_test_phase_state(const struct workload_options *opts,
@@ -521,6 +568,116 @@ static void build_table_die_transition_csv_path(char *buf, size_t len,
 	snprintf(name, sizeof(name), "sqlite_table_die_transition_%s.csv",
 		 opts->tag ? opts->tag : DEFAULT_TAG);
 	join_path(buf, len, RESULT_FOLDER, name);
+}
+
+static void build_bg_nand_phase_path(char *buf, size_t len,
+				     const struct workload_options *opts)
+{
+	char name[128];
+
+	snprintf(name, sizeof(name), "sqlite_bg_nand_phase_%s.csv",
+		 opts->tag ? opts->tag : DEFAULT_TAG);
+	join_path(buf, len, RESULT_FOLDER, name);
+}
+
+static int load_bg_nand_stats(const char *path, struct bg_nand_stats *stats)
+{
+	FILE *fp;
+	char line[256];
+	struct bg_nand_stats tmp = {};
+
+	if (!stats)
+		return -EINVAL;
+	*stats = tmp;
+	if (!path || !path[0])
+		return -EINVAL;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -errno;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return ferror(fp) ? -errno : -EIO;
+	}
+	fclose(fp);
+
+	if (sscanf(line,
+		   "busy_ns=%llu read_ns=%llu write_ns=%llu erase_ns=%llu read_ops=%llu write_ops=%llu erase_ops=%llu",
+		   &tmp.busy_ns, &tmp.read_ns, &tmp.write_ns, &tmp.erase_ns,
+		   &tmp.read_ops, &tmp.write_ops, &tmp.erase_ops) != 7)
+		return -EINVAL;
+
+	*stats = tmp;
+	return 0;
+}
+
+static unsigned long long diff_u64(unsigned long long after,
+				   unsigned long long before)
+{
+	return after >= before ? after - before : 0ULL;
+}
+
+static void bg_nand_stats_delta(struct bg_nand_stats *dst,
+				const struct bg_nand_stats *after,
+				const struct bg_nand_stats *before)
+{
+	if (!dst || !after || !before)
+		return;
+
+	dst->busy_ns = diff_u64(after->busy_ns, before->busy_ns);
+	dst->read_ns = diff_u64(after->read_ns, before->read_ns);
+	dst->write_ns = diff_u64(after->write_ns, before->write_ns);
+	dst->erase_ns = diff_u64(after->erase_ns, before->erase_ns);
+	dst->read_ops = diff_u64(after->read_ops, before->read_ops);
+	dst->write_ops = diff_u64(after->write_ops, before->write_ops);
+	dst->erase_ops = diff_u64(after->erase_ops, before->erase_ops);
+}
+
+static void print_bg_nand_stats_line(const char *phase,
+				     const struct bg_nand_stats *stats)
+{
+	if (!stats)
+		return;
+
+	printf("[sqlite_init] bg_nand phase=%s busy_ns=%llu read_ns=%llu write_ns=%llu "
+	       "erase_ns=%llu read_ops=%llu write_ops=%llu erase_ops=%llu\n",
+	       phase ? phase : "unknown",
+	       stats->busy_ns, stats->read_ns, stats->write_ns, stats->erase_ns,
+	       stats->read_ops, stats->write_ops, stats->erase_ops);
+}
+
+static int write_bg_nand_phase_csv(const char *path,
+				   const struct bg_nand_stats *mixed_init,
+				   const struct bg_nand_stats *cold_read,
+				   const struct bg_nand_stats *total)
+{
+	FILE *fp = fopen(path, "w");
+
+	if (!fp)
+		return -errno;
+
+	fprintf(fp, "phase,busy_ns,read_ns,write_ns,erase_ns,read_ops,write_ops,erase_ops\n");
+	if (mixed_init) {
+		fprintf(fp, "mixed_init,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+			mixed_init->busy_ns, mixed_init->read_ns, mixed_init->write_ns,
+			mixed_init->erase_ns, mixed_init->read_ops, mixed_init->write_ops,
+			mixed_init->erase_ops);
+	}
+	if (cold_read) {
+		fprintf(fp, "cold_read,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+			cold_read->busy_ns, cold_read->read_ns, cold_read->write_ns,
+			cold_read->erase_ns, cold_read->read_ops, cold_read->write_ops,
+			cold_read->erase_ops);
+	}
+	if (total) {
+		fprintf(fp, "total,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+			total->busy_ns, total->read_ns, total->write_ns,
+			total->erase_ns, total->read_ops, total->write_ops,
+			total->erase_ops);
+	}
+
+	fclose(fp);
+	return 0;
 }
 
 static int cmp_u64(const void *a, const void *b)
@@ -2029,8 +2186,15 @@ static int run_init_mode(const struct workload_options *opts)
 	double estimated_rounds = 0.0;
 	double total_read_time = 0.0;
 	double cold_read_time = 0.0;
+	double mixed_init_total_time = 0.0;
 	unsigned long long cold_rows = 0;
 	struct refstyle_dummy_state ref_dummy = { .fd = -1 };
+	struct bg_nand_stats bg_nand_before = {};
+	struct bg_nand_stats bg_nand_after_mixed = {};
+	struct bg_nand_stats bg_nand_after_cold = {};
+	struct bg_nand_stats bg_nand_mixed = {};
+	struct bg_nand_stats bg_nand_cold = {};
+	struct bg_nand_stats bg_nand_total = {};
 	char layout_path[PATH_MAX];
 	char row_stats_path[PATH_MAX];
 	char table_stats_path[PATH_MAX];
@@ -2039,8 +2203,16 @@ static int run_init_mode(const struct workload_options *opts)
 	char page_tier_csv_path[PATH_MAX];
 	char page_die_transition_csv_path[PATH_MAX];
 	char table_die_transition_csv_path[PATH_MAX];
+	char bg_nand_phase_csv_path[PATH_MAX];
+	double init_start_time = monotonic_sec();
+	double init_total_time = 0.0;
 	int rc = 0;
 	bool test_phase_toggled = false;
+	bool gc_nand_timing_toggled = false;
+	bool bg_nand_before_valid = false;
+	bool bg_nand_mixed_valid = false;
+	bool bg_nand_cold_valid = false;
+	bool bg_nand_total_valid = false;
 
 	rc = dataset_layout_build(opts, &layout);
 	if (rc != 0)
@@ -2087,6 +2259,7 @@ static int run_init_mode(const struct workload_options *opts)
 					    sizeof(page_die_transition_csv_path), opts);
 	build_table_die_transition_csv_path(table_die_transition_csv_path,
 					     sizeof(table_die_transition_csv_path), opts);
+	build_bg_nand_phase_path(bg_nand_phase_csv_path, sizeof(bg_nand_phase_csv_path), opts);
 
 	rc = build_table_read_plan(&layout, opts, &read_plan);
 	if (rc != 0)
@@ -2102,6 +2275,10 @@ static int run_init_mode(const struct workload_options *opts)
 							 opts->ftl_host_page_bytes ?
 							 opts->ftl_host_page_bytes :
 							 DEFAULT_FTL_HOST_PAGE_BYTES);
+	if (load_bg_nand_stats(opts->bg_nand_stats_path, &bg_nand_before) == 0)
+		bg_nand_before_valid = true;
+	set_gc_nand_timing_state(opts, true, "mixed-init-start");
+	gc_nand_timing_toggled = opts->enable_gc_nand_timing;
 
 	estimated_pages_per_table =
 		(double)layout.rows_per_table[0] * (double)effective_pages_per_row;
@@ -2234,6 +2411,13 @@ static int run_init_mode(const struct workload_options *opts)
 		}
 	}
 
+	mixed_init_total_time = monotonic_sec() - init_start_time;
+	if (bg_nand_before_valid &&
+	    load_bg_nand_stats(opts->bg_nand_stats_path, &bg_nand_after_mixed) == 0) {
+		bg_nand_stats_delta(&bg_nand_mixed, &bg_nand_after_mixed, &bg_nand_before);
+		bg_nand_mixed_valid = true;
+	}
+
 	rc = set_test_phase_state(opts, true, "cold-read-start");
 	if (rc != 0)
 		goto out;
@@ -2248,6 +2432,18 @@ static int run_init_mode(const struct workload_options *opts)
 	if (rc != 0)
 		goto out;
 	test_phase_toggled = false;
+	if (bg_nand_before_valid &&
+	    load_bg_nand_stats(opts->bg_nand_stats_path, &bg_nand_after_cold) == 0) {
+		bg_nand_stats_delta(&bg_nand_total, &bg_nand_after_cold, &bg_nand_before);
+		bg_nand_total_valid = true;
+		bg_nand_stats_delta(&bg_nand_cold, &bg_nand_after_cold,
+				    bg_nand_mixed_valid ? &bg_nand_after_mixed : &bg_nand_before);
+		bg_nand_cold_valid = true;
+	}
+	if (gc_nand_timing_toggled) {
+		set_gc_nand_timing_state(opts, false, "cold-read-end");
+		gc_nand_timing_toggled = false;
+	}
 
 	rc = load_page_die_entries(opts->page_die_path, &page_die_entries, &page_die_count, &die_slots);
 	if (rc != 0)
@@ -2298,10 +2494,22 @@ static int run_init_mode(const struct workload_options *opts)
 				   (1024.0 * 1024.0 * 1024.0);
 		double dummy_gib = (double)ref_dummy.total_bytes_written /
 				   (1024.0 * 1024.0 * 1024.0);
+		double total_read_phase_time;
+		double mixed_init_write_time;
+		double estimated_write_time;
 		const char *table_die_transition_out = page_die_transition_entries ?
 			table_die_transition_csv_path : "(unavailable)";
 		const char *page_die_transition_out = page_die_transition_entries ?
 			page_die_transition_csv_path : "(unavailable)";
+
+		init_total_time = monotonic_sec() - init_start_time;
+		total_read_phase_time = total_read_time + cold_read_time;
+		mixed_init_write_time = mixed_init_total_time - total_read_time;
+		estimated_write_time = init_total_time - total_read_phase_time;
+		if (mixed_init_write_time < 0.0)
+			mixed_init_write_time = 0.0;
+		if (estimated_write_time < 0.0)
+			estimated_write_time = 0.0;
 
 		printf("[sqlite_init] table_bytes=%.2fGiB dummy_bytes=%.2fGiB combined_write_bytes=%.2fGiB\n",
 		       table_gib, dummy_gib, table_gib + dummy_gib);
@@ -2309,6 +2517,30 @@ static int run_init_mode(const struct workload_options *opts)
 		       "cold_full_read=%.6fs cold_full_read_tp=%.2fMB/s cold_mode=full-scan-concurrent multifile=1\n",
 		       opts->tag, layout.table_count, layout.total_rows, read_events,
 		       total_read_time, cold_read_time, tp);
+		printf("[sqlite_init] mixed_init_total_time=%.6fs interleaved_read_time=%.6fs "
+		       "estimated_mixed_init_write_time=%.6fs\n",
+		       mixed_init_total_time, total_read_time, mixed_init_write_time);
+		printf("[sqlite_init] end_to_end_total_time=%.6fs read_total_time=%.6fs "
+		       "estimated_end_to_end_write_time=%.6fs\n",
+		       init_total_time, total_read_phase_time, estimated_write_time);
+		if (bg_nand_mixed_valid)
+			print_bg_nand_stats_line("mixed_init", &bg_nand_mixed);
+		if (bg_nand_cold_valid)
+			print_bg_nand_stats_line("cold_read", &bg_nand_cold);
+		if (bg_nand_total_valid)
+			print_bg_nand_stats_line("total", &bg_nand_total);
+		if (bg_nand_mixed_valid || bg_nand_cold_valid || bg_nand_total_valid) {
+			if (write_bg_nand_phase_csv(bg_nand_phase_csv_path,
+						    bg_nand_mixed_valid ? &bg_nand_mixed : NULL,
+						    bg_nand_cold_valid ? &bg_nand_cold : NULL,
+						    bg_nand_total_valid ? &bg_nand_total : NULL) != 0) {
+				fprintf(stderr, "warning: failed to write bg_nand phase csv %s\n",
+					bg_nand_phase_csv_path);
+			} else {
+				printf("[sqlite_init] bg_nand_phase_csv=%s\n",
+				       bg_nand_phase_csv_path);
+			}
+		}
 		printf("[sqlite_init] row_stats=%s table_stats=%s table_tier=%s table_die=%s "
 		       "page_tier=%s table_die_transition=%s page_die_transition=%s\n",
 		       row_stats_path, table_stats_path, table_tier_path, table_die_path,
@@ -2319,6 +2551,8 @@ static int run_init_mode(const struct workload_options *opts)
 out:
 	if (test_phase_toggled)
 		set_test_phase_state(opts, false, "cleanup");
+	if (gc_nand_timing_toggled)
+		set_gc_nand_timing_state(opts, false, "cleanup");
 	free(page_die_entries);
 	free(page_tier_entries);
 	free(page_die_transition_entries);
@@ -2354,6 +2588,9 @@ static void usage(const char *prog)
 		"  --interleave-reads N\n"
 		"  --cold-concurrent-threads N\n"
 		"  --page-die-transition-path PATH\n"
+		"  --enable-gc-nand-timing\n"
+		"  --gc-nand-timing-path PATH\n"
+		"  --bg-nand-stats-path PATH\n"
 		"  --tag TAG\n", prog);
 }
 
@@ -2386,6 +2623,9 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->refstyle_dummy_bytes = DEFAULT_REFSTYLE_DUMMY_BYTES;
 	opts->align_pages = 0;
 	opts->test_phase_path = DEFAULT_TEST_PHASE_PATH;
+	opts->enable_gc_nand_timing = false;
+	opts->gc_nand_timing_path = DEFAULT_GC_NAND_TIMING_PATH;
+	opts->bg_nand_stats_path = DEFAULT_BG_NAND_STATS_PATH;
 
 	while ((c = getopt_long(argc, argv, "m:s:h", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -2488,6 +2728,15 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			break;
 		case 1029:
 			opts->align_pages = (unsigned int)strtoul(optarg, NULL, 10);
+			break;
+		case 1031:
+			opts->enable_gc_nand_timing = true;
+			break;
+		case 1032:
+			opts->gc_nand_timing_path = optarg;
+			break;
+		case 1033:
+			opts->bg_nand_stats_path = optarg;
 			break;
 		case 'h':
 		default:
