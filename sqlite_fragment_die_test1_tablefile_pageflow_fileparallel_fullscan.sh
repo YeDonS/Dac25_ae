@@ -18,7 +18,7 @@ source commonvariables.sh
 THREAD_COUNTS="${THREAD_COUNTS:-1 8}"
 VARIANTS="${VARIANTS:-die_base die_no1 die_no2 die_no3 die_all}"
 
-SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-8G}
+SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
 SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-80}
 SQLITE_ROWS_PER_TABLE=${SQLITE_ROWS_PER_TABLE:-0}
 SQLITE_WINDOW_TABLES=${SQLITE_WINDOW_TABLES:-80}
@@ -26,13 +26,16 @@ SQLITE_WINDOW_PAGES_PER_TABLE=${SQLITE_WINDOW_PAGES_PER_TABLE:-960}
 SQLITE_WINDOW_PASSES_PER_ROUND=${SQLITE_WINDOW_PASSES_PER_ROUND:-1}
 SQLITE_INTERLEAVE_PAGES=${SQLITE_INTERLEAVE_PAGES:-209715}
 SQLITE_INTERLEAVE_READS=${SQLITE_INTERLEAVE_READS:-1000}
-SQLITE_REFSTYLE_DUMMY_BYTES=${SQLITE_REFSTYLE_DUMMY_BYTES:-88K}
+SQLITE_REFSTYLE_DUMMY_BYTES=${SQLITE_REFSTYLE_DUMMY_BYTES:-0}
+SQLITE_ALIGN_PAGES=${SQLITE_ALIGN_PAGES:-0}
 SQLITE_DIE_AFFINITY_STATS_PATH=${SQLITE_DIE_AFFINITY_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/die_affinity_stats}
 SQLITE_LPN_DIE_CHANGE_STATS_PATH=${SQLITE_LPN_DIE_CHANGE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/lpn_die_change_stats}
 SQLITE_TEST_PHASE_PATH=${SQLITE_TEST_PHASE_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase}
 SQLITE_TEST_PHASE_STATS_PATH=${SQLITE_TEST_PHASE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase_stats}
 SQLITE_DIE_STATS_PATH=${SQLITE_DIE_STATS_PATH:-/sys/module/nvmev/parameters/die_stats}
 SQLITE_BG_NAND_STATS_PATH=${SQLITE_BG_NAND_STATS_PATH:-/sys/module/nvmev/parameters/bg_nand_stats}
+SQLITE_GC_NAND_TIMING=${SQLITE_GC_NAND_TIMING:-1}
+SQLITE_GC_NAND_TIMING_PATH=${SQLITE_GC_NAND_TIMING_PATH:-/sys/module/nvmev/parameters/gc_nand_timing}
 SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
 SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
 SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-0}
@@ -140,8 +143,9 @@ run_one_test() {
     echo "================================================================"
     echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  tag=$tag"
     echo "  per-table-db=ON  logical_row_bytes~32KB  est_row_pages~8  tables=$SQLITE_TABLE_COUNT  rows/tbl_override=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  cold_mode=$SQLITE_COLD_FULL_READ_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES"
-    echo "  note: dummy mode uses per-row round-robin across table files; cold scan uses one thread per table file within each batch"
+    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  cold_mode=$SQLITE_COLD_FULL_READ_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
+    echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH"
+    echo "  note: default run uses no dummy; cold scan uses one thread per table file within each batch"
     echo "================================================================"
 
     load_die_module "$variant"
@@ -162,8 +166,14 @@ run_one_test() {
     if [[ "$SQLITE_FAST_INIT_PROFILE" == "1" ]]; then
         extra_args+=(--fast-init-profile)
     fi
+    if [[ "$SQLITE_GC_NAND_TIMING" == "1" ]]; then
+        extra_args+=(--enable-gc-nand-timing)
+    fi
     if [[ "$SQLITE_REFSTYLE_DUMMY_BYTES" != "0" ]]; then
         extra_args+=(--refstyle-dummy-bytes "$SQLITE_REFSTYLE_DUMMY_BYTES")
+    fi
+    if [[ "$SQLITE_ALIGN_PAGES" != "0" ]]; then
+        extra_args+=(--align-pages "$SQLITE_ALIGN_PAGES")
     fi
 
     if ! numactl --cpubind=$NUMADOMAIN --membind=$NUMADOMAIN ./${EXE_NAME} --mode init \
@@ -188,6 +198,8 @@ run_one_test() {
         --cold-full-read-iters "$SQLITE_COLD_FULL_READ_ITERS" \
         --cold-concurrent-threads "$threads" \
         --test-phase-path "$SQLITE_TEST_PHASE_PATH" \
+        --gc-nand-timing-path "$SQLITE_GC_NAND_TIMING_PATH" \
+        --bg-nand-stats-path "$SQLITE_BG_NAND_STATS_PATH" \
         --strict-cold-per-select \
         "${extra_args[@]}" \
         --tag "$tag" \
@@ -209,6 +221,7 @@ run_one_test() {
     cp "${RESULT_FOLDER}"/sqlite_table_die_${tag}.csv  "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_${tag}.csv      "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_row_${tag}.csv        "${out_dir}/" 2>/dev/null || true
+    cp "${RESULT_FOLDER}"/sqlite_bg_nand_phase_${tag}.csv "${out_dir}/" 2>/dev/null || true
     if [[ -r "$SQLITE_DIE_AFFINITY_STATS_PATH" ]]; then
         {
             echo "[die_affinity_stats]"
