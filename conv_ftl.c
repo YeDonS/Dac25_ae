@@ -64,7 +64,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_ENABLE_READ_REPROMOTION 1
 #endif
 #ifndef NVMEV_ENABLE_INTERNAL_DIE_AFFINITY
-#define NVMEV_ENABLE_INTERNAL_DIE_AFFINITY 1
+#define NVMEV_ENABLE_INTERNAL_DIE_AFFINITY 0
 #endif
 #ifndef NVMEV_ENABLE_DIE_BATCHED_REPROMOTION
 #define NVMEV_ENABLE_DIE_BATCHED_REPROMOTION 1
@@ -782,6 +782,8 @@ static inline void internal_rr_note_write(struct conv_ftl *conv_ftl, bool qlc_de
 	}
 }
 
+static inline uint32_t encode_die(struct ssdparams *spp, const struct ppa *ppa);
+
 static inline uint32_t internal_fallback_die_for_ppa(struct conv_ftl *conv_ftl,
 						      const struct ppa *src_ppa,
 						      bool qlc_dest)
@@ -834,7 +836,6 @@ static inline bool qlc_zone_is_fast(uint8_t zone)
 /* 前向声明以避免隐式声明错误 */
 static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn);
 static noinline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa);
-static inline uint32_t encode_die(struct ssdparams *spp, const struct ppa *ppa);
 static inline bool mapped_ppa(struct ppa *ppa);
 static inline bool valid_ppa(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
