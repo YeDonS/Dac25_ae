@@ -834,6 +834,8 @@ static inline bool qlc_zone_is_fast(uint8_t zone)
 
 /* 前向声明以避免隐式声明错误 */
 static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn);
+static noinline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa);
+static inline uint32_t encode_die(struct ssdparams *spp, const struct ppa *ppa);
 static inline bool mapped_ppa(struct ppa *ppa);
 static inline bool valid_ppa(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
@@ -1191,9 +1193,10 @@ static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *pp
 static inline bool should_gc_high(struct conv_ftl *conv_ftl)
 {
 	struct line_pool_stats slc_stats, qlc_stats;
+	uint32_t total_free_lines;
 	collect_slc_stats(conv_ftl, &slc_stats);
 	collect_qlc_stats(conv_ftl, &qlc_stats);
-	uint32_t total_free_lines = slc_stats.free + qlc_stats.free;
+	total_free_lines = slc_stats.free + qlc_stats.free;
 	return total_free_lines <= conv_ftl->cp.gc_thres_lines_high;
 }
 static inline bool should_gc_slc_soft(struct conv_ftl *conv_ftl)
@@ -3724,6 +3727,15 @@ static inline struct line *get_line_DA(struct conv_ftl *conv_ftl, struct ppa *pp
 /* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
+	struct ssdparams *spp;
+	struct nand_block *blk;
+	struct nand_page *pg;
+	struct heat_tracking *ht;
+	uint64_t lpn = INVALID_LPN;
+	uint64_t read_cnt = 0;
+	bool in_slc;
+	bool invalidated = false;
+
     /* 1. 增加全局参数验证 */
     if (!conv_ftl || !ppa || !conv_ftl->ssd) {
         NVMEV_ERROR("[mark_page_invalid] Invalid parameters.\n");
@@ -3735,15 +3747,9 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
                    ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
         return;
     }
-    
-    struct ssdparams *spp = &conv_ftl->ssd->sp;
-    struct nand_block *blk;
-    struct nand_page *pg;
-	struct heat_tracking *ht = &conv_ftl->heat_track;
-	uint64_t lpn = INVALID_LPN;
-	uint64_t read_cnt = 0;
-	bool in_slc;
-	bool invalidated = false;
+
+	spp = &conv_ftl->ssd->sp;
+	ht = &conv_ftl->heat_track;
 
     /* 更新页和块的状态 (这部分不涉及共享数据结构，可以在锁外完成) */
     pg = get_pg(conv_ftl->ssd, ppa);
@@ -3914,21 +3920,26 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-    NVMEV_DEBUG("Entering mark_page_valid: ch=%d, lun=%d, blk=%d, pg=%d\n",
-                ppa ? ppa->g.ch : -1, ppa ? ppa->g.lun : -1, 
-                ppa ? ppa->g.blk : -1, ppa ? ppa->g.pg : -1);
-	/* 1. 增加全局参数验证 */
-    if (!conv_ftl || !ppa || !conv_ftl->ssd) {
-        NVMEV_ERROR("[mark_page_valid] Invalid parameters.\n");
-        return;
-    }
-    
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct heat_tracking *ht = &conv_ftl->heat_track;
+	struct ssdparams *spp;
+	struct heat_tracking *ht;
 	uint64_t lpn;
 	uint64_t read_cnt;
 	struct nand_block *blk;
 	struct nand_page *pg;
+	bool in_slc;
+	struct line *line;
+
+	NVMEV_DEBUG("Entering mark_page_valid: ch=%d, lun=%d, blk=%d, pg=%d\n",
+	            ppa ? ppa->g.ch : -1, ppa ? ppa->g.lun : -1,
+	            ppa ? ppa->g.blk : -1, ppa ? ppa->g.pg : -1);
+	/* 1. 增加全局参数验证 */
+	if (!conv_ftl || !ppa || !conv_ftl->ssd) {
+		NVMEV_ERROR("[mark_page_valid] Invalid parameters.\n");
+		return;
+	}
+
+	spp = &conv_ftl->ssd->sp;
+	ht = &conv_ftl->heat_track;
 	/* 2. 验证PPA有效性 */
     if (!valid_ppa(conv_ftl, ppa)) {
         NVMEV_ERROR("[mark_page_valid] Invalid PPA: ch=%d, lun=%d, blk=%d, pg=%d\n",
@@ -3968,7 +3979,7 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
     }
 
     /* 2. 根据介质类型，进入完全独立的原子操作块 */
-    bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
+    in_slc = is_slc_block(conv_ftl, ppa->g.blk);
     if (in_slc) {
         uint32_t die = encode_die(spp, ppa);
         struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
@@ -4008,7 +4019,7 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         }
 
         spin_lock(&conv_ftl->qlc_lock);
-        struct line *line = &lm->lines[idx];
+        line = &lm->lines[idx];
         if (line->vpc < conv_ftl->qlc_pgs_per_blk)
             line->vpc++;
         else
@@ -4279,36 +4290,44 @@ static bool select_victim_line(struct conv_ftl *conv_ftl, bool force, int target
 static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	bool in_slc = is_slc_block(conv_ftl, ppa->g.blk);
-	uint32_t die = encode_die(spp, ppa);
+	struct line_mgmt *lm;
+	struct line *line;
+	bool in_slc;
+	uint32_t die;
+	uint32_t start_blk;
+	uint32_t line_id;
+	uint32_t idx;
+
+	in_slc = is_slc_block(conv_ftl, ppa->g.blk);
+	die = encode_die(spp, ppa);
 
 	if (in_slc) {
-		struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
-		uint32_t line_id = line_from_blk(ppa->g.blk);
+		lm = get_slc_die_lm(conv_ftl, die);
+		line_id = line_from_blk(ppa->g.blk);
 
 		if (!lm || !lm->lines || line_id >= lm->tt_lines)
 			return;
 
 		spin_lock(&conv_ftl->slc_lock);
-		struct line *line = &lm->lines[line_id];
+		line = &lm->lines[line_id];
 		line->ipc = 0;
 		line->vpc = 0;
 		list_add_tail(&line->entry, &lm->free_line_list);
 		lm->free_line_cnt++;
 		spin_unlock(&conv_ftl->slc_lock);
 	} else {
-		uint32_t start_blk = conv_ftl->slc_blks_per_pl;
-		uint32_t line_id = line_from_blk(ppa->g.blk);
+		start_blk = conv_ftl->slc_blks_per_pl;
+		line_id = line_from_blk(ppa->g.blk);
 		if (ppa->g.blk < start_blk)
 			return;
-		uint32_t idx = line_id - start_blk;
-		struct line_mgmt *lm = get_qlc_die_lm(conv_ftl, die);
+		idx = line_id - start_blk;
+		lm = get_qlc_die_lm(conv_ftl, die);
 
 		if (!lm || !lm->lines || idx >= lm->tt_lines)
 			return;
 
 		spin_lock(&conv_ftl->qlc_lock);
-		struct line *line = &lm->lines[idx];
+		line = &lm->lines[idx];
 		line->ipc = 0;
 		line->vpc = 0;
 		list_add_tail(&line->entry, &lm->free_line_list);
