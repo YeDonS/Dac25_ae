@@ -130,8 +130,9 @@ struct conv_ftl {
 	struct write_pointer qlc_gc_wp;
 
 	uint32_t slc_gc_free_thres_high;
+	uint32_t slc_gc_free_thres_low;
 	uint32_t qlc_gc_free_thres_high;
-	uint32_t slc_target_watermark;        /* 迁移目标水位线（高水位触发后回落到此值） */
+	uint32_t slc_target_watermark;        /* 迁移目标剩余行数（触发后尽量回补到此值） */
 	uint32_t slc_repromote_guard_lines;   /* QLC->SLC 回迁的安全预留行数 */
 
 	/* 热数据跟踪和迁移管理 */
@@ -187,7 +188,7 @@ struct conv_ftl {
 	struct ppa repromote_ppas[REPROMOTE_QUEUE_SIZE];
 	uint32_t repromote_head;
 	uint32_t repromote_tail;
-	uint32_t repromote_die_cursor;    /* affinity variants: die-batched repromotion start die */
+	uint32_t repromote_die_cursor;    /* batched repromotion cursor (chain-first when enabled) */
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
@@ -201,6 +202,17 @@ struct conv_ftl {
 	uint16_t *lpn_initial_die;          /* first die ever assigned to this LPN */
 	uint8_t *lpn_die_changed;           /* current mapping differs from initial die */
 	uint8_t *lpn_die_change_reason;     /* reason for the current changed state */
+	uint32_t *lpn_chain_id;             /* inferred append-chain id per LPN */
+	uint8_t *chain_slc_next_die;        /* next SLC die for this chain's private RR */
+	uint8_t *chain_qlc_next_die;        /* next QLC die for this chain's private RR */
+	uint8_t *chain_slc_rr_pages;        /* pages already placed on current SLC die */
+	uint8_t *chain_qlc_rr_pages;        /* pages already placed on current QLC die */
+	uint32_t chain_capacity;            /* max number of chains tracked */
+	uint32_t next_chain_id;             /* next chain id to allocate */
+	uint32_t *blk_owner_chain;          /* dominant chain id per physical block */
+	uint16_t *blk_owner_pages;          /* pages in block that belong to dominant chain */
+	uint16_t *blk_valid_pages;          /* valid pages currently tracked in block */
+	uint16_t *blk_mixed_pages;          /* pages not belonging to dominant chain */
 	uint64_t lpn_initial_die_tracked;   /* LPNs that have ever been assigned an initial die */
 	uint64_t lpn_current_die_changed;   /* currently mapped LPNs whose die != initial die */
 	uint64_t lpn_changed_host_append;
@@ -209,6 +221,12 @@ struct conv_ftl {
 	uint64_t lpn_changed_slc_to_qlc;
 	uint64_t lpn_changed_repromote;
 	uint64_t lpn_changed_qlc_rebalance;
+	uint64_t chain_chunk_migration_attempts;
+	uint64_t chain_chunk_migration_pages;
+	uint64_t chain_block_migration_attempts;
+	uint64_t chain_block_migration_pages;
+	uint64_t chain_block_migration_skip_budget;
+	uint64_t chain_gc_to_qlc_pages;
 	bool test_phase_active;                 /* whether cold-test phase is active */
 	atomic64_t test_phase_read_reqs;        /* read requests observed during test phase */
 	atomic64_t test_phase_overwrite_reqs;   /* overwrite requests observed during test phase */
@@ -255,7 +273,7 @@ struct conv_ftl {
 	bool threads_should_stop;                /* 线程停止标志 */
 	
 	/* 水位线控制 - 基于剩余空间数量 */
-	uint32_t slc_high_watermark;             /* SLC 高水位线: 剩余空间低于此值时触发迁移 */
+	uint32_t slc_high_watermark;             /* SLC 迁移阈值: 剩余行数低于此值时触发迁移 */
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
