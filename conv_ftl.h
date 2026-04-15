@@ -207,6 +207,8 @@ struct conv_ftl {
 	uint8_t *chain_qlc_next_die;        /* next QLC die for this chain's private RR */
 	uint8_t *chain_slc_rr_pages;        /* pages already placed on current SLC die */
 	uint8_t *chain_qlc_rr_pages;        /* pages already placed on current QLC die */
+	uint32_t *chain_slc_page_count;     /* exact current SLC resident pages per chain */
+	uint64_t *chain_last_slc_touch;     /* last SLC touch time per chain */
 	uint32_t chain_capacity;            /* max number of chains tracked */
 	uint32_t next_chain_id;             /* next chain id to allocate */
 	uint32_t *blk_owner_chain;          /* dominant chain id per physical block */
