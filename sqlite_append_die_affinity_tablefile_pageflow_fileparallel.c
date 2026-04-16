@@ -64,16 +64,29 @@
 #define DEFAULT_TAG "default"
 #define DEFAULT_PAGE_TIER_PATH "/sys/kernel/debug/nvmev/ftl0/page_tier"
 #define DEFAULT_PAGE_DIE_PATH "/sys/kernel/debug/nvmev/ftl0/page_die"
+#define DEFAULT_PAGE_CHAIN_PATH "/sys/kernel/debug/nvmev/ftl0/page_chain"
 #define DEFAULT_PAGE_DIE_TRANSITION_PATH "/sys/kernel/debug/nvmev/ftl0/page_die_transition"
 #define DEFAULT_FTL_HOST_PAGE_BYTES 4096ULL
 #define DEFAULT_TEST_PHASE_PATH "/sys/kernel/debug/nvmev/ftl0/test_phase"
 #define DEFAULT_GC_NAND_TIMING_PATH "/sys/module/nvmev/parameters/gc_nand_timing"
 #define DEFAULT_BG_NAND_STATS_PATH "/sys/module/nvmev/parameters/bg_nand_stats"
+#define DEFAULT_COLD_EXTRA_APPEND_BYTES (0ULL)
 #define DIE_STATS_RESET_PATH "/sys/module/nvmev/parameters/die_stats_reset"
+
+enum cold_extra_mode {
+	COLD_EXTRA_MODE_OFF = 0,
+	COLD_EXTRA_MODE_SERIAL,
+	COLD_EXTRA_MODE_CONCURRENT,
+};
 
 struct page_die_entry {
 	unsigned long long lpn;
 	unsigned int die;
+};
+
+struct page_chain_entry {
+	unsigned long long lpn;
+	unsigned int chain_id;
 };
 
 struct page_tier_entry {
@@ -128,6 +141,7 @@ struct workload_options {
 	const char *tag;
 	const char *page_tier_path;
 	const char *page_die_path;
+	const char *page_chain_path;
 	const char *page_die_transition_path;
 	unsigned int seed;
 	const char *dist_name;
@@ -142,6 +156,8 @@ struct workload_options {
 	bool enable_gc_nand_timing;
 	const char *gc_nand_timing_path;
 	const char *bg_nand_stats_path;
+	unsigned long long cold_extra_append_bytes;
+	enum cold_extra_mode cold_extra_mode;
 };
 
 struct refstyle_dummy_state {
@@ -154,6 +170,8 @@ struct table_file_state {
 	unsigned int table_id;
 	unsigned int total_rows;
 	unsigned int rows_inserted;
+	int next_record_id;
+	int max_record_id_exclusive;
 	char db_path[PATH_MAX];
 	sqlite3 *db;
 	sqlite3_stmt *insert_stmt;
@@ -166,11 +184,26 @@ struct concurrent_read_ctx {
 	unsigned int thread_id;
 	unsigned int table_id;
 	const char *db_path;
-	unsigned int record_id_begin;
-	unsigned int record_id_end;
+	int record_id_begin;
+	int record_id_end;
 	unsigned int repeats;
 	double elapsed_sec;
 	unsigned long long rows_read;
+};
+
+struct append_phase_stats {
+	unsigned long long rows_written;
+	unsigned long long payload_bytes_written;
+	unsigned long long page_growth;
+	double elapsed_sec;
+	int rc;
+};
+
+struct append_phase_ctx {
+	const struct workload_options *opts;
+	struct table_file_state *tables;
+	struct refstyle_dummy_state *dummy;
+	struct append_phase_stats *stats;
 };
 
 static const struct option long_opts[] = {
@@ -187,6 +220,7 @@ static const struct option long_opts[] = {
 	{"cold-concurrent-threads", required_argument, NULL, 1008},
 	{"ftl-host-page-bytes", required_argument, NULL, 1009},
 	{"page-die-path", required_argument, NULL, 1010},
+	{"page-chain-path", required_argument, NULL, 1034},
 	{"page-die-transition-path", required_argument, NULL, 1030},
 	{"distribution", required_argument, NULL, 1011},
 	{"seed", required_argument, NULL, 's'},
@@ -210,6 +244,8 @@ static const struct option long_opts[] = {
 	{"enable-gc-nand-timing", no_argument, NULL, 1031},
 	{"gc-nand-timing-path", required_argument, NULL, 1032},
 	{"bg-nand-stats-path", required_argument, NULL, 1033},
+	{"cold-extra-append-bytes", required_argument, NULL, 1035},
+	{"cold-extra-mode", required_argument, NULL, 1036},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -268,6 +304,30 @@ static unsigned long long parse_size_arg(const char *arg)
 	if (v <= 0.0)
 		return 0;
 	return (unsigned long long)(v * (double)mult);
+}
+
+static enum cold_extra_mode parse_cold_extra_mode(const char *arg)
+{
+	if (!arg || !*arg || !strcasecmp(arg, "off") || !strcasecmp(arg, "none"))
+		return COLD_EXTRA_MODE_OFF;
+	if (!strcasecmp(arg, "serial"))
+		return COLD_EXTRA_MODE_SERIAL;
+	if (!strcasecmp(arg, "concurrent") || !strcasecmp(arg, "overlap"))
+		return COLD_EXTRA_MODE_CONCURRENT;
+	return COLD_EXTRA_MODE_OFF;
+}
+
+static const char *cold_extra_mode_label(enum cold_extra_mode mode)
+{
+	switch (mode) {
+	case COLD_EXTRA_MODE_SERIAL:
+		return "serial";
+	case COLD_EXTRA_MODE_CONCURRENT:
+		return "concurrent";
+	case COLD_EXTRA_MODE_OFF:
+	default:
+		return "off";
+	}
 }
 
 static void join_path(char *dst, size_t len, const char *dir, const char *leaf)
@@ -560,6 +620,25 @@ static void build_table_die_path(char *buf, size_t len, const struct workload_op
 	join_path(buf, len, RESULT_FOLDER, name);
 }
 
+static void build_table_chain_path(char *buf, size_t len, const struct workload_options *opts)
+{
+	char name[128];
+
+	snprintf(name, sizeof(name), "sqlite_table_chain_%s.csv",
+		 opts->tag ? opts->tag : DEFAULT_TAG);
+	join_path(buf, len, RESULT_FOLDER, name);
+}
+
+static void build_table_chain_die_path(char *buf, size_t len,
+				       const struct workload_options *opts)
+{
+	char name[128];
+
+	snprintf(name, sizeof(name), "sqlite_table_chain_die_%s.csv",
+		 opts->tag ? opts->tag : DEFAULT_TAG);
+	join_path(buf, len, RESULT_FOLDER, name);
+}
+
 static void build_table_die_transition_csv_path(char *buf, size_t len,
 						const struct workload_options *opts)
 {
@@ -733,6 +812,18 @@ static int cmp_page_die_entry(const void *a, const void *b)
 	return 0;
 }
 
+static int cmp_page_chain_entry(const void *a, const void *b)
+{
+	const struct page_chain_entry *ea = a;
+	const struct page_chain_entry *eb = b;
+
+	if (ea->lpn < eb->lpn)
+		return -1;
+	if (ea->lpn > eb->lpn)
+		return 1;
+	return 0;
+}
+
 static int dataset_layout_build(const struct workload_options *opts,
 				struct dataset_layout *layout)
 {
@@ -764,6 +855,21 @@ static int dataset_layout_build(const struct workload_options *opts,
 	layout->table_count = table_count;
 	layout->total_rows = (unsigned int)total_rows;
 	return 0;
+}
+
+static void dataset_layout_refresh(struct dataset_layout *layout)
+{
+	unsigned long long total_rows = 0;
+
+	if (!layout || !layout->rows_per_table || !layout->row_prefix)
+		return;
+
+	for (unsigned int i = 0; i < layout->table_count; ++i) {
+		layout->row_prefix[i] = (unsigned int)total_rows;
+		total_rows += layout->rows_per_table[i];
+	}
+	layout->row_prefix[layout->table_count] = (unsigned int)total_rows;
+	layout->total_rows = (unsigned int)total_rows;
 }
 
 static void dataset_layout_destroy(struct dataset_layout *layout)
@@ -852,6 +958,62 @@ static int load_page_die_entries(const char *path, struct page_die_entry **entri
 	*entries_out = entries;
 	*count_out = count;
 	*die_slots_out = max_die + 1U;
+	return 0;
+}
+
+static int load_page_chain_entries(const char *path, struct page_chain_entry **entries_out,
+				   size_t *count_out)
+{
+	FILE *fp;
+	struct page_chain_entry *entries = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+	char line[128];
+
+	*entries_out = NULL;
+	*count_out = 0;
+	if (!path || !*path)
+		return 0;
+
+	fp = fopen(path, "r");
+	if (!fp) {
+		if (errno == ENOENT)
+			return 0;
+		return -errno;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		unsigned long long lpn;
+		unsigned int chain_id;
+
+		if (sscanf(line, "%llu %u", &lpn, &chain_id) != 2)
+			continue;
+		if (count == cap) {
+			size_t new_cap = cap ? cap * 2 : 4096;
+			struct page_chain_entry *tmp = realloc(entries, new_cap * sizeof(*entries));
+
+			if (!tmp) {
+				free(entries);
+				fclose(fp);
+				return -ENOMEM;
+			}
+			entries = tmp;
+			cap = new_cap;
+		}
+		entries[count].lpn = lpn;
+		entries[count].chain_id = chain_id;
+		count++;
+	}
+
+	fclose(fp);
+	if (!count) {
+		free(entries);
+		return 0;
+	}
+
+	qsort(entries, count, sizeof(*entries), cmp_page_chain_entry);
+	*entries_out = entries;
+	*count_out = count;
 	return 0;
 }
 
@@ -1034,6 +1196,26 @@ static bool lookup_page_die(const struct page_die_entry *entries, size_t count,
 	if (lo >= count || entries[lo].lpn != lpn)
 		return false;
 	*die_out = entries[lo].die;
+	return true;
+}
+
+static bool lookup_page_chain(const struct page_chain_entry *entries, size_t count,
+			      unsigned long long lpn, unsigned int *chain_id_out)
+{
+	size_t lo = 0;
+	size_t hi = count;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (entries[mid].lpn < lpn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo >= count || entries[lo].lpn != lpn)
+		return false;
+	if (chain_id_out)
+		*chain_id_out = entries[lo].chain_id;
 	return true;
 }
 
@@ -1269,6 +1451,7 @@ static int open_table_db(struct table_file_state *table, const struct workload_o
 	rc = sqlite3_open(table->db_path, &table->db);
 	if (rc != SQLITE_OK)
 		return -EIO;
+	sqlite3_busy_timeout(table->db, 30000);
 
 	sqlite3_exec(table->db, "PRAGMA journal_mode = off;", NULL, NULL, NULL);
 	sqlite3_exec(table->db, "PRAGMA synchronous = on;", NULL, NULL, NULL);
@@ -1311,6 +1494,56 @@ static void close_table_db(struct table_file_state *table)
 	memset(table, 0, sizeof(*table));
 }
 
+static int ensure_table_row_capacity(struct table_file_state *table, unsigned int new_total_rows)
+{
+	unsigned long long *new_reads;
+	double *new_latency;
+
+	if (!table)
+		return -EINVAL;
+	if (new_total_rows <= table->total_rows)
+		return 0;
+
+	new_reads = realloc(table->row_reads,
+			    (size_t)new_total_rows * sizeof(*table->row_reads));
+	if (!new_reads)
+		return -ENOMEM;
+	new_latency = realloc(table->row_latency,
+			      (size_t)new_total_rows * sizeof(*table->row_latency));
+	if (!new_latency) {
+		table->row_reads = new_reads;
+		return -ENOMEM;
+	}
+
+	memset(new_reads + table->total_rows, 0,
+	       (size_t)(new_total_rows - table->total_rows) * sizeof(*new_reads));
+	memset(new_latency + table->total_rows, 0,
+	       (size_t)(new_total_rows - table->total_rows) * sizeof(*new_latency));
+	table->row_reads = new_reads;
+	table->row_latency = new_latency;
+	table->total_rows = new_total_rows;
+	return 0;
+}
+
+static int extend_tables_for_extra_rows(struct dataset_layout *layout,
+					struct table_file_state *tables,
+					unsigned int extra_rows_per_table)
+{
+	if (!layout || !tables || extra_rows_per_table == 0)
+		return 0;
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned int new_total_rows = tables[tbl].total_rows + extra_rows_per_table;
+		int rc = ensure_table_row_capacity(&tables[tbl], new_total_rows);
+
+		if (rc != 0)
+			return rc;
+		layout->rows_per_table[tbl] = new_total_rows;
+	}
+	dataset_layout_refresh(layout);
+	return 0;
+}
+
 static int get_db_page_count(sqlite3 *db, unsigned int *pages_out)
 {
 	sqlite3_stmt *stmt = NULL;
@@ -1338,7 +1571,7 @@ static int insert_rows_range(struct table_file_state *table, unsigned int start_
 	char rstr4[STR4_LEN + 1];
 
 	for (unsigned int row = start_row; row < start_row + rows_this_batch; ++row) {
-		int record_id = (int)(table->total_rows - 1U - row);
+		int record_id = table->next_record_id;
 		int rc;
 
 		random_string(rstr1, sizeof(rstr1));
@@ -1359,6 +1592,7 @@ static int insert_rows_range(struct table_file_state *table, unsigned int start_
 				table->table_id, row, sqlite3_errmsg(table->db));
 			return -EIO;
 		}
+		table->next_record_id--;
 	}
 	return 0;
 }
@@ -1437,6 +1671,88 @@ static int insert_table_window_by_pages(struct table_file_state *table,
 	*pages_delta_out = (current_pages >= start_pages ? current_pages - start_pages : 0U) +
 			   dummy_pages;
 	return 0;
+}
+
+static void *append_tables_round_robin_worker(void *arg)
+{
+	struct append_phase_ctx *ctx = arg;
+	struct append_phase_stats *stats;
+	const struct workload_options *opts;
+	struct table_file_state *tables;
+	struct refstyle_dummy_state *dummy;
+	unsigned int *active = NULL;
+	unsigned int active_count = 0;
+	unsigned int page_budget;
+	double start;
+
+	if (!ctx || !ctx->stats || !ctx->opts || !ctx->tables || !ctx->dummy)
+		return NULL;
+
+	stats = ctx->stats;
+	opts = ctx->opts;
+	tables = ctx->tables;
+	dummy = ctx->dummy;
+	page_budget = opts->window_pages_per_table ? opts->window_pages_per_table :
+		DEFAULT_WINDOW_PAGES_PER_TABLE;
+	active = calloc(opts->table_count ? opts->table_count : 1U, sizeof(*active));
+	if (!active) {
+		stats->rc = -ENOMEM;
+		return NULL;
+	}
+
+	for (unsigned int i = 0; i < opts->table_count; ++i)
+		active[active_count++] = i;
+
+	start = monotonic_sec();
+	while (active_count > 0) {
+		unsigned int next_active = 0;
+
+		for (unsigned int i = 0; i < active_count; ++i) {
+			unsigned int table_id = active[i];
+			struct table_file_state *table = &tables[table_id];
+			unsigned int rows_step = 0;
+			unsigned int pages_step = 0;
+			int rc;
+
+			if (table->rows_inserted >= table->total_rows)
+				continue;
+
+			rc = insert_table_window_by_pages(table, page_budget, opts, dummy,
+							  &rows_step, &pages_step);
+			if (rc != 0) {
+				stats->rc = rc;
+				free(active);
+				stats->elapsed_sec = monotonic_sec() - start;
+				return NULL;
+			}
+
+			table->rows_inserted += rows_step;
+			stats->rows_written += rows_step;
+			stats->payload_bytes_written += (unsigned long long)rows_step * ROW_PAYLOAD_BYTES;
+			stats->page_growth += pages_step;
+
+			if (table->rows_inserted < table->total_rows)
+				active[next_active++] = table_id;
+		}
+		active_count = next_active;
+	}
+
+	free(active);
+	stats->elapsed_sec = monotonic_sec() - start;
+	stats->rc = 0;
+	return NULL;
+}
+
+static unsigned int cold_extra_rows_per_table(const struct workload_options *opts,
+					      unsigned int table_count)
+{
+	unsigned long long per_table_bytes;
+
+	if (!opts || opts->cold_extra_append_bytes == 0 || table_count == 0)
+		return 0;
+	per_table_bytes = (opts->cold_extra_append_bytes + table_count - 1ULL) /
+			  (unsigned long long)table_count;
+	return ceil_div_u64_to_u32(per_table_bytes, ROW_PAYLOAD_BYTES);
 }
 
 static unsigned int pick_table(unsigned int table_count, const struct workload_options *opts,
@@ -1549,9 +1865,7 @@ static int run_read_event(unsigned int event_id,
 		if (reads == 0 || table->rows_inserted == 0)
 			continue;
 
-		lower_bound = (int)(table->total_rows - table->rows_inserted);
-		if (lower_bound < 0)
-			lower_bound = 0;
+		lower_bound = table->next_record_id + 1;
 		drop_file_cache(table->db_path);
 
 		for (unsigned int iter = 0; iter < reads; ++iter) {
@@ -1594,6 +1908,7 @@ static void *full_scan_worker(void *arg)
 		ctx->elapsed_sec = 0.0;
 		return NULL;
 	}
+	sqlite3_busy_timeout(db, 30000);
 
 	snprintf(sql, sizeof(sql),
 		 "SELECT str1,str2,str3,str4 FROM DB1 WHERE id >= ? AND id < ? ORDER BY id;");
@@ -1645,7 +1960,6 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 		return 0.0;
 	}
 
-	drop_page_cache();
 	wall_start = monotonic_sec();
 
 	for (unsigned int batch_begin = 0; batch_begin < layout->table_count; batch_begin += threads) {
@@ -1659,7 +1973,7 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 			if (tbl >= layout->table_count)
 				break;
 
-			row_count = layout->rows_per_table[tbl];
+			row_count = tables[tbl].rows_inserted;
 			reads = read_plan ? read_plan[tbl] : 1U;
 			if (row_count == 0 || reads == 0)
 				continue;
@@ -1668,12 +1982,12 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 			ctxs[launched].thread_id = launched;
 			ctxs[launched].table_id = tbl;
 			ctxs[launched].db_path = tables[tbl].db_path;
-			ctxs[launched].record_id_begin = 0;
-			ctxs[launched].record_id_end = row_count;
+			ctxs[launched].record_id_begin = tables[tbl].next_record_id + 1;
+			ctxs[launched].record_id_end = tables[tbl].max_record_id_exclusive;
 			ctxs[launched].repeats = reads;
 			ctxs[launched].elapsed_sec = 0.0;
 			ctxs[launched].rows_read = 0;
-			printf("[sqlite_cold_fileparallel] batch=%u table=%u thread=%u ids=[%u,%u) repeats=%u\n",
+			printf("[sqlite_cold_fileparallel] batch=%u table=%u thread=%u ids=[%d,%d) repeats=%u\n",
 			       batch_begin / threads, tbl, launched,
 			       ctxs[launched].record_id_begin,
 			       ctxs[launched].record_id_end,
@@ -1799,6 +2113,253 @@ static int write_table_die_csv(const char *path, const struct workload_options *
 		free(die_counts);
 		free(lpns);
 	}
+	fclose(fp);
+	return 0;
+}
+
+struct chain_bucket {
+	unsigned int chain_id;
+	unsigned long long count;
+	unsigned long long *die_counts;
+};
+
+static int cmp_chain_bucket_desc(const void *a, const void *b)
+{
+	const struct chain_bucket *ea = a;
+	const struct chain_bucket *eb = b;
+
+	if (ea->count < eb->count)
+		return 1;
+	if (ea->count > eb->count)
+		return -1;
+	if (ea->chain_id < eb->chain_id)
+		return -1;
+	if (ea->chain_id > eb->chain_id)
+		return 1;
+	return 0;
+}
+
+static unsigned long long file_identity_id(const char *path, unsigned int fallback_id)
+{
+	struct stat st;
+
+	if (path && stat(path, &st) == 0)
+		return (unsigned long long)st.st_ino;
+	return (unsigned long long)fallback_id;
+}
+
+static int write_table_chain_csv(const char *path, const struct workload_options *opts,
+				 const struct dataset_layout *layout,
+				 const struct table_file_state *tables,
+				 const struct page_chain_entry *page_chain_entries,
+				 size_t page_chain_count,
+				 const struct page_die_entry *page_die_entries,
+				 size_t page_die_count, unsigned int die_slots)
+{
+	FILE *fp = fopen(path, "w");
+
+	if (!fp)
+		return -errno;
+
+	fprintf(fp, "file_id,table_id,table_name,chain_id,lpn_count,lpn_ratio,distinct_die,"
+		"dominant_die,dominant_die_lpn,dominant_die_ratio\n");
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		struct chain_bucket *buckets = NULL;
+		size_t bucket_count = 0;
+		size_t bucket_cap = 0;
+		unsigned long long *lpns = NULL;
+		size_t lpn_count = 0;
+		unsigned long long file_id;
+		char table_name[64];
+		int rc;
+
+		rc = collect_file_lpns(tables[tbl].db_path, opts->ftl_host_page_bytes, &lpns, &lpn_count);
+		if (rc != 0)
+			continue;
+
+		for (size_t i = 0; i < lpn_count; ++i) {
+			unsigned int chain_id;
+			size_t pos;
+			unsigned int die = 0;
+			bool die_known;
+
+			if (!lookup_page_chain(page_chain_entries, page_chain_count, lpns[i], &chain_id))
+				continue;
+
+			for (pos = 0; pos < bucket_count; ++pos) {
+				if (buckets[pos].chain_id == chain_id)
+					break;
+			}
+			if (pos == bucket_count) {
+				struct chain_bucket *tmp;
+
+				if (bucket_count == bucket_cap) {
+					size_t new_cap = bucket_cap ? bucket_cap * 2 : 8;
+
+					tmp = realloc(buckets, new_cap * sizeof(*buckets));
+					if (!tmp) {
+						free(lpns);
+						fclose(fp);
+						return -ENOMEM;
+					}
+					buckets = tmp;
+					bucket_cap = new_cap;
+				}
+				buckets[pos].chain_id = chain_id;
+				buckets[pos].count = 0;
+				buckets[pos].die_counts = calloc(die_slots ? die_slots : 1U,
+							       sizeof(*buckets[pos].die_counts));
+				if (!buckets[pos].die_counts) {
+					for (size_t j = 0; j < bucket_count; ++j)
+						free(buckets[j].die_counts);
+					free(buckets);
+					free(lpns);
+					fclose(fp);
+					return -ENOMEM;
+				}
+				bucket_count++;
+			}
+
+			buckets[pos].count++;
+			die_known = lookup_page_die(page_die_entries, page_die_count, lpns[i], &die);
+			if (die_known && die < die_slots)
+				buckets[pos].die_counts[die]++;
+		}
+
+		qsort(buckets, bucket_count, sizeof(*buckets), cmp_chain_bucket_desc);
+		file_id = file_identity_id(tables[tbl].db_path, tbl);
+		build_table_name(table_name, sizeof(table_name), tbl);
+		for (size_t i = 0; i < bucket_count; ++i) {
+			unsigned int distinct_die = 0;
+			int dominant_die = -1;
+			unsigned long long dominant_lpn = 0;
+
+			for (unsigned int die = 0; die < die_slots; ++die) {
+				if (buckets[i].die_counts[die] == 0)
+					continue;
+				distinct_die++;
+				if (buckets[i].die_counts[die] > dominant_lpn) {
+					dominant_lpn = buckets[i].die_counts[die];
+					dominant_die = (int)die;
+				}
+			}
+
+			fprintf(fp, "%llu,%u,", file_id, tbl);
+			fprintf(fp, "%s,%u,%llu,%.9f,%u,%d,%llu,%.9f\n",
+				table_name, buckets[i].chain_id, buckets[i].count,
+				lpn_count ? (double)buckets[i].count / (double)lpn_count : 0.0,
+				distinct_die, dominant_die, dominant_lpn,
+				buckets[i].count ? (double)dominant_lpn / (double)buckets[i].count : 0.0);
+			free(buckets[i].die_counts);
+		}
+
+		free(buckets);
+		free(lpns);
+	}
+
+	fclose(fp);
+	return 0;
+}
+
+static int write_table_chain_die_csv(const char *path, const struct workload_options *opts,
+				     const struct dataset_layout *layout,
+				     const struct table_file_state *tables,
+				     const struct page_chain_entry *page_chain_entries,
+				     size_t page_chain_count,
+				     const struct page_die_entry *page_die_entries,
+				     size_t page_die_count, unsigned int die_slots)
+{
+	FILE *fp = fopen(path, "w");
+
+	if (!fp)
+		return -errno;
+
+	fprintf(fp, "file_id,table_id,table_name,chain_id,die,lpn_count,lpn_ratio_in_chain,"
+		"lpn_ratio_in_file\n");
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		struct chain_bucket *buckets = NULL;
+		size_t bucket_count = 0;
+		size_t bucket_cap = 0;
+		unsigned long long *lpns = NULL;
+		size_t lpn_count = 0;
+		unsigned long long file_id;
+		char table_name[64];
+		int rc;
+
+		rc = collect_file_lpns(tables[tbl].db_path, opts->ftl_host_page_bytes, &lpns, &lpn_count);
+		if (rc != 0)
+			continue;
+
+		for (size_t i = 0; i < lpn_count; ++i) {
+			unsigned int chain_id;
+			unsigned int die;
+			size_t pos;
+
+			if (!lookup_page_chain(page_chain_entries, page_chain_count, lpns[i], &chain_id))
+				continue;
+			if (!lookup_page_die(page_die_entries, page_die_count, lpns[i], &die) || die >= die_slots)
+				continue;
+
+			for (pos = 0; pos < bucket_count; ++pos) {
+				if (buckets[pos].chain_id == chain_id)
+					break;
+			}
+			if (pos == bucket_count) {
+				struct chain_bucket *tmp;
+
+				if (bucket_count == bucket_cap) {
+					size_t new_cap = bucket_cap ? bucket_cap * 2 : 8;
+
+					tmp = realloc(buckets, new_cap * sizeof(*buckets));
+					if (!tmp) {
+						free(lpns);
+						fclose(fp);
+						return -ENOMEM;
+					}
+					buckets = tmp;
+					bucket_cap = new_cap;
+				}
+				buckets[pos].chain_id = chain_id;
+				buckets[pos].count = 0;
+				buckets[pos].die_counts = calloc(die_slots ? die_slots : 1U,
+							       sizeof(*buckets[pos].die_counts));
+				if (!buckets[pos].die_counts) {
+					for (size_t j = 0; j < bucket_count; ++j)
+						free(buckets[j].die_counts);
+					free(buckets);
+					free(lpns);
+					fclose(fp);
+					return -ENOMEM;
+				}
+				bucket_count++;
+			}
+
+			buckets[pos].count++;
+			buckets[pos].die_counts[die]++;
+		}
+
+		qsort(buckets, bucket_count, sizeof(*buckets), cmp_chain_bucket_desc);
+		file_id = file_identity_id(tables[tbl].db_path, tbl);
+		build_table_name(table_name, sizeof(table_name), tbl);
+		for (size_t i = 0; i < bucket_count; ++i) {
+			for (unsigned int die = 0; die < die_slots; ++die) {
+				if (buckets[i].die_counts[die] == 0)
+					continue;
+				fprintf(fp, "%llu,%u,%s,%u,%u,%llu,%.9f,%.9f\n",
+					file_id, tbl, table_name, buckets[i].chain_id, die,
+					buckets[i].die_counts[die],
+					buckets[i].count ?
+						(double)buckets[i].die_counts[die] / (double)buckets[i].count : 0.0,
+					lpn_count ?
+						(double)buckets[i].die_counts[die] / (double)lpn_count : 0.0);
+			}
+			free(buckets[i].die_counts);
+		}
+
+		free(buckets);
+		free(lpns);
+	}
+
 	fclose(fp);
 	return 0;
 }
@@ -2164,9 +2725,11 @@ static int run_init_mode(const struct workload_options *opts)
 	double *cold_per_table = NULL;
 	unsigned long long *table_read_ops = NULL;
 	struct page_die_entry *page_die_entries = NULL;
+	struct page_chain_entry *page_chain_entries = NULL;
 	struct page_tier_entry *page_tier_entries = NULL;
 	struct page_die_transition_entry *page_die_transition_entries = NULL;
 	size_t page_die_count = 0;
+	size_t page_chain_count = 0;
 	size_t page_tier_count = 0;
 	size_t page_die_transition_count = 0;
 	unsigned int die_slots = 0;
@@ -2186,9 +2749,18 @@ static int run_init_mode(const struct workload_options *opts)
 	double estimated_rounds = 0.0;
 	double total_read_time = 0.0;
 	double cold_read_time = 0.0;
+	double cold_append_time = 0.0;
+	double cold_stage_total_time = 0.0;
 	double mixed_init_total_time = 0.0;
 	unsigned long long cold_rows = 0;
+	unsigned long long cold_extra_rows = 0;
+	unsigned long long cold_extra_payload_bytes = 0;
+	unsigned long long cold_extra_page_growth = 0;
+	unsigned int cold_extra_rows_each = 0;
 	struct refstyle_dummy_state ref_dummy = { .fd = -1 };
+	struct append_phase_stats cold_append_stats = {};
+	struct append_phase_ctx cold_append_ctx = {};
+	pthread_t cold_append_thread;
 	struct bg_nand_stats bg_nand_before = {};
 	struct bg_nand_stats bg_nand_after_mixed = {};
 	struct bg_nand_stats bg_nand_after_cold = {};
@@ -2200,6 +2772,8 @@ static int run_init_mode(const struct workload_options *opts)
 	char table_stats_path[PATH_MAX];
 	char table_tier_path[PATH_MAX];
 	char table_die_path[PATH_MAX];
+	char table_chain_path[PATH_MAX];
+	char table_chain_die_path[PATH_MAX];
 	char page_tier_csv_path[PATH_MAX];
 	char page_die_transition_csv_path[PATH_MAX];
 	char table_die_transition_csv_path[PATH_MAX];
@@ -2213,6 +2787,7 @@ static int run_init_mode(const struct workload_options *opts)
 	bool bg_nand_mixed_valid = false;
 	bool bg_nand_cold_valid = false;
 	bool bg_nand_total_valid = false;
+	bool cold_append_thread_started = false;
 
 	rc = dataset_layout_build(opts, &layout);
 	if (rc != 0)
@@ -2228,11 +2803,13 @@ static int run_init_mode(const struct workload_options *opts)
 		goto out;
 	}
 
-	for (unsigned int tbl = 0; tbl < layout.table_count; ++tbl) {
-		tables[tbl].table_id = tbl;
-		tables[tbl].total_rows = layout.rows_per_table[tbl];
-		tables[tbl].row_reads = calloc(tables[tbl].total_rows ? tables[tbl].total_rows : 1U,
-					       sizeof(unsigned long long));
+		for (unsigned int tbl = 0; tbl < layout.table_count; ++tbl) {
+			tables[tbl].table_id = tbl;
+			tables[tbl].total_rows = layout.rows_per_table[tbl];
+			tables[tbl].next_record_id = (int)layout.rows_per_table[tbl] - 1;
+			tables[tbl].max_record_id_exclusive = (int)layout.rows_per_table[tbl];
+			tables[tbl].row_reads = calloc(tables[tbl].total_rows ? tables[tbl].total_rows : 1U,
+						       sizeof(unsigned long long));
 		tables[tbl].row_latency = calloc(tables[tbl].total_rows ? tables[tbl].total_rows : 1U,
 					       sizeof(double));
 		if (!tables[tbl].row_reads || !tables[tbl].row_latency) {
@@ -2254,6 +2831,8 @@ static int run_init_mode(const struct workload_options *opts)
 	build_table_stats_path(table_stats_path, sizeof(table_stats_path), opts);
 	build_table_tier_path(table_tier_path, sizeof(table_tier_path), opts);
 	build_table_die_path(table_die_path, sizeof(table_die_path), opts);
+	build_table_chain_path(table_chain_path, sizeof(table_chain_path), opts);
+	build_table_chain_die_path(table_chain_die_path, sizeof(table_chain_die_path), opts);
 	build_page_tier_path(page_tier_csv_path, sizeof(page_tier_csv_path), opts);
 	build_page_die_transition_csv_path(page_die_transition_csv_path,
 					    sizeof(page_die_transition_csv_path), opts);
@@ -2418,15 +2997,66 @@ static int run_init_mode(const struct workload_options *opts)
 		bg_nand_mixed_valid = true;
 	}
 
+	cold_extra_rows_each = cold_extra_rows_per_table(opts, layout.table_count);
+	if (cold_extra_rows_each > 0 && opts->cold_extra_mode != COLD_EXTRA_MODE_OFF) {
+		rc = extend_tables_for_extra_rows(&layout, tables, cold_extra_rows_each);
+		if (rc != 0)
+			goto out;
+		printf("[sqlite_init] cold_extra_append mode=%s target_bytes=%llu rows_per_table=%u total_extra_rows=%u\n",
+		       cold_extra_mode_label(opts->cold_extra_mode),
+		       opts->cold_extra_append_bytes,
+		       cold_extra_rows_each,
+		       cold_extra_rows_each * layout.table_count);
+	}
+
 	rc = set_test_phase_state(opts, true, "cold-read-start");
 	if (rc != 0)
 		goto out;
 	test_phase_toggled = true;
 	reset_die_stats();
+	drop_page_cache();
+
+	cold_stage_total_time = monotonic_sec();
+	cold_append_ctx.opts = opts;
+	cold_append_ctx.tables = tables;
+	cold_append_ctx.dummy = &ref_dummy;
+	cold_append_ctx.stats = &cold_append_stats;
+	if (cold_extra_rows_each > 0 && opts->cold_extra_mode == COLD_EXTRA_MODE_SERIAL) {
+		append_tables_round_robin_worker(&cold_append_ctx);
+		if (cold_append_stats.rc != 0) {
+			rc = cold_append_stats.rc;
+			goto out;
+		}
+		cold_append_time = cold_append_stats.elapsed_sec;
+		cold_extra_rows = cold_append_stats.rows_written;
+		cold_extra_payload_bytes = cold_append_stats.payload_bytes_written;
+		cold_extra_page_growth = cold_append_stats.page_growth;
+	}
+	if (cold_extra_rows_each > 0 && opts->cold_extra_mode == COLD_EXTRA_MODE_CONCURRENT) {
+		if (pthread_create(&cold_append_thread, NULL, append_tables_round_robin_worker,
+				   &cold_append_ctx) != 0) {
+			rc = -errno;
+			goto out;
+		}
+		cold_append_thread_started = true;
+	}
 
 	cold_read_time = run_cold_full_scan_concurrent(&layout, tables,
 						       opts->cold_concurrent_threads,
 						       read_plan, cold_per_table, &cold_rows);
+	if (cold_append_thread_started) {
+		pthread_join(cold_append_thread, NULL);
+		cold_append_thread_started = false;
+		if (cold_append_stats.rc != 0) {
+			rc = cold_append_stats.rc;
+			goto out;
+		}
+		cold_append_time = cold_append_stats.elapsed_sec;
+		cold_extra_rows = cold_append_stats.rows_written;
+		cold_extra_payload_bytes = cold_append_stats.payload_bytes_written;
+		cold_extra_page_growth = cold_append_stats.page_growth;
+	}
+	cold_stage_total_time = monotonic_sec() - cold_stage_total_time;
 
 	rc = set_test_phase_state(opts, false, "cold-read-end");
 	if (rc != 0)
@@ -2448,6 +3078,10 @@ static int run_init_mode(const struct workload_options *opts)
 	rc = load_page_die_entries(opts->page_die_path, &page_die_entries, &page_die_count, &die_slots);
 	if (rc != 0)
 		fprintf(stderr, "warning: failed to load page_die entries (%d)\n", rc);
+	rc = 0;
+	rc = load_page_chain_entries(opts->page_chain_path, &page_chain_entries, &page_chain_count);
+	if (rc != 0)
+		fprintf(stderr, "warning: failed to load page_chain entries (%d)\n", rc);
 	rc = 0;
 	rc = load_page_tier_entries(opts->page_tier_path, &page_tier_entries, &page_tier_count);
 	if (rc != 0)
@@ -2471,6 +3105,15 @@ static int run_init_mode(const struct workload_options *opts)
 		write_table_tier_csv(table_tier_path, opts, &layout, tables,
 				     page_die_entries, page_die_count, die_slots,
 				     cold_per_table);
+	}
+	if (page_chain_entries && page_chain_count > 0) {
+		write_table_chain_csv(table_chain_path, opts, &layout, tables,
+				      page_chain_entries, page_chain_count,
+				      page_die_entries, page_die_count, die_slots);
+		if (page_die_entries && die_slots > 0)
+			write_table_chain_die_csv(table_chain_die_path, opts, &layout, tables,
+						 page_chain_entries, page_chain_count,
+						 page_die_entries, page_die_count, die_slots);
 	}
 	write_page_tier_csv(page_tier_csv_path, opts, &layout, tables,
 			   page_tier_entries, page_tier_count,
@@ -2497,13 +3140,18 @@ static int run_init_mode(const struct workload_options *opts)
 		double total_read_phase_time;
 		double mixed_init_write_time;
 		double estimated_write_time;
+		const char *table_chain_out = page_chain_entries ?
+			table_chain_path : "(unavailable)";
+		const char *table_chain_die_out = (page_chain_entries && page_die_entries && die_slots > 0) ?
+			table_chain_die_path : "(unavailable)";
 		const char *table_die_transition_out = page_die_transition_entries ?
 			table_die_transition_csv_path : "(unavailable)";
 		const char *page_die_transition_out = page_die_transition_entries ?
 			page_die_transition_csv_path : "(unavailable)";
+		const char *cold_mode = "full-scan-concurrent";
 
-		init_total_time = monotonic_sec() - init_start_time;
-		total_read_phase_time = total_read_time + cold_read_time;
+			init_total_time = monotonic_sec() - init_start_time;
+			total_read_phase_time = total_read_time + cold_read_time;
 		mixed_init_write_time = mixed_init_total_time - total_read_time;
 		estimated_write_time = init_total_time - total_read_phase_time;
 		if (mixed_init_write_time < 0.0)
@@ -2511,12 +3159,27 @@ static int run_init_mode(const struct workload_options *opts)
 		if (estimated_write_time < 0.0)
 			estimated_write_time = 0.0;
 
-		printf("[sqlite_init] table_bytes=%.2fGiB dummy_bytes=%.2fGiB combined_write_bytes=%.2fGiB\n",
-		       table_gib, dummy_gib, table_gib + dummy_gib);
-		printf("[sqlite_init] tag=%s tables=%u total_rows=%u read_events=%u interleaved_read_time=%.6fs "
-		       "cold_full_read=%.6fs cold_full_read_tp=%.2fMB/s cold_mode=full-scan-concurrent multifile=1\n",
-		       opts->tag, layout.table_count, layout.total_rows, read_events,
-		       total_read_time, cold_read_time, tp);
+			printf("[sqlite_init] table_bytes=%.2fGiB dummy_bytes=%.2fGiB combined_write_bytes=%.2fGiB\n",
+			       table_gib, dummy_gib, table_gib + dummy_gib);
+			if (opts->cold_extra_append_bytes > 0 && opts->cold_extra_mode != COLD_EXTRA_MODE_OFF) {
+				cold_mode = opts->cold_extra_mode == COLD_EXTRA_MODE_CONCURRENT ?
+					"full-scan-concurrent+append-concurrent" :
+					"append-serial+full-scan-concurrent";
+				printf("[sqlite_init] cold_extra_append mode=%s target_bytes=%llu actual_payload_bytes=%llu "
+				       "rows_written=%llu page_growth=%llu append_time=%.6fs stage_total=%.6fs\n",
+				       cold_extra_mode_label(opts->cold_extra_mode),
+				       opts->cold_extra_append_bytes,
+				       cold_extra_payload_bytes,
+				       cold_extra_rows,
+				       cold_extra_page_growth,
+				       cold_append_time,
+				       cold_stage_total_time > 0.0 ? cold_stage_total_time :
+				       cold_read_time + cold_append_time);
+			}
+			printf("[sqlite_init] tag=%s tables=%u total_rows=%u read_events=%u interleaved_read_time=%.6fs "
+			       "cold_full_read=%.6fs cold_full_read_tp=%.2fMB/s cold_mode=%s multifile=1\n",
+			       opts->tag, layout.table_count, layout.total_rows, read_events,
+			       total_read_time, cold_read_time, tp, cold_mode);
 		printf("[sqlite_init] mixed_init_total_time=%.6fs interleaved_read_time=%.6fs "
 		       "estimated_mixed_init_write_time=%.6fs\n",
 		       mixed_init_total_time, total_read_time, mixed_init_write_time);
@@ -2541,19 +3204,22 @@ static int run_init_mode(const struct workload_options *opts)
 				       bg_nand_phase_csv_path);
 			}
 		}
-		printf("[sqlite_init] row_stats=%s table_stats=%s table_tier=%s table_die=%s "
-		       "page_tier=%s table_die_transition=%s page_die_transition=%s\n",
-		       row_stats_path, table_stats_path, table_tier_path, table_die_path,
-		       page_tier_csv_path, table_die_transition_out,
-		       page_die_transition_out);
-	}
+			printf("[sqlite_init] row_stats=%s table_stats=%s table_tier=%s table_die=%s "
+			       "table_chain=%s table_chain_die=%s page_tier=%s table_die_transition=%s page_die_transition=%s\n",
+			       row_stats_path, table_stats_path, table_tier_path, table_die_path,
+			       table_chain_out, table_chain_die_out, page_tier_csv_path, table_die_transition_out,
+			       page_die_transition_out);
+		}
 
 out:
+	if (cold_append_thread_started)
+		pthread_join(cold_append_thread, NULL);
 	if (test_phase_toggled)
 		set_test_phase_state(opts, false, "cleanup");
 	if (gc_nand_timing_toggled)
 		set_gc_nand_timing_state(opts, false, "cleanup");
 	free(page_die_entries);
+	free(page_chain_entries);
 	free(page_tier_entries);
 	free(page_die_transition_entries);
 	free(read_plan);
@@ -2587,10 +3253,13 @@ static void usage(const char *prog)
 		"  --interleave-pages N\n"
 		"  --interleave-reads N\n"
 		"  --cold-concurrent-threads N\n"
+		"  --page-chain-path PATH\n"
 		"  --page-die-transition-path PATH\n"
 		"  --enable-gc-nand-timing\n"
 		"  --gc-nand-timing-path PATH\n"
 		"  --bg-nand-stats-path PATH\n"
+		"  --cold-extra-append-bytes SIZE\n"
+		"  --cold-extra-mode off|serial|concurrent\n"
 		"  --tag TAG\n", prog);
 }
 
@@ -2612,6 +3281,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->tag = DEFAULT_TAG;
 	opts->page_tier_path = DEFAULT_PAGE_TIER_PATH;
 	opts->page_die_path = DEFAULT_PAGE_DIE_PATH;
+	opts->page_chain_path = DEFAULT_PAGE_CHAIN_PATH;
 	opts->page_die_transition_path = DEFAULT_PAGE_DIE_TRANSITION_PATH;
 	opts->seed = 42U;
 	opts->dist_name = "normal";
@@ -2626,6 +3296,8 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->enable_gc_nand_timing = false;
 	opts->gc_nand_timing_path = DEFAULT_GC_NAND_TIMING_PATH;
 	opts->bg_nand_stats_path = DEFAULT_BG_NAND_STATS_PATH;
+	opts->cold_extra_append_bytes = DEFAULT_COLD_EXTRA_APPEND_BYTES;
+	opts->cold_extra_mode = COLD_EXTRA_MODE_OFF;
 
 	while ((c = getopt_long(argc, argv, "m:s:h", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -2675,11 +3347,14 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			if (opts->ftl_host_page_bytes == 0)
 				opts->ftl_host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
 			break;
-		case 1010:
-			opts->page_die_path = optarg;
-			break;
-		case 1030:
-			opts->page_die_transition_path = optarg;
+			case 1010:
+				opts->page_die_path = optarg;
+				break;
+			case 1034:
+				opts->page_chain_path = optarg;
+				break;
+			case 1030:
+				opts->page_die_transition_path = optarg;
 			break;
 		case 1011:
 			opts->dist_name = optarg;
@@ -2735,10 +3410,16 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		case 1032:
 			opts->gc_nand_timing_path = optarg;
 			break;
-		case 1033:
-			opts->bg_nand_stats_path = optarg;
-			break;
-		case 'h':
+			case 1033:
+				opts->bg_nand_stats_path = optarg;
+				break;
+			case 1035:
+				opts->cold_extra_append_bytes = parse_size_arg(optarg);
+				break;
+			case 1036:
+				opts->cold_extra_mode = parse_cold_extra_mode(optarg);
+				break;
+			case 'h':
 		default:
 			usage(argv[0]);
 			exit(EXIT_FAILURE);

@@ -202,20 +202,22 @@ struct conv_ftl {
 	uint16_t *lpn_initial_die;          /* first die ever assigned to this LPN */
 	uint8_t *lpn_die_changed;           /* current mapping differs from initial die */
 	uint8_t *lpn_die_change_reason;     /* reason for the current changed state */
-	uint32_t *lpn_chain_id;             /* inferred append-chain id per LPN */
-	uint8_t *chain_slc_next_die;        /* next SLC die for this chain's private RR */
-	uint8_t *chain_qlc_next_die;        /* next QLC die for this chain's private RR */
-	uint8_t *chain_slc_rr_pages;        /* pages already placed on current SLC die */
-	uint8_t *chain_qlc_rr_pages;        /* pages already placed on current QLC die */
-	uint32_t *chain_slc_page_count;     /* exact current SLC resident pages per chain */
-	uint64_t *chain_last_slc_touch;     /* last SLC touch time per chain */
-	uint32_t chain_capacity;            /* max number of chains tracked */
-	uint32_t next_chain_id;             /* next chain id to allocate */
-	uint32_t *blk_owner_chain;          /* dominant chain id per physical block */
-	uint16_t *blk_owner_pages;          /* pages in block that belong to dominant chain */
-	uint16_t *blk_valid_pages;          /* valid pages currently tracked in block */
-	uint16_t *blk_mixed_pages;          /* pages not belonging to dominant chain */
-	uint64_t lpn_initial_die_tracked;   /* LPNs that have ever been assigned an initial die */
+		uint32_t *lpn_chain_id;             /* inferred append-chain id per LPN */
+		uint8_t *chain_slc_next_die;        /* next SLC die for this chain's private RR */
+		uint8_t *chain_qlc_next_die;        /* next QLC die for this chain's private RR */
+		uint8_t *chain_slc_rr_pages;        /* pages already placed on current SLC die */
+		uint8_t *chain_qlc_rr_pages;        /* pages already placed on current QLC die */
+		uint32_t *chain_slc_page_count;     /* exact current SLC resident pages per chain */
+		uint64_t *chain_last_slc_touch;     /* last SLC touch time per chain */
+		struct write_pointer **chain_host_slc_wps; /* lazily allocated per-chain/per-die host SLC WPs */
+		uint32_t chain_capacity;            /* max number of chains tracked */
+		uint32_t next_chain_id;             /* next chain id to allocate */
+		uint32_t *blk_owner_chain;          /* dominant chain id per physical block */
+		uint16_t *blk_owner_pages;          /* pages in block that belong to dominant chain */
+		uint16_t *blk_valid_pages;          /* valid pages currently tracked in block */
+		uint16_t *blk_mixed_pages;          /* pages not belonging to dominant chain */
+		uint16_t *blk_active_wp_refs;       /* open host chain-private SLC writers per block */
+		uint64_t lpn_initial_die_tracked;   /* LPNs that have ever been assigned an initial die */
 	uint64_t lpn_current_die_changed;   /* currently mapped LPNs whose die != initial die */
 	uint64_t lpn_changed_host_append;
 	uint64_t lpn_changed_host_overwrite;
@@ -245,10 +247,11 @@ struct conv_ftl {
 	atomic_t slc_recover_lock;        /* 序列化 SLC 回收 */
 	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
-	struct dentry *debug_access_inject; /* debugfs entry for counter injection */
-	struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
-	struct dentry *debug_page_die;     /* debugfs entry for mapped page die */
-	struct dentry *debug_page_die_transition; /* debugfs entry for initial/current die transitions */
+		struct dentry *debug_access_inject; /* debugfs entry for counter injection */
+		struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
+		struct dentry *debug_page_die;     /* debugfs entry for mapped page die */
+		struct dentry *debug_page_chain;   /* debugfs entry for mapped page chain */
+		struct dentry *debug_page_die_transition; /* debugfs entry for initial/current die transitions */
 	struct dentry *debug_die_affinity_stats; /* debugfs entry for die-affinity counters */
 	struct dentry *debug_lpn_die_change_stats; /* debugfs entry for current die-change counts */
 	struct dentry *debug_test_phase;   /* debugfs entry for toggling test phase */

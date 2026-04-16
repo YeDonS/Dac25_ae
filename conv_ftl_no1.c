@@ -953,7 +953,11 @@ static int qlc_get_new_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zo
 static int qlc_get_new_gc_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zone_hint,
 			       struct ppa *ppa_out);
 static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
+static void advance_chain_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t chain_id,
+					    uint32_t die);
 static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
+static struct ppa get_new_chain_slc_page(struct conv_ftl *conv_ftl, uint32_t chain_id,
+					 uint32_t die);
 /* 新增：GC 专用 SLC 写指针函数声明（仅在本文件使用） */
 static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
@@ -980,6 +984,8 @@ static uint32_t migrate_chain_chunk_from_slc(struct conv_ftl *conv_ftl, struct p
 
 	blk = get_blk(conv_ftl->ssd, seed_ppa);
 	if (!blk)
+		return 0;
+	if (slc_block_has_active_writer(conv_ftl, seed_ppa))
 		return 0;
 	seed_lpn = get_rmap_ent(conv_ftl, seed_ppa);
 	if (seed_lpn == INVALID_LPN || seed_lpn >= conv_ftl->ssd->sp.tt_pgs ||
@@ -1059,6 +1065,8 @@ static uint32_t migrate_chain_block_from_slc(struct conv_ftl *conv_ftl, struct p
 		return 0;
 	if (!block_meta_high_purity(conv_ftl, seed_ppa, &owner_chain))
 		return 0;
+	if (slc_block_has_active_writer(conv_ftl, seed_ppa))
+		return 0;
 
 	blk = get_blk(conv_ftl->ssd, seed_ppa);
 	if (!blk)
@@ -1136,6 +1144,8 @@ static bool slc_chain_gc_should_migrate_to_qlc(struct conv_ftl *conv_ftl,
 		return false;
 	if (!block_meta_high_purity(conv_ftl, old_ppa, &owner_chain))
 		return false;
+	if (slc_block_has_active_writer(conv_ftl, old_ppa))
+		return false;
 	if (conv_ftl->lpn_chain_id[lpn] != owner_chain)
 		return false;
 
@@ -1200,11 +1210,13 @@ static bool chain_find_seed_block(struct conv_ftl *conv_ftl, uint32_t chain_id,
 				candidate_ppa.g.blk = blk;
 				candidate_ppa.g.pg = 0;
 				(*blocks_checked_out)++;
-				idx = block_meta_index(conv_ftl, &candidate_ppa);
-				if (idx == U64_MAX || idx >= conv_ftl->ssd->sp.tt_blks)
-					continue;
-				if (conv_ftl->blk_owner_chain[idx] != chain_id)
-					continue;
+					idx = block_meta_index(conv_ftl, &candidate_ppa);
+					if (idx == U64_MAX || idx >= conv_ftl->ssd->sp.tt_blks)
+						continue;
+					if (slc_block_has_active_writer(conv_ftl, &candidate_ppa))
+						continue;
+					if (conv_ftl->blk_owner_chain[idx] != chain_id)
+						continue;
 				if (!block_meta_high_purity(conv_ftl, &candidate_ppa, NULL))
 					continue;
 
@@ -1472,11 +1484,13 @@ static uint32_t migrate_some_cold_from_slc_cursor(struct conv_ftl *conv_ftl, uin
 			if (recent_write_guard(conv_ftl, lpn))
 				continue;
 
-			old_ppa = get_maptbl_ent(conv_ftl, lpn);
-			if (!(mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk))) {
-				slc_resident_untrack_page(conv_ftl, lpn);
-				continue;
-			}
+				old_ppa = get_maptbl_ent(conv_ftl, lpn);
+				if (!(mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk))) {
+					slc_resident_untrack_page(conv_ftl, lpn);
+					continue;
+				}
+				if (slc_block_has_active_writer(conv_ftl, &old_ppa))
+					continue;
 
 #if NVMEV_ENABLE_CHAIN_AGGREGATION
 			{
@@ -2132,6 +2146,47 @@ static const struct file_operations page_die_fops = {
 	.release = single_release,
 };
 
+static int page_chain_show(struct seq_file *m, void *v)
+{
+	struct conv_ftl *conv_ftl = m->private;
+	struct ssdparams *spp;
+	uint64_t lpn;
+
+	(void)v;
+
+	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->lpn_chain_id)
+		return 0;
+
+	spp = &conv_ftl->ssd->sp;
+	for (lpn = 0; lpn < spp->tt_pgs; lpn++) {
+		struct ppa ppa = get_maptbl_ent(conv_ftl, lpn);
+		uint32_t chain_id;
+
+		if (!mapped_ppa(&ppa) || !valid_ppa(conv_ftl, &ppa))
+			continue;
+		chain_id = conv_ftl->lpn_chain_id[lpn];
+		if (!chain_id_valid(conv_ftl, chain_id))
+			continue;
+
+		seq_printf(m, "%llu %u\n", lpn, chain_id);
+	}
+
+	return 0;
+}
+
+static int page_chain_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, page_chain_show, inode->i_private);
+}
+
+static const struct file_operations page_chain_fops = {
+	.owner = THIS_MODULE,
+	.open = page_chain_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int lpn_die_change_stats_show(struct seq_file *m, void *v)
 {
 	struct conv_ftl *conv_ftl = m->private;
@@ -2611,6 +2666,143 @@ static inline struct write_pointer *get_qlc_die_wp(struct conv_ftl *conv_ftl, ui
 	return &(*arr)[die % conv_ftl->die_count];
 }
 
+static inline uint64_t slc_block_index_for_die(struct conv_ftl *conv_ftl, uint32_t die,
+					       uint32_t blk)
+{
+	struct ppa ppa = { .ppa = 0 };
+	struct ssdparams *spp;
+	uint32_t ch, lun;
+
+	if (!conv_ftl || !conv_ftl->ssd)
+		return U64_MAX;
+
+	spp = &conv_ftl->ssd->sp;
+	decode_die(spp, die % (conv_ftl->die_count ? conv_ftl->die_count : 1), &ch, &lun);
+	ppa.g.ch = ch;
+	ppa.g.lun = lun;
+	ppa.g.pl = 0;
+	ppa.g.blk = blk;
+	ppa.g.pg = 0;
+	return block_meta_index(conv_ftl, &ppa);
+}
+
+static inline void slc_active_block_ref_change(struct conv_ftl *conv_ftl, uint32_t die,
+					       uint32_t blk, int delta)
+{
+	uint64_t idx;
+
+	if (!conv_ftl || !conv_ftl->blk_active_wp_refs || delta == 0)
+		return;
+
+	idx = slc_block_index_for_die(conv_ftl, die, blk);
+	if (idx == U64_MAX || idx >= conv_ftl->ssd->sp.tt_blks)
+		return;
+
+	if (delta > 0) {
+		uint32_t value = conv_ftl->blk_active_wp_refs[idx];
+		if (value < U16_MAX)
+			conv_ftl->blk_active_wp_refs[idx] = value + 1;
+		return;
+	}
+
+	if (conv_ftl->blk_active_wp_refs[idx] > 0)
+		conv_ftl->blk_active_wp_refs[idx]--;
+}
+
+static inline bool slc_block_has_active_writer(struct conv_ftl *conv_ftl, const struct ppa *ppa)
+{
+	uint64_t idx;
+
+	if (!conv_ftl || !ppa || !conv_ftl->blk_active_wp_refs)
+		return false;
+
+	idx = block_meta_index(conv_ftl, ppa);
+	if (idx == U64_MAX || idx >= conv_ftl->ssd->sp.tt_blks)
+		return false;
+	return conv_ftl->blk_active_wp_refs[idx] != 0;
+}
+
+static struct write_pointer *get_chain_host_slc_wp(struct conv_ftl *conv_ftl, uint32_t chain_id,
+						   uint32_t die, bool alloc)
+{
+	struct write_pointer *wps;
+
+	if (!chain_id_valid(conv_ftl, chain_id) || !conv_ftl->chain_host_slc_wps ||
+	    !conv_ftl->die_count)
+		return NULL;
+
+	wps = READ_ONCE(conv_ftl->chain_host_slc_wps[chain_id]);
+	if (!wps && alloc) {
+		struct write_pointer *new_wps;
+
+		new_wps = kcalloc(conv_ftl->die_count, sizeof(*new_wps), GFP_KERNEL);
+		if (!new_wps)
+			return NULL;
+
+		spin_lock(&conv_ftl->slc_lock);
+		if (!conv_ftl->chain_host_slc_wps[chain_id])
+			conv_ftl->chain_host_slc_wps[chain_id] = new_wps;
+		spin_unlock(&conv_ftl->slc_lock);
+
+		wps = READ_ONCE(conv_ftl->chain_host_slc_wps[chain_id]);
+		if (wps != new_wps)
+			kfree(new_wps);
+	}
+
+	if (!wps)
+		return NULL;
+	return &wps[die % conv_ftl->die_count];
+}
+
+static inline bool slc_wp_open_line_locked(struct conv_ftl *conv_ftl, struct line_mgmt *lm,
+					   struct write_pointer *wp, uint32_t die)
+{
+	struct line *curline;
+	struct ssdparams *spp;
+
+	if (!conv_ftl || !lm || !wp || !conv_ftl->ssd)
+		return false;
+
+	curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
+	if (!curline)
+		return false;
+
+	spp = &conv_ftl->ssd->sp;
+	list_del_init(&curline->entry);
+	lm->free_line_cnt--;
+	decode_die(spp, die, &wp->ch, &wp->lun);
+	wp->curline = curline;
+	wp->blk = curline->id;
+	wp->pg = 0;
+	wp->pl = 0;
+	slc_active_block_ref_change(conv_ftl, die, wp->blk, +1);
+	return true;
+}
+
+static inline void slc_wp_close_line_locked(struct conv_ftl *conv_ftl, struct line_mgmt *lm,
+					    struct write_pointer *wp, uint32_t die)
+{
+	struct ssdparams *spp;
+
+	if (!conv_ftl || !lm || !wp || !wp->curline || !conv_ftl->ssd)
+		return;
+
+	spp = &conv_ftl->ssd->sp;
+	slc_active_block_ref_change(conv_ftl, die, wp->blk, -1);
+	if (wp->curline->vpc == spp->pgs_per_lun_line) {
+		list_add_tail(&wp->curline->entry, &lm->full_line_list);
+		lm->full_line_cnt++;
+	} else {
+		pqueue_insert(lm->victim_line_pq, wp->curline);
+		lm->victim_line_cnt++;
+	}
+
+	wp->curline = NULL;
+	wp->blk = 0;
+	wp->pg = 0;
+	wp->pl = 0;
+}
+
 static inline void __maybe_unused qlc_wp_set_die_hint(struct conv_ftl *conv_ftl,
 						      struct write_pointer *wp,
 						      uint32_t ch, uint32_t lun)
@@ -3083,10 +3275,12 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->chain_qlc_rr_pages = vzalloc(sizeof(*conv_ftl->chain_qlc_rr_pages) * spp->tt_pgs);
 	conv_ftl->chain_slc_page_count = vzalloc(sizeof(*conv_ftl->chain_slc_page_count) * spp->tt_pgs);
 	conv_ftl->chain_last_slc_touch = vzalloc(sizeof(*conv_ftl->chain_last_slc_touch) * spp->tt_pgs);
+	conv_ftl->chain_host_slc_wps = vzalloc(sizeof(*conv_ftl->chain_host_slc_wps) * spp->tt_pgs);
 	conv_ftl->blk_owner_chain = vmalloc(sizeof(*conv_ftl->blk_owner_chain) * spp->tt_blks);
 	conv_ftl->blk_owner_pages = vzalloc(sizeof(*conv_ftl->blk_owner_pages) * spp->tt_blks);
 	conv_ftl->blk_valid_pages = vzalloc(sizeof(*conv_ftl->blk_valid_pages) * spp->tt_blks);
 	conv_ftl->blk_mixed_pages = vzalloc(sizeof(*conv_ftl->blk_mixed_pages) * spp->tt_blks);
+	conv_ftl->blk_active_wp_refs = vzalloc(sizeof(*conv_ftl->blk_active_wp_refs) * spp->tt_blks);
 #else
 	conv_ftl->lpn_chain_id = NULL;
 	conv_ftl->chain_slc_next_die = NULL;
@@ -3095,10 +3289,12 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->chain_qlc_rr_pages = NULL;
 	conv_ftl->chain_slc_page_count = NULL;
 	conv_ftl->chain_last_slc_touch = NULL;
+	conv_ftl->chain_host_slc_wps = NULL;
 	conv_ftl->blk_owner_chain = NULL;
 	conv_ftl->blk_owner_pages = NULL;
 	conv_ftl->blk_valid_pages = NULL;
 	conv_ftl->blk_mixed_pages = NULL;
+	conv_ftl->blk_active_wp_refs = NULL;
 #endif
 	if (!conv_ftl->lpn_initial_die || !conv_ftl->lpn_die_changed ||
 	    !conv_ftl->lpn_die_change_reason
@@ -3106,9 +3302,10 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	    || !conv_ftl->lpn_chain_id || !conv_ftl->chain_slc_next_die ||
 	    !conv_ftl->chain_qlc_next_die || !conv_ftl->chain_slc_rr_pages ||
 	    !conv_ftl->chain_qlc_rr_pages || !conv_ftl->chain_slc_page_count ||
-	    !conv_ftl->chain_last_slc_touch || !conv_ftl->blk_owner_chain ||
+	    !conv_ftl->chain_last_slc_touch || !conv_ftl->chain_host_slc_wps ||
+	    !conv_ftl->blk_owner_chain ||
 	    !conv_ftl->blk_owner_pages || !conv_ftl->blk_valid_pages ||
-	    !conv_ftl->blk_mixed_pages
+	    !conv_ftl->blk_mixed_pages || !conv_ftl->blk_active_wp_refs
 #endif
 	    ) {
 		NVMEV_ERROR("Failed to allocate LPN die-change tracking memory\n");
@@ -3132,16 +3329,20 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 			vfree(conv_ftl->chain_qlc_rr_pages);
 		if (conv_ftl->chain_slc_page_count)
 			vfree(conv_ftl->chain_slc_page_count);
-		if (conv_ftl->chain_last_slc_touch)
-			vfree(conv_ftl->chain_last_slc_touch);
-		if (conv_ftl->blk_owner_chain)
-			vfree(conv_ftl->blk_owner_chain);
-		if (conv_ftl->blk_owner_pages)
-			vfree(conv_ftl->blk_owner_pages);
-		if (conv_ftl->blk_valid_pages)
-			vfree(conv_ftl->blk_valid_pages);
-		if (conv_ftl->blk_mixed_pages)
-			vfree(conv_ftl->blk_mixed_pages);
+			if (conv_ftl->chain_last_slc_touch)
+				vfree(conv_ftl->chain_last_slc_touch);
+			if (conv_ftl->chain_host_slc_wps)
+				vfree(conv_ftl->chain_host_slc_wps);
+			if (conv_ftl->blk_owner_chain)
+				vfree(conv_ftl->blk_owner_chain);
+			if (conv_ftl->blk_owner_pages)
+				vfree(conv_ftl->blk_owner_pages);
+			if (conv_ftl->blk_valid_pages)
+				vfree(conv_ftl->blk_valid_pages);
+			if (conv_ftl->blk_mixed_pages)
+				vfree(conv_ftl->blk_mixed_pages);
+			if (conv_ftl->blk_active_wp_refs)
+				vfree(conv_ftl->blk_active_wp_refs);
 		conv_ftl->lpn_initial_die = NULL;
 		conv_ftl->lpn_die_changed = NULL;
 		conv_ftl->lpn_die_change_reason = NULL;
@@ -3150,15 +3351,17 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 		conv_ftl->chain_qlc_next_die = NULL;
 		conv_ftl->chain_slc_rr_pages = NULL;
 		conv_ftl->chain_qlc_rr_pages = NULL;
-		conv_ftl->chain_slc_page_count = NULL;
-		conv_ftl->chain_last_slc_touch = NULL;
-		conv_ftl->blk_owner_chain = NULL;
-		conv_ftl->blk_owner_pages = NULL;
-		conv_ftl->blk_valid_pages = NULL;
-		conv_ftl->blk_mixed_pages = NULL;
-		conv_ftl->maptbl_initialized = false;
-		return;
-	}
+			conv_ftl->chain_slc_page_count = NULL;
+			conv_ftl->chain_last_slc_touch = NULL;
+			conv_ftl->chain_host_slc_wps = NULL;
+			conv_ftl->blk_owner_chain = NULL;
+			conv_ftl->blk_owner_pages = NULL;
+			conv_ftl->blk_valid_pages = NULL;
+			conv_ftl->blk_mixed_pages = NULL;
+			conv_ftl->blk_active_wp_refs = NULL;
+			conv_ftl->maptbl_initialized = false;
+			return;
+		}
 
 	for (i = 0; i < spp->tt_pgs; i++) {
 		conv_ftl->maptbl[i].ppa = UNMAPPED_PPA;
@@ -3200,6 +3403,12 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 
 static void remove_maptbl(struct conv_ftl *conv_ftl)
 {
+	uint32_t chain_id;
+
+	if (conv_ftl->chain_host_slc_wps) {
+		for (chain_id = 0; chain_id < conv_ftl->next_chain_id; chain_id++)
+			kfree(conv_ftl->chain_host_slc_wps[chain_id]);
+	}
 	vfree(conv_ftl->maptbl);
 	vfree(conv_ftl->lpn_initial_die);
 	vfree(conv_ftl->lpn_die_changed);
@@ -3211,10 +3420,12 @@ static void remove_maptbl(struct conv_ftl *conv_ftl)
 	vfree(conv_ftl->chain_qlc_rr_pages);
 	vfree(conv_ftl->chain_slc_page_count);
 	vfree(conv_ftl->chain_last_slc_touch);
+	vfree(conv_ftl->chain_host_slc_wps);
 	vfree(conv_ftl->blk_owner_chain);
 	vfree(conv_ftl->blk_owner_pages);
 	vfree(conv_ftl->blk_valid_pages);
 	vfree(conv_ftl->blk_mixed_pages);
+	vfree(conv_ftl->blk_active_wp_refs);
 	conv_ftl->maptbl = NULL;
 	conv_ftl->lpn_initial_die = NULL;
 	conv_ftl->lpn_die_changed = NULL;
@@ -3226,10 +3437,12 @@ static void remove_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->chain_qlc_rr_pages = NULL;
 	conv_ftl->chain_slc_page_count = NULL;
 	conv_ftl->chain_last_slc_touch = NULL;
+	conv_ftl->chain_host_slc_wps = NULL;
 	conv_ftl->blk_owner_chain = NULL;
 	conv_ftl->blk_owner_pages = NULL;
 	conv_ftl->blk_valid_pages = NULL;
 	conv_ftl->blk_mixed_pages = NULL;
+	conv_ftl->blk_active_wp_refs = NULL;
 	conv_ftl->chain_capacity = 0;
 	conv_ftl->next_chain_id = 0;
 }
@@ -3699,6 +3912,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->debug_access_inject = NULL;
 	conv_ftl->debug_page_tier = NULL;
 	conv_ftl->debug_page_die = NULL;
+	conv_ftl->debug_page_chain = NULL;
 	conv_ftl->debug_die_affinity_stats = NULL;
 	conv_ftl->debug_lpn_die_change_stats = NULL;
 	conv_ftl->debug_test_phase = NULL;
@@ -3888,15 +4102,18 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		conv_ftl->debug_access_inject =
 			debugfs_create_file("access_inject", 0200, parent,
 					    conv_ftl, &access_inject_fops);
-		conv_ftl->debug_page_tier =
-			debugfs_create_file("page_tier", 0440, parent,
-					    conv_ftl, &page_tier_fops);
-		conv_ftl->debug_page_die =
-			debugfs_create_file("page_die", 0440, parent,
-					    conv_ftl, &page_die_fops);
-		conv_ftl->debug_die_affinity_stats =
-			debugfs_create_file("die_affinity_stats", 0440, parent,
-					    conv_ftl, &die_affinity_stats_fops);
+			conv_ftl->debug_page_tier =
+				debugfs_create_file("page_tier", 0440, parent,
+						    conv_ftl, &page_tier_fops);
+			conv_ftl->debug_page_die =
+				debugfs_create_file("page_die", 0440, parent,
+						    conv_ftl, &page_die_fops);
+			conv_ftl->debug_page_chain =
+				debugfs_create_file("page_chain", 0440, parent,
+						    conv_ftl, &page_chain_fops);
+			conv_ftl->debug_die_affinity_stats =
+				debugfs_create_file("die_affinity_stats", 0440, parent,
+						    conv_ftl, &die_affinity_stats_fops);
 		conv_ftl->debug_lpn_die_change_stats =
 			debugfs_create_file("lpn_die_change_stats", 0440, parent,
 					    conv_ftl, &lpn_die_change_stats_fops);
@@ -3924,10 +4141,11 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 		debugfs_remove_recursive(conv_ftl->debug_dir);
 		conv_ftl->debug_dir = NULL;
 		conv_ftl->debug_access_count = NULL;
-		conv_ftl->debug_access_inject = NULL;
-		conv_ftl->debug_page_tier = NULL;
-		conv_ftl->debug_page_die = NULL;
-		conv_ftl->debug_die_affinity_stats = NULL;
+			conv_ftl->debug_access_inject = NULL;
+			conv_ftl->debug_page_tier = NULL;
+			conv_ftl->debug_page_die = NULL;
+			conv_ftl->debug_page_chain = NULL;
+			conv_ftl->debug_die_affinity_stats = NULL;
 		conv_ftl->debug_lpn_die_change_stats = NULL;
 		conv_ftl->debug_test_phase = NULL;
 		conv_ftl->debug_test_phase_stats = NULL;
@@ -3945,11 +4163,15 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 			debugfs_remove(conv_ftl->debug_page_tier);
 			conv_ftl->debug_page_tier = NULL;
 		}
-		if (conv_ftl->debug_page_die) {
-			debugfs_remove(conv_ftl->debug_page_die);
-			conv_ftl->debug_page_die = NULL;
-		}
-		if (conv_ftl->debug_die_affinity_stats) {
+			if (conv_ftl->debug_page_die) {
+				debugfs_remove(conv_ftl->debug_page_die);
+				conv_ftl->debug_page_die = NULL;
+			}
+			if (conv_ftl->debug_page_chain) {
+				debugfs_remove(conv_ftl->debug_page_chain);
+				conv_ftl->debug_page_chain = NULL;
+			}
+			if (conv_ftl->debug_die_affinity_stats) {
 			debugfs_remove(conv_ftl->debug_die_affinity_stats);
 			conv_ftl->debug_die_affinity_stats = NULL;
 		}
@@ -5115,6 +5337,72 @@ static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id)
 }
 
 /* 获取 SLC 的新页面 - 使用 Die Affinity, 支持 die fallback */
+static void advance_chain_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t chain_id,
+					    uint32_t die)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct write_pointer *wp;
+	struct line_mgmt *lm;
+
+	wp = get_chain_host_slc_wp(conv_ftl, chain_id, die, false);
+	lm = get_slc_die_lm(conv_ftl, die);
+	if (!wp || !lm || !wp->curline)
+		return;
+
+	wp->pg++;
+	if (wp->pg >= spp->pgs_per_blk) {
+		spin_lock(&conv_ftl->slc_lock);
+		slc_wp_close_line_locked(conv_ftl, lm, wp, die);
+		spin_unlock(&conv_ftl->slc_lock);
+	}
+}
+
+static struct ppa get_new_chain_slc_page(struct conv_ftl *conv_ftl, uint32_t chain_id,
+					 uint32_t die)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct ppa ppa;
+	struct nand_page *pg;
+	struct write_pointer *wp;
+	struct line_mgmt *lm;
+
+	wp = get_chain_host_slc_wp(conv_ftl, chain_id, die, true);
+	lm = get_slc_die_lm(conv_ftl, die);
+	if (!wp || !lm || !lm->lines)
+		return (struct ppa){ .ppa = UNMAPPED_PPA };
+
+retry_get_page:
+	if (!wp->curline) {
+		spin_lock(&conv_ftl->slc_lock);
+		if (!wp->curline && !slc_wp_open_line_locked(conv_ftl, lm, wp, die)) {
+			spin_unlock(&conv_ftl->slc_lock);
+			return (struct ppa){ .ppa = UNMAPPED_PPA };
+		}
+		spin_unlock(&conv_ftl->slc_lock);
+	}
+
+	ppa.ppa = 0;
+	ppa.g.ch = wp->ch;
+	ppa.g.lun = wp->lun;
+	ppa.g.pg = wp->pg;
+	ppa.g.blk = wp->blk;
+	ppa.g.pl = wp->pl;
+
+	pg = get_pg(conv_ftl->ssd, &ppa);
+	if (!pg)
+		return (struct ppa){ .ppa = UNMAPPED_PPA };
+
+	if (pg->status != PG_FREE) {
+		advance_chain_slc_write_pointer(conv_ftl, chain_id, die);
+		goto retry_get_page;
+	}
+
+	if (wp->pg >= (uint32_t)spp->pgs_per_blk)
+		return (struct ppa){ .ppa = UNMAPPED_PPA };
+
+	return ppa;
+}
+
 static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -6883,47 +7171,58 @@ retry_wb_alloc:
 			}
 		}
 
-		if (bOverwrite && old_prev_lpn != INVALID_LPN)
-			prev_link_lpn = old_prev_lpn;
-		seed_die = conv_ftl->die_count ?
-			   (uint16_t)(conv_ftl->lunpointer % conv_ftl->die_count) : 0;
-		if (bOverwrite && chain_id_valid(conv_ftl, old_chain_id))
-			chain_id = old_chain_id;
-		else
-			chain_id = chain_for_write(conv_ftl, prev_link_lpn, seed_die);
-		if (chain_id_valid(conv_ftl, chain_id) && conv_ftl->die_count)
-			conv_ftl->lunpointer =
-				chain_place_die(conv_ftl, chain_id, CHAIN_TIER_SLC,
-						conv_ftl->lunpointer % conv_ftl->die_count);
+			if (bOverwrite && old_prev_lpn != INVALID_LPN)
+				prev_link_lpn = old_prev_lpn;
 
-        {
-            int slc_retry = 0;
-            const int SLC_MAX_RETRIES = 8;
+			seed_die = conv_ftl->die_count ?
+				   (uint16_t)(conv_ftl->lunpointer % conv_ftl->die_count) : 0;
+			if (bOverwrite && chain_id_valid(conv_ftl, old_chain_id))
+				chain_id = old_chain_id;
+			else
+				chain_id = chain_for_write(conv_ftl, prev_link_lpn, seed_die);
+			if (aff_target_valid && conv_ftl->die_count)
+				conv_ftl->lunpointer = aff_target_die % conv_ftl->die_count;
+			else if (chain_id_valid(conv_ftl, chain_id) && conv_ftl->die_count)
+				conv_ftl->lunpointer =
+					chain_place_die(conv_ftl, chain_id, CHAIN_TIER_SLC,
+							conv_ftl->lunpointer % conv_ftl->die_count);
 
-            ppa = get_new_slc_page(conv_ftl);
-            while (!mapped_ppa(&ppa) && slc_retry < SLC_MAX_RETRIES) {
-                uint32_t starved_die;
-                int32_t target_die = conv_ftl->die_count ?
-                    (int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
+			{
+				int slc_retry = 0;
+				const int SLC_MAX_RETRIES = 8;
 
-                slc_retry++;
-                migrate_some_cold_from_slc(conv_ftl, conv_ftl->slc_pgs_per_blk * 8,
-                                           target_die);
+				if (chain_id_valid(conv_ftl, chain_id) && conv_ftl->die_count)
+					ppa = get_new_chain_slc_page(conv_ftl, chain_id,
+									 conv_ftl->lunpointer % conv_ftl->die_count);
+				else
+					ppa = get_new_slc_page(conv_ftl);
+				while (!mapped_ppa(&ppa) && slc_retry < SLC_MAX_RETRIES) {
+					uint32_t starved_die;
+					int32_t target_die = conv_ftl->die_count ?
+						(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
 
-                if (should_gc_slc_any_die_critical(conv_ftl, &starved_die))
-                    do_gc_for_die(conv_ftl, starved_die, true);
+					slc_retry++;
+					migrate_some_cold_from_slc(conv_ftl, conv_ftl->slc_pgs_per_blk * 8,
+								   target_die);
 
-                forground_gc(conv_ftl, FGC_MODE_HARD);
-                ppa = get_new_slc_page(conv_ftl);
-            }
-        }
+					if (should_gc_slc_any_die_critical(conv_ftl, &starved_die))
+						do_gc_for_die(conv_ftl, starved_die, true);
 
-        if (!mapped_ppa(&ppa)) {
-            NVMEV_ERROR("SLC exhausted, write failed for LPN %lld (after retries)\n", local_lpn);
-            ret->status = NVME_SC_WRITE_FAULT;
-            ret->nsecs_target = nsecs_latest;
-            goto slc_fail_release;
-        }
+					forground_gc(conv_ftl, FGC_MODE_HARD);
+					if (chain_id_valid(conv_ftl, chain_id) && conv_ftl->die_count)
+						ppa = get_new_chain_slc_page(conv_ftl, chain_id,
+										 conv_ftl->lunpointer % conv_ftl->die_count);
+					else
+						ppa = get_new_slc_page(conv_ftl);
+				}
+			}
+
+			if (!mapped_ppa(&ppa)) {
+				NVMEV_ERROR("SLC exhausted, write failed for LPN %lld (after retries)\n", local_lpn);
+				ret->status = NVME_SC_WRITE_FAULT;
+				ret->nsecs_target = nsecs_latest;
+				goto slc_fail_release;
+			}
 
 		if (aff_target_valid) {
 			uint32_t actual_die = encode_die(spp, &ppa);
@@ -6934,12 +7233,12 @@ retry_wb_alloc:
 				conv_ftl->die_aff_overwrite_effective++;
 		}
 
-        /* 记录页面在 SLC 中 */
-        conv_ftl->page_in_slc[local_lpn] = true;
-        conv_ftl->slc_write_cnt++;
-        conv_ftl->total_host_writes++;
-        if (conv_ftl->heat_track.write_epoch)
-            conv_ftl->heat_track.write_epoch[local_lpn] = conv_ftl->total_host_writes;
+			/* 记录页面在 SLC 中 */
+			conv_ftl->page_in_slc[local_lpn] = true;
+			conv_ftl->slc_write_cnt++;
+			conv_ftl->total_host_writes++;
+			if (conv_ftl->heat_track.write_epoch)
+				conv_ftl->heat_track.write_epoch[local_lpn] = conv_ftl->total_host_writes;
 
 		//NVMEV_ERROR("PPA: ch:%d, lun:%d, blk:%d, pg:%d \n", ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg );
 
@@ -6964,10 +7263,13 @@ retry_wb_alloc:
 		/* need to advance the write pointer here */
 		//need branch
 //66f1
-        /* 使用 SLC 的 Die Affinity 推进写指针 */
-        advance_slc_write_pointer(conv_ftl, encode_die(spp, &ppa));
-		chain_place_note_write(conv_ftl, chain_id, CHAIN_TIER_SLC,
-				       encode_die(spp, &ppa));
+			/* 使用 chain-private SLC block（若可用）推进写指针 */
+			if (chain_id_valid(conv_ftl, chain_id))
+				advance_chain_slc_write_pointer(conv_ftl, chain_id, encode_die(spp, &ppa));
+			else
+				advance_slc_write_pointer(conv_ftl, encode_die(spp, &ppa));
+			chain_place_note_write(conv_ftl, chain_id, CHAIN_TIER_SLC,
+					       encode_die(spp, &ppa));
 
 	//	nsecs_completed = ssd_advance_write_buffer(conv_ftl->ssd, nsecs_latest, conv_ftl->ssd->sp.pgsz);
 
