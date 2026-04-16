@@ -55,7 +55,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_ENABLE_CHAIN_AGGREGATION 1
 #endif
 #ifndef NVMEV_ENABLE_HOST_DIE_HINT
-#define NVMEV_ENABLE_HOST_DIE_HINT 0
+#define NVMEV_ENABLE_HOST_DIE_HINT 1
 #endif
 #ifndef NVMEV_ENABLE_QLC_HOTCOLD
 #define NVMEV_ENABLE_QLC_HOTCOLD 0
@@ -72,7 +72,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #ifndef NVMEV_ENABLE_QLC_REBALANCE
 #define NVMEV_ENABLE_QLC_REBALANCE 0
 #endif
-/* Variant: only chain/block aggregation is enabled. */
+/* Variant: chain/block aggregation enabled with host append/overwrite die hint retained. */
 
 #define RECENT_WRITE_GUARD_PCT 10U
 #define SLC_EMERGENCY_RESERVE 10
@@ -6791,7 +6791,7 @@ retry_wb_alloc:
 			return true;
 		}
 		prev_link_lpn = INVALID_LPN;
-		if (lpn >= start_lpn + nr_parts && local_lpn > 0) {
+		if (local_lpn > 0) {
 			nvmev_set_maptbl_site("conv_write.prev_tmp", local_lpn - 1);
 			struct ppa prev_tmp = get_maptbl_ent(conv_ftl, local_lpn - 1);
 			if (mapped_ppa(&prev_tmp) && valid_ppa(conv_ftl, &prev_tmp))
