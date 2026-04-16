@@ -953,6 +953,7 @@ static int qlc_get_new_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zo
 static int qlc_get_new_gc_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zone_hint,
 			       struct ppa *ppa_out);
 static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
+static inline bool slc_block_has_active_writer(struct conv_ftl *conv_ftl, const struct ppa *ppa);
 static void advance_chain_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t chain_id,
 					    uint32_t die);
 static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
@@ -1484,13 +1485,13 @@ static uint32_t migrate_some_cold_from_slc_cursor(struct conv_ftl *conv_ftl, uin
 			if (recent_write_guard(conv_ftl, lpn))
 				continue;
 
-				old_ppa = get_maptbl_ent(conv_ftl, lpn);
-				if (!(mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk))) {
-					slc_resident_untrack_page(conv_ftl, lpn);
-					continue;
-				}
-				if (slc_block_has_active_writer(conv_ftl, &old_ppa))
-					continue;
+			old_ppa = get_maptbl_ent(conv_ftl, lpn);
+			if (!(mapped_ppa(&old_ppa) && is_slc_block(conv_ftl, old_ppa.g.blk))) {
+				slc_resident_untrack_page(conv_ftl, lpn);
+				continue;
+			}
+			if (slc_block_has_active_writer(conv_ftl, &old_ppa))
+				continue;
 
 #if NVMEV_ENABLE_CHAIN_AGGREGATION
 			{
