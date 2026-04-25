@@ -225,6 +225,7 @@ run_one_test() {
     cp "${RESULT_FOLDER}"/sqlite_table_die_${tag}.csv  "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_chain_${tag}.csv "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_chain_die_${tag}.csv "${out_dir}/" 2>/dev/null || true
+    cp "${RESULT_FOLDER}"/sqlite_stream_die_stats_${tag}.csv "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_table_${tag}.csv      "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_row_${tag}.csv        "${out_dir}/" 2>/dev/null || true
     cp "${RESULT_FOLDER}"/sqlite_bg_nand_phase_${tag}.csv "${out_dir}/" 2>/dev/null || true

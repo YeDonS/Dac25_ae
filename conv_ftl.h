@@ -90,6 +90,95 @@ struct migration_mgmt {
 	bool migration_in_progress;       /* 迁移进行标志 */
 };
 
+enum nvmev_chain_alloc_reason {
+	NVMEV_CHAIN_ALLOC_REASON_NO_PREV = 0,
+	NVMEV_CHAIN_ALLOC_REASON_PREV_CHAIN_INVALID = 1,
+	NVMEV_CHAIN_ALLOC_REASON_CAPACITY = 2,
+};
+
+enum nvmev_chain_cold_method {
+	NVMEV_CHAIN_COLD_METHOD_BLOCK = 1,
+	NVMEV_CHAIN_COLD_METHOD_CHUNK = 2,
+};
+
+struct nvmev_chain_alloc_event {
+	uint64_t seq;
+	uint64_t lpn;
+	uint64_t prev_link_lpn;
+	uint32_t chain_id;
+	uint32_t prev_chain_id;
+	uint16_t seed_die;
+	uint8_t is_append;
+	uint8_t is_overwrite;
+	uint8_t reason;
+};
+
+struct nvmev_chain_cold_event {
+	uint64_t seq;
+	uint64_t heat_sum;
+	uint32_t chain_id;
+	uint32_t die;
+	uint32_t blk;
+	uint32_t pages_moved;
+	uint32_t heat_pages;
+	uint32_t cold_pages;
+	uint32_t owned_pages;
+	uint8_t ch;
+	uint8_t lun;
+	uint8_t pl;
+	uint8_t method;
+};
+
+struct nvmev_gc_victim_event {
+	uint64_t seq;
+	uint32_t die;
+	uint32_t blk;
+	uint32_t owner_chain;
+	uint32_t vpc;
+	uint32_t ipc;
+	uint8_t is_slc;
+	uint8_t high_purity;
+};
+
+#define NVMEV_MAP_ENTRY_BYTES 8U
+#define NVMEV_MAP_TPAGE_BYTES 4096U
+#define NVMEV_MAP_ENTRIES_PER_TPAGE (NVMEV_MAP_TPAGE_BYTES / NVMEV_MAP_ENTRY_BYTES)
+#define NVMEV_MAP_CMT_BYTES (8ULL << 20)
+#define NVMEV_MAP_CMT_TPAGES (NVMEV_MAP_CMT_BYTES / NVMEV_MAP_TPAGE_BYTES)
+#define NVMEV_MAP_EVICT_SCAN 64U
+#define NVMEV_MAP_HEAT_DECAY_INTERVAL 100000ULL
+
+struct nvmev_map_cache_entry {
+	uint64_t tpage_id;
+	struct ppa *entries;
+	bool valid;
+	bool dirty;
+	uint16_t heat;
+	struct list_head lru_node;
+};
+
+struct nvmev_map_cache {
+	spinlock_t lock;
+	struct nvmev_map_cache_entry *entries;
+	struct ppa *entry_storage;
+	struct list_head lru;
+	uint32_t nr_entries;
+	uint32_t used_entries;
+	uint64_t access_seq;
+	bool initialized;
+	bool hotcold;
+	atomic64_t lookups;
+	atomic64_t hits;
+	atomic64_t misses;
+	atomic64_t evictions;
+	atomic64_t dirty_evictions;
+	atomic64_t metadata_reads;
+	atomic64_t metadata_writes;
+	atomic64_t metadata_read_ns;
+	atomic64_t metadata_write_ns;
+	atomic64_t heat_decays;
+};
+
 struct conv_ftl {
 	struct ssd *ssd;
 
@@ -97,6 +186,7 @@ struct conv_ftl {
 	struct ppa *maptbl; /* page level mapping table */
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
 	seqlock_t maptbl_lock; /* serialize maptbl/rmap updates with low-overhead readers */
+	struct nvmev_map_cache map_cache; /* simulator CMT for flash-resident L2P variants */
 	struct write_flow_control wfc;
 	//66f1 - 删除了冲突的旧 line_mgmt 结构
 	uint32_t lunpointer;
@@ -231,6 +321,9 @@ struct conv_ftl {
 	uint64_t chain_block_migration_pages;
 	uint64_t chain_block_migration_skip_budget;
 	uint64_t chain_gc_to_qlc_pages;
+	uint64_t chain_alloc_no_prev;
+	uint64_t chain_alloc_prev_chain_invalid;
+	uint64_t chain_alloc_capacity_fail;
 	bool test_phase_active;                 /* whether cold-test phase is active */
 	atomic64_t test_phase_read_reqs;        /* read requests observed during test phase */
 	atomic64_t test_phase_overwrite_reqs;   /* overwrite requests observed during test phase */
@@ -245,6 +338,19 @@ struct conv_ftl {
 	atomic_t test_phase_active_bg_ops;      /* currently active bg migration ops */
 	atomic64_t slc_resident_page_cnt; /* 当前驻留在 SLC 的页面数 */
 	atomic_t slc_recover_lock;        /* 序列化 SLC 回收 */
+	spinlock_t event_log_lock;        /* 保护调试事件环形日志 */
+	struct nvmev_chain_alloc_event *chain_alloc_events;
+	struct nvmev_chain_cold_event *chain_cold_events;
+	struct nvmev_gc_victim_event *gc_victim_events;
+	uint32_t chain_alloc_event_head;
+	uint32_t chain_alloc_event_count;
+	uint32_t chain_cold_event_head;
+	uint32_t chain_cold_event_count;
+	uint32_t gc_victim_event_head;
+	uint32_t gc_victim_event_count;
+	uint64_t chain_alloc_event_seq;
+	uint64_t chain_cold_event_seq;
+	uint64_t gc_victim_event_seq;
 	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
 		struct dentry *debug_access_inject; /* debugfs entry for counter injection */
@@ -257,6 +363,10 @@ struct conv_ftl {
 	struct dentry *debug_test_phase;   /* debugfs entry for toggling test phase */
 	struct dentry *debug_test_phase_stats; /* debugfs entry for test phase counters */
 	struct dentry *debug_read_repromotion; /* debugfs entry for read repromotion toggle */
+	struct dentry *debug_map_cache_stats; /* debugfs entry for CMT hit/miss counters */
+	struct dentry *debug_chain_alloc_events; /* debugfs entry for chain allocation events */
+	struct dentry *debug_chain_cold_events; /* debugfs entry for cold migration picks */
+	struct dentry *debug_gc_victim_events; /* debugfs entry for gc victim picks */
 	
 	/* 初始化状态标记 */
 	bool maptbl_initialized;     /* 映射表是否初始化成功 */

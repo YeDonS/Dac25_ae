@@ -66,17 +66,28 @@
 #define DEFAULT_PAGE_DIE_PATH "/sys/kernel/debug/nvmev/ftl0/page_die"
 #define DEFAULT_PAGE_CHAIN_PATH "/sys/kernel/debug/nvmev/ftl0/page_chain"
 #define DEFAULT_PAGE_DIE_TRANSITION_PATH "/sys/kernel/debug/nvmev/ftl0/page_die_transition"
+#define DEFAULT_CHAIN_ALLOC_EVENTS_PATH "/sys/kernel/debug/nvmev/ftl0/chain_alloc_events"
+#define DEFAULT_CHAIN_COLD_EVENTS_PATH "/sys/kernel/debug/nvmev/ftl0/chain_cold_events"
+#define DEFAULT_GC_VICTIM_EVENTS_PATH "/sys/kernel/debug/nvmev/ftl0/gc_victim_events"
+#define DEFAULT_MAP_CACHE_STATS_PATH "/sys/kernel/debug/nvmev/ftl0/map_cache_stats"
 #define DEFAULT_FTL_HOST_PAGE_BYTES 4096ULL
 #define DEFAULT_TEST_PHASE_PATH "/sys/kernel/debug/nvmev/ftl0/test_phase"
 #define DEFAULT_GC_NAND_TIMING_PATH "/sys/module/nvmev/parameters/gc_nand_timing"
 #define DEFAULT_BG_NAND_STATS_PATH "/sys/module/nvmev/parameters/bg_nand_stats"
 #define DEFAULT_COLD_EXTRA_APPEND_BYTES (0ULL)
+#define DEFAULT_COLD_FULL_READ_ITERS 1U
+#define DEFAULT_COLD_RANDOM_CHUNK_ROWS 128U
 #define DIE_STATS_RESET_PATH "/sys/module/nvmev/parameters/die_stats_reset"
 
 enum cold_extra_mode {
 	COLD_EXTRA_MODE_OFF = 0,
 	COLD_EXTRA_MODE_SERIAL,
 	COLD_EXTRA_MODE_CONCURRENT,
+};
+
+enum cold_full_read_mode {
+	COLD_FULL_READ_FULL_SCAN = 0,
+	COLD_FULL_READ_RANDOM_CHUNK,
 };
 
 struct page_die_entry {
@@ -114,6 +125,26 @@ struct bg_nand_stats {
 	unsigned long long erase_ops;
 };
 
+struct map_cache_stats {
+	char policy[64];
+	unsigned int initialized;
+	unsigned int hotcold;
+	unsigned long long cmt_bytes;
+	unsigned long long cached_translation_pages;
+	unsigned long long used_translation_pages;
+	unsigned long long lookups;
+	unsigned long long hits;
+	unsigned long long misses;
+	unsigned long long metadata_reads;
+	unsigned long long metadata_writes;
+	unsigned long long metadata_read_ns;
+	unsigned long long metadata_write_ns;
+	unsigned long long metadata_total_ns;
+	unsigned long long evictions;
+	unsigned long long dirty_evictions;
+	unsigned long long heat_decays;
+};
+
 struct file_extent {
 	unsigned long long logical;
 	unsigned long long physical;
@@ -137,12 +168,19 @@ struct workload_options {
 	unsigned int interleave_pages;
 	unsigned int interleave_reads;
 	unsigned int cold_concurrent_threads;
+	enum cold_full_read_mode cold_full_read_mode;
+	unsigned int cold_full_read_iters;
+	unsigned int cold_random_chunk_rows;
 	unsigned long long ftl_host_page_bytes;
 	const char *tag;
 	const char *page_tier_path;
 	const char *page_die_path;
 	const char *page_chain_path;
 	const char *page_die_transition_path;
+	const char *chain_alloc_events_path;
+	const char *chain_cold_events_path;
+	const char *gc_victim_events_path;
+	const char *map_cache_stats_path;
 	unsigned int seed;
 	const char *dist_name;
 	double zipf_alpha;
@@ -187,6 +225,9 @@ struct concurrent_read_ctx {
 	int record_id_begin;
 	int record_id_end;
 	unsigned int repeats;
+	enum cold_full_read_mode mode;
+	unsigned int rng_seed;
+	unsigned int chunk_rows;
 	double elapsed_sec;
 	unsigned long long rows_read;
 };
@@ -246,6 +287,7 @@ static const struct option long_opts[] = {
 	{"bg-nand-stats-path", required_argument, NULL, 1033},
 	{"cold-extra-append-bytes", required_argument, NULL, 1035},
 	{"cold-extra-mode", required_argument, NULL, 1036},
+	{"map-cache-stats-path", required_argument, NULL, 1037},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -315,6 +357,32 @@ static enum cold_extra_mode parse_cold_extra_mode(const char *arg)
 	if (!strcasecmp(arg, "concurrent") || !strcasecmp(arg, "overlap"))
 		return COLD_EXTRA_MODE_CONCURRENT;
 	return COLD_EXTRA_MODE_OFF;
+}
+
+static enum cold_full_read_mode parse_cold_full_read_mode(const char *arg)
+{
+	if (!arg || !*arg ||
+	    !strcasecmp(arg, "full-scan") ||
+	    !strcasecmp(arg, "full-scan-concurrent"))
+		return COLD_FULL_READ_FULL_SCAN;
+	if (!strcasecmp(arg, "random") ||
+	    !strcasecmp(arg, "random-read") ||
+	    !strcasecmp(arg, "cold-random-read") ||
+	    !strcasecmp(arg, "random-chunk") ||
+	    !strcasecmp(arg, "random-chunk-concurrent"))
+		return COLD_FULL_READ_RANDOM_CHUNK;
+	return COLD_FULL_READ_FULL_SCAN;
+}
+
+static const char *cold_full_read_mode_label(enum cold_full_read_mode mode)
+{
+	switch (mode) {
+	case COLD_FULL_READ_RANDOM_CHUNK:
+		return "random-chunk-concurrent";
+	case COLD_FULL_READ_FULL_SCAN:
+	default:
+		return "full-scan-concurrent";
+	}
 }
 
 static const char *cold_extra_mode_label(enum cold_extra_mode mode)
@@ -659,6 +727,149 @@ static void build_bg_nand_phase_path(char *buf, size_t len,
 	join_path(buf, len, RESULT_FOLDER, name);
 }
 
+static void build_chain_alloc_events_path(char *buf, size_t len,
+					  const struct workload_options *opts)
+{
+	char name[128];
+
+	snprintf(name, sizeof(name), "sqlite_chain_alloc_events_%s.txt",
+		 opts->tag ? opts->tag : DEFAULT_TAG);
+	join_path(buf, len, RESULT_FOLDER, name);
+}
+
+static void build_chain_cold_events_path(char *buf, size_t len,
+					 const struct workload_options *opts)
+{
+	char name[128];
+
+	snprintf(name, sizeof(name), "sqlite_chain_cold_events_%s.txt",
+		 opts->tag ? opts->tag : DEFAULT_TAG);
+	join_path(buf, len, RESULT_FOLDER, name);
+}
+
+static void build_gc_victim_events_path(char *buf, size_t len,
+					const struct workload_options *opts)
+{
+	char name[128];
+
+	snprintf(name, sizeof(name), "sqlite_gc_victim_events_%s.txt",
+		 opts->tag ? opts->tag : DEFAULT_TAG);
+	join_path(buf, len, RESULT_FOLDER, name);
+}
+
+static void build_map_cache_stats_path(char *buf, size_t len,
+				       const struct workload_options *opts)
+{
+	char name[128];
+
+	snprintf(name, sizeof(name), "sqlite_map_cache_stats_%s.txt",
+		 opts->tag ? opts->tag : DEFAULT_TAG);
+	join_path(buf, len, RESULT_FOLDER, name);
+}
+
+static int copy_text_file(const char *src, const char *dst)
+{
+	FILE *in = NULL;
+	FILE *out = NULL;
+	char buf[4096];
+	size_t n;
+
+	if (!src || !dst)
+		return -EINVAL;
+
+	in = fopen(src, "r");
+	if (!in)
+		return -errno;
+	out = fopen(dst, "w");
+	if (!out) {
+		fclose(in);
+		return -errno;
+	}
+
+	while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+		if (fwrite(buf, 1, n, out) != n) {
+			fclose(in);
+			fclose(out);
+			return -EIO;
+		}
+	}
+
+	fclose(in);
+	fclose(out);
+	return 0;
+}
+
+static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
+{
+	FILE *fp;
+	char line[256];
+	struct map_cache_stats tmp = {};
+
+	if (!stats)
+		return -EINVAL;
+	*stats = tmp;
+	if (!path || !path[0])
+		return -EINVAL;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -errno;
+
+	while (fgets(line, sizeof(line), fp)) {
+		if (sscanf(line, "policy %63s", tmp.policy) == 1)
+			continue;
+		if (sscanf(line, "initialized %u", &tmp.initialized) == 1)
+			continue;
+		if (sscanf(line, "cmt_bytes %llu", &tmp.cmt_bytes) == 1)
+			continue;
+		if (sscanf(line, "cached_translation_pages %llu",
+			   &tmp.cached_translation_pages) == 1)
+			continue;
+		if (sscanf(line, "used_translation_pages %llu",
+			   &tmp.used_translation_pages) == 1)
+			continue;
+		if (sscanf(line, "hotcold %u", &tmp.hotcold) == 1)
+			continue;
+		if (sscanf(line, "lookups %llu", &tmp.lookups) == 1)
+			continue;
+		if (sscanf(line, "hits %llu", &tmp.hits) == 1)
+			continue;
+		if (sscanf(line, "misses %llu", &tmp.misses) == 1)
+			continue;
+		if (sscanf(line, "metadata_reads %llu", &tmp.metadata_reads) == 1)
+			continue;
+		if (sscanf(line, "metadata_writes %llu", &tmp.metadata_writes) == 1)
+			continue;
+		if (sscanf(line, "metadata_read_ns %llu", &tmp.metadata_read_ns) == 1)
+			continue;
+		if (sscanf(line, "metadata_write_ns %llu", &tmp.metadata_write_ns) == 1)
+			continue;
+		if (sscanf(line, "metadata_total_ns %llu", &tmp.metadata_total_ns) == 1)
+			continue;
+		if (sscanf(line, "evictions %llu", &tmp.evictions) == 1)
+			continue;
+		if (sscanf(line, "dirty_evictions %llu", &tmp.dirty_evictions) == 1)
+			continue;
+		if (sscanf(line, "heat_decays %llu", &tmp.heat_decays) == 1)
+			continue;
+	}
+
+	if (ferror(fp)) {
+		int err = errno ? errno : EIO;
+
+		fclose(fp);
+		return -err;
+	}
+	fclose(fp);
+
+	if (!tmp.metadata_total_ns)
+		tmp.metadata_total_ns = tmp.metadata_read_ns + tmp.metadata_write_ns;
+	if (!tmp.policy[0])
+		snprintf(tmp.policy, sizeof(tmp.policy), "%s", "unknown");
+	*stats = tmp;
+	return 0;
+}
+
 static int load_bg_nand_stats(const char *path, struct bg_nand_stats *stats)
 {
 	FILE *fp;
@@ -694,6 +905,29 @@ static unsigned long long diff_u64(unsigned long long after,
 				   unsigned long long before)
 {
 	return after >= before ? after - before : 0ULL;
+}
+
+static void map_cache_stats_delta(struct map_cache_stats *dst,
+				  const struct map_cache_stats *after,
+				  const struct map_cache_stats *before)
+{
+	if (!dst || !after || !before)
+		return;
+
+	*dst = *after;
+	dst->lookups = diff_u64(after->lookups, before->lookups);
+	dst->hits = diff_u64(after->hits, before->hits);
+	dst->misses = diff_u64(after->misses, before->misses);
+	dst->metadata_reads = diff_u64(after->metadata_reads, before->metadata_reads);
+	dst->metadata_writes = diff_u64(after->metadata_writes, before->metadata_writes);
+	dst->metadata_read_ns = diff_u64(after->metadata_read_ns, before->metadata_read_ns);
+	dst->metadata_write_ns = diff_u64(after->metadata_write_ns, before->metadata_write_ns);
+	dst->metadata_total_ns = diff_u64(after->metadata_total_ns, before->metadata_total_ns);
+	if (!dst->metadata_total_ns)
+		dst->metadata_total_ns = dst->metadata_read_ns + dst->metadata_write_ns;
+	dst->evictions = diff_u64(after->evictions, before->evictions);
+	dst->dirty_evictions = diff_u64(after->dirty_evictions, before->dirty_evictions);
+	dst->heat_decays = diff_u64(after->heat_decays, before->heat_decays);
 }
 
 static void bg_nand_stats_delta(struct bg_nand_stats *dst,
@@ -1896,6 +2130,34 @@ static int run_read_event(unsigned int event_id,
 	return 0;
 }
 
+static int scan_stmt_range(sqlite3_stmt *stmt, int begin, int end,
+			   unsigned long long *rows_read)
+{
+	int rc;
+
+	sqlite3_reset(stmt);
+	sqlite3_clear_bindings(stmt);
+	sqlite3_bind_int(stmt, 1, begin);
+	sqlite3_bind_int(stmt, 2, end);
+	while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+		if (rows_read)
+			(*rows_read)++;
+	}
+	return rc;
+}
+
+static void shuffle_u32(unsigned int *order, unsigned int count, unsigned int *state)
+{
+	if (!order || !state)
+		return;
+	for (unsigned int i = count; i > 1; --i) {
+		unsigned int j = next_rand(state) % i;
+		unsigned int tmp = order[i - 1];
+		order[i - 1] = order[j];
+		order[j] = tmp;
+	}
+}
+
 static void *full_scan_worker(void *arg)
 {
 	struct concurrent_read_ctx *ctx = arg;
@@ -1919,17 +2181,49 @@ static void *full_scan_worker(void *arg)
 	}
 
 	start = monotonic_sec();
-	for (unsigned int rep = 0; rep < ctx->repeats; ++rep) {
-		int rc;
+	if (ctx->mode == COLD_FULL_READ_RANDOM_CHUNK) {
+		unsigned int chunk_rows = ctx->chunk_rows ? ctx->chunk_rows : DEFAULT_COLD_RANDOM_CHUNK_ROWS;
+		unsigned int total_rows = (ctx->record_id_end > ctx->record_id_begin) ?
+			(unsigned int)(ctx->record_id_end - ctx->record_id_begin) : 0U;
+		unsigned int chunk_count = chunk_rows ? ceil_div_u64_to_u32(total_rows, chunk_rows) : 0U;
+		unsigned int *order = NULL;
+		unsigned int state = ctx->rng_seed ? ctx->rng_seed : 1U;
 
-		sqlite3_reset(stmt);
-		sqlite3_clear_bindings(stmt);
-		sqlite3_bind_int(stmt, 1, (int)ctx->record_id_begin);
-		sqlite3_bind_int(stmt, 2, (int)ctx->record_id_end);
-		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
-			ctx->rows_read++;
-		if (rc != SQLITE_DONE)
-			break;
+		if (chunk_count > 0)
+			order = calloc(chunk_count, sizeof(*order));
+		if (chunk_count > 0 && !order) {
+			sqlite3_finalize(stmt);
+			sqlite3_close(db);
+			ctx->elapsed_sec = 0.0;
+			return NULL;
+		}
+
+		for (unsigned int rep = 0; rep < ctx->repeats; ++rep) {
+			for (unsigned int i = 0; i < chunk_count; ++i)
+				order[i] = i;
+			shuffle_u32(order, chunk_count, &state);
+			for (unsigned int i = 0; i < chunk_count; ++i) {
+				int begin = ctx->record_id_begin + (int)(order[i] * chunk_rows);
+				int end = begin + (int)chunk_rows;
+				int rc;
+
+				if (end > ctx->record_id_end)
+					end = ctx->record_id_end;
+				rc = scan_stmt_range(stmt, begin, end, &ctx->rows_read);
+				if (rc != SQLITE_DONE) {
+					rep = ctx->repeats;
+					break;
+				}
+			}
+		}
+		free(order);
+	} else {
+		for (unsigned int rep = 0; rep < ctx->repeats; ++rep) {
+			int rc = scan_stmt_range(stmt, ctx->record_id_begin,
+					      ctx->record_id_end, &ctx->rows_read);
+			if (rc != SQLITE_DONE)
+				break;
+		}
 	}
 
 	ctx->elapsed_sec = monotonic_sec() - start;
@@ -1940,6 +2234,7 @@ static void *full_scan_worker(void *arg)
 
 static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 					    struct table_file_state *tables,
+					    const struct workload_options *opts,
 					    unsigned int threads,
 					    const unsigned int *read_plan,
 					    double *cold_per_table,
@@ -1978,20 +2273,29 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 			if (row_count == 0 || reads == 0)
 				continue;
 
-			drop_file_cache(tables[tbl].db_path);
-			ctxs[launched].thread_id = launched;
-			ctxs[launched].table_id = tbl;
-			ctxs[launched].db_path = tables[tbl].db_path;
-			ctxs[launched].record_id_begin = tables[tbl].next_record_id + 1;
-			ctxs[launched].record_id_end = tables[tbl].max_record_id_exclusive;
-			ctxs[launched].repeats = reads;
-			ctxs[launched].elapsed_sec = 0.0;
-			ctxs[launched].rows_read = 0;
-			printf("[sqlite_cold_fileparallel] batch=%u table=%u thread=%u ids=[%d,%d) repeats=%u\n",
-			       batch_begin / threads, tbl, launched,
-			       ctxs[launched].record_id_begin,
-			       ctxs[launched].record_id_end,
-			       ctxs[launched].repeats);
+				drop_file_cache(tables[tbl].db_path);
+				ctxs[launched].thread_id = launched;
+				ctxs[launched].table_id = tbl;
+				ctxs[launched].db_path = tables[tbl].db_path;
+				ctxs[launched].record_id_begin = tables[tbl].next_record_id + 1;
+				ctxs[launched].record_id_end = tables[tbl].max_record_id_exclusive;
+				ctxs[launched].repeats = reads * (opts && opts->cold_full_read_iters ?
+					opts->cold_full_read_iters : 1U);
+				ctxs[launched].mode = opts ? opts->cold_full_read_mode :
+					COLD_FULL_READ_FULL_SCAN;
+				ctxs[launched].rng_seed = (opts ? opts->seed : 42U) ^
+					(0x9e3779b9U * (tbl + 1U));
+				ctxs[launched].chunk_rows = opts && opts->cold_random_chunk_rows ?
+					opts->cold_random_chunk_rows : DEFAULT_COLD_RANDOM_CHUNK_ROWS;
+				ctxs[launched].elapsed_sec = 0.0;
+				ctxs[launched].rows_read = 0;
+				printf("[sqlite_cold_fileparallel] batch=%u table=%u thread=%u ids=[%d,%d) repeats=%u mode=%s chunk_rows=%u\n",
+				       batch_begin / threads, tbl, launched,
+				       ctxs[launched].record_id_begin,
+				       ctxs[launched].record_id_end,
+				       ctxs[launched].repeats,
+				       cold_full_read_mode_label(ctxs[launched].mode),
+				       ctxs[launched].chunk_rows);
 			pthread_create(&tids[launched], NULL, full_scan_worker, &ctxs[launched]);
 			launched++;
 		}
@@ -2767,6 +3071,9 @@ static int run_init_mode(const struct workload_options *opts)
 	struct bg_nand_stats bg_nand_mixed = {};
 	struct bg_nand_stats bg_nand_cold = {};
 	struct bg_nand_stats bg_nand_total = {};
+	struct map_cache_stats map_cache_stats = {};
+	struct map_cache_stats map_cache_before = {};
+	struct map_cache_stats map_cache_after = {};
 	char layout_path[PATH_MAX];
 	char row_stats_path[PATH_MAX];
 	char table_stats_path[PATH_MAX];
@@ -2778,6 +3085,10 @@ static int run_init_mode(const struct workload_options *opts)
 	char page_die_transition_csv_path[PATH_MAX];
 	char table_die_transition_csv_path[PATH_MAX];
 	char bg_nand_phase_csv_path[PATH_MAX];
+	char chain_alloc_events_out_path[PATH_MAX];
+	char chain_cold_events_out_path[PATH_MAX];
+	char gc_victim_events_out_path[PATH_MAX];
+	char map_cache_stats_out_path[PATH_MAX];
 	double init_start_time = monotonic_sec();
 	double init_total_time = 0.0;
 	int rc = 0;
@@ -2787,6 +3098,9 @@ static int run_init_mode(const struct workload_options *opts)
 	bool bg_nand_mixed_valid = false;
 	bool bg_nand_cold_valid = false;
 	bool bg_nand_total_valid = false;
+	bool map_cache_before_valid = false;
+	bool map_cache_stats_valid = false;
+	const char *map_cache_scope = "final";
 	bool cold_append_thread_started = false;
 
 	rc = dataset_layout_build(opts, &layout);
@@ -2839,6 +3153,14 @@ static int run_init_mode(const struct workload_options *opts)
 	build_table_die_transition_csv_path(table_die_transition_csv_path,
 					     sizeof(table_die_transition_csv_path), opts);
 	build_bg_nand_phase_path(bg_nand_phase_csv_path, sizeof(bg_nand_phase_csv_path), opts);
+	build_chain_alloc_events_path(chain_alloc_events_out_path,
+				      sizeof(chain_alloc_events_out_path), opts);
+	build_chain_cold_events_path(chain_cold_events_out_path,
+				     sizeof(chain_cold_events_out_path), opts);
+	build_gc_victim_events_path(gc_victim_events_out_path,
+				    sizeof(gc_victim_events_out_path), opts);
+	build_map_cache_stats_path(map_cache_stats_out_path,
+				   sizeof(map_cache_stats_out_path), opts);
 
 	rc = build_table_read_plan(&layout, opts, &read_plan);
 	if (rc != 0)
@@ -2856,6 +3178,8 @@ static int run_init_mode(const struct workload_options *opts)
 							 DEFAULT_FTL_HOST_PAGE_BYTES);
 	if (load_bg_nand_stats(opts->bg_nand_stats_path, &bg_nand_before) == 0)
 		bg_nand_before_valid = true;
+	if (load_map_cache_stats(opts->map_cache_stats_path, &map_cache_before) == 0)
+		map_cache_before_valid = true;
 	set_gc_nand_timing_state(opts, true, "mixed-init-start");
 	gc_nand_timing_toggled = opts->enable_gc_nand_timing;
 
@@ -3041,7 +3365,7 @@ static int run_init_mode(const struct workload_options *opts)
 		cold_append_thread_started = true;
 	}
 
-	cold_read_time = run_cold_full_scan_concurrent(&layout, tables,
+	cold_read_time = run_cold_full_scan_concurrent(&layout, tables, opts,
 						       opts->cold_concurrent_threads,
 						       read_plan, cold_per_table, &cold_rows);
 	if (cold_append_thread_started) {
@@ -3127,6 +3451,31 @@ static int run_init_mode(const struct workload_options *opts)
 					      page_die_transition_entries,
 					      page_die_transition_count,
 					      page_tier_entries, page_tier_count);
+	if (copy_text_file(opts->chain_alloc_events_path, chain_alloc_events_out_path) != 0)
+		snprintf(chain_alloc_events_out_path, sizeof(chain_alloc_events_out_path),
+			 "%s", "(unavailable)");
+	if (copy_text_file(opts->chain_cold_events_path, chain_cold_events_out_path) != 0)
+		snprintf(chain_cold_events_out_path, sizeof(chain_cold_events_out_path),
+			 "%s", "(unavailable)");
+	if (copy_text_file(opts->gc_victim_events_path, gc_victim_events_out_path) != 0)
+		snprintf(gc_victim_events_out_path, sizeof(gc_victim_events_out_path),
+			 "%s", "(unavailable)");
+	if (copy_text_file(opts->map_cache_stats_path, map_cache_stats_out_path) != 0) {
+		snprintf(map_cache_stats_out_path, sizeof(map_cache_stats_out_path),
+			 "%s", "(unavailable)");
+	} else if (load_map_cache_stats(map_cache_stats_out_path, &map_cache_after) == 0) {
+		if (map_cache_before_valid) {
+			map_cache_stats_delta(&map_cache_stats, &map_cache_after,
+					      &map_cache_before);
+			map_cache_scope = "workload_delta";
+		} else {
+			map_cache_stats = map_cache_after;
+		}
+		map_cache_stats_valid = true;
+	} else {
+		fprintf(stderr, "warning: failed to parse map_cache stats %s\n",
+			map_cache_stats_out_path);
+	}
 	report_cold_tail_latency(&layout, tables, table_latency, table_read_ops);
 	dataset_layout_to_file(layout_path, &layout);
 
@@ -3148,7 +3497,7 @@ static int run_init_mode(const struct workload_options *opts)
 			table_die_transition_csv_path : "(unavailable)";
 		const char *page_die_transition_out = page_die_transition_entries ?
 			page_die_transition_csv_path : "(unavailable)";
-		const char *cold_mode = "full-scan-concurrent";
+		const char *cold_mode = cold_full_read_mode_label(opts->cold_full_read_mode);
 
 			init_total_time = monotonic_sec() - init_start_time;
 			total_read_phase_time = total_read_time + cold_read_time;
@@ -3163,8 +3512,12 @@ static int run_init_mode(const struct workload_options *opts)
 			       table_gib, dummy_gib, table_gib + dummy_gib);
 			if (opts->cold_extra_append_bytes > 0 && opts->cold_extra_mode != COLD_EXTRA_MODE_OFF) {
 				cold_mode = opts->cold_extra_mode == COLD_EXTRA_MODE_CONCURRENT ?
-					"full-scan-concurrent+append-concurrent" :
-					"append-serial+full-scan-concurrent";
+					(opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CHUNK ?
+					 "random-chunk-concurrent+append-concurrent" :
+					 "full-scan-concurrent+append-concurrent") :
+					(opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CHUNK ?
+					 "append-serial+random-chunk-concurrent" :
+					 "append-serial+full-scan-concurrent");
 				printf("[sqlite_init] cold_extra_append mode=%s target_bytes=%llu actual_payload_bytes=%llu "
 				       "rows_written=%llu page_growth=%llu append_time=%.6fs stage_total=%.6fs\n",
 				       cold_extra_mode_label(opts->cold_extra_mode),
@@ -3192,24 +3545,59 @@ static int run_init_mode(const struct workload_options *opts)
 			print_bg_nand_stats_line("cold_read", &bg_nand_cold);
 		if (bg_nand_total_valid)
 			print_bg_nand_stats_line("total", &bg_nand_total);
-		if (bg_nand_mixed_valid || bg_nand_cold_valid || bg_nand_total_valid) {
-			if (write_bg_nand_phase_csv(bg_nand_phase_csv_path,
-						    bg_nand_mixed_valid ? &bg_nand_mixed : NULL,
+			if (bg_nand_mixed_valid || bg_nand_cold_valid || bg_nand_total_valid) {
+				if (write_bg_nand_phase_csv(bg_nand_phase_csv_path,
+							    bg_nand_mixed_valid ? &bg_nand_mixed : NULL,
 						    bg_nand_cold_valid ? &bg_nand_cold : NULL,
 						    bg_nand_total_valid ? &bg_nand_total : NULL) != 0) {
 				fprintf(stderr, "warning: failed to write bg_nand phase csv %s\n",
 					bg_nand_phase_csv_path);
 			} else {
-				printf("[sqlite_init] bg_nand_phase_csv=%s\n",
-				       bg_nand_phase_csv_path);
+					printf("[sqlite_init] bg_nand_phase_csv=%s\n",
+					       bg_nand_phase_csv_path);
+				}
 			}
-		}
-			printf("[sqlite_init] row_stats=%s table_stats=%s table_tier=%s table_die=%s "
-			       "table_chain=%s table_chain_die=%s page_tier=%s table_die_transition=%s page_die_transition=%s\n",
+			if (map_cache_stats_valid) {
+				double hit_ratio = map_cache_stats.lookups ?
+					(double)map_cache_stats.hits / (double)map_cache_stats.lookups : 0.0;
+				double metadata_read_sec =
+					(double)map_cache_stats.metadata_read_ns / 1000000000.0;
+				double metadata_write_sec =
+					(double)map_cache_stats.metadata_write_ns / 1000000000.0;
+				double metadata_total_sec =
+					(double)map_cache_stats.metadata_total_ns / 1000000000.0;
+				unsigned long long avg_read_ns = map_cache_stats.metadata_reads ?
+					map_cache_stats.metadata_read_ns / map_cache_stats.metadata_reads : 0ULL;
+				unsigned long long avg_write_ns = map_cache_stats.metadata_writes ?
+					map_cache_stats.metadata_write_ns / map_cache_stats.metadata_writes : 0ULL;
+
+				printf("[sqlite_init] map_cache scope=%s policy=%s initialized=%u hotcold=%u cmt_bytes=%llu "
+				       "cached_translation_pages=%llu used_translation_pages=%llu lookups=%llu hits=%llu "
+				       "misses=%llu hit_ratio=%.6f metadata_reads=%llu metadata_writes=%llu "
+				       "metadata_read_time=%.9fs metadata_write_time=%.9fs metadata_total_time=%.9fs "
+				       "avg_metadata_read_ns=%llu avg_metadata_write_ns=%llu evictions=%llu dirty_evictions=%llu\n",
+				       map_cache_scope, map_cache_stats.policy, map_cache_stats.initialized,
+				       map_cache_stats.hotcold, map_cache_stats.cmt_bytes,
+				       map_cache_stats.cached_translation_pages,
+				       map_cache_stats.used_translation_pages,
+				       map_cache_stats.lookups, map_cache_stats.hits,
+				       map_cache_stats.misses, hit_ratio,
+				       map_cache_stats.metadata_reads,
+				       map_cache_stats.metadata_writes,
+				       metadata_read_sec, metadata_write_sec,
+				       metadata_total_sec, avg_read_ns, avg_write_ns,
+				       map_cache_stats.evictions,
+				       map_cache_stats.dirty_evictions);
+			}
+				printf("[sqlite_init] row_stats=%s table_stats=%s table_tier=%s table_die=%s "
+			       "table_chain=%s table_chain_die=%s page_tier=%s table_die_transition=%s page_die_transition=%s "
+			       "chain_alloc_events=%s chain_cold_events=%s gc_victim_events=%s map_cache_stats=%s\n",
 			       row_stats_path, table_stats_path, table_tier_path, table_die_path,
 			       table_chain_out, table_chain_die_out, page_tier_csv_path, table_die_transition_out,
-			       page_die_transition_out);
-		}
+			       page_die_transition_out, chain_alloc_events_out_path,
+			       chain_cold_events_out_path, gc_victim_events_out_path,
+			       map_cache_stats_out_path);
+			}
 
 out:
 	if (cold_append_thread_started)
@@ -3252,13 +3640,16 @@ static void usage(const char *prog)
 		"  --window-passes-per-round N\n"
 		"  --interleave-pages N\n"
 		"  --interleave-reads N\n"
-		"  --cold-concurrent-threads N\n"
-		"  --page-chain-path PATH\n"
+			"  --cold-concurrent-threads N\n"
+			"  --cold-full-read-mode full-scan-concurrent|random-chunk-concurrent\n"
+			"  --cold-full-read-iters N\n"
+			"  --page-chain-path PATH\n"
 		"  --page-die-transition-path PATH\n"
-		"  --enable-gc-nand-timing\n"
-		"  --gc-nand-timing-path PATH\n"
-		"  --bg-nand-stats-path PATH\n"
-		"  --cold-extra-append-bytes SIZE\n"
+			"  --enable-gc-nand-timing\n"
+			"  --gc-nand-timing-path PATH\n"
+			"  --bg-nand-stats-path PATH\n"
+			"  --map-cache-stats-path PATH\n"
+			"  --cold-extra-append-bytes SIZE\n"
 		"  --cold-extra-mode off|serial|concurrent\n"
 		"  --tag TAG\n", prog);
 }
@@ -3283,6 +3674,9 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->page_die_path = DEFAULT_PAGE_DIE_PATH;
 	opts->page_chain_path = DEFAULT_PAGE_CHAIN_PATH;
 	opts->page_die_transition_path = DEFAULT_PAGE_DIE_TRANSITION_PATH;
+	opts->chain_alloc_events_path = DEFAULT_CHAIN_ALLOC_EVENTS_PATH;
+	opts->chain_cold_events_path = DEFAULT_CHAIN_COLD_EVENTS_PATH;
+	opts->gc_victim_events_path = DEFAULT_GC_VICTIM_EVENTS_PATH;
 	opts->seed = 42U;
 	opts->dist_name = "normal";
 	opts->zipf_alpha = 1.2;
@@ -3296,8 +3690,12 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->enable_gc_nand_timing = false;
 	opts->gc_nand_timing_path = DEFAULT_GC_NAND_TIMING_PATH;
 	opts->bg_nand_stats_path = DEFAULT_BG_NAND_STATS_PATH;
+	opts->map_cache_stats_path = DEFAULT_MAP_CACHE_STATS_PATH;
 	opts->cold_extra_append_bytes = DEFAULT_COLD_EXTRA_APPEND_BYTES;
 	opts->cold_extra_mode = COLD_EXTRA_MODE_OFF;
+	opts->cold_full_read_mode = COLD_FULL_READ_FULL_SCAN;
+	opts->cold_full_read_iters = DEFAULT_COLD_FULL_READ_ITERS;
+	opts->cold_random_chunk_rows = DEFAULT_COLD_RANDOM_CHUNK_ROWS;
 
 	while ((c = getopt_long(argc, argv, "m:s:h", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -3375,10 +3773,16 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		case 1018:
 			opts->normal_stddev = strtod(optarg, NULL);
 			break;
-		case 1019:
-		case 1020:
-		case 1021:
-			break;
+			case 1019:
+				opts->cold_full_read_mode = parse_cold_full_read_mode(optarg);
+				break;
+			case 1020:
+				opts->cold_full_read_iters = (unsigned int)strtoul(optarg, NULL, 10);
+				if (opts->cold_full_read_iters == 0)
+					opts->cold_full_read_iters = DEFAULT_COLD_FULL_READ_ITERS;
+				break;
+			case 1021:
+				break;
 		case 1022:
 			opts->test_phase_path = optarg;
 			break;
@@ -3416,10 +3820,13 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			case 1035:
 				opts->cold_extra_append_bytes = parse_size_arg(optarg);
 				break;
-			case 1036:
-				opts->cold_extra_mode = parse_cold_extra_mode(optarg);
-				break;
-			case 'h':
+				case 1036:
+					opts->cold_extra_mode = parse_cold_extra_mode(optarg);
+					break;
+				case 1037:
+					opts->map_cache_stats_path = optarg;
+					break;
+				case 'h':
 		default:
 			usage(argv[0]);
 			exit(EXIT_FAILURE);

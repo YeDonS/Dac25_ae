@@ -8,15 +8,36 @@
 #   ./build_die.sh die_no2       # repromotion ON  + QLC internal migration ON  (variant 2)
 #   ./build_die.sh die_no3       # repromotion ON  + QLC internal migration OFF
 #   ./build_die.sh die_base      # repromotion OFF + QLC internal migration OFF (baseline)
+#   ./build_die.sh die_base_lru  # baseline + 8MiB demand-loaded mapping CMT + LRU
+#   ./build_die.sh die_no4       # baseline + same 8MiB CMT + simple hot/cold eviction
 #   ./build_die.sh die_base2     # baseline + random die placement for internal moves
 #   ./build_die.sh die_base3     # baseline + shared host lunpointer for internal moves
-#   ./build_die.sh all           # build all seven variants
+#   ./build_die.sh all           # build all variants
 #
 # All variants use ssd_die.c which adds per-die conflict counters
 # and a runtime gc_nand_timing toggle via sysfs.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+BUILD_TMPDIR=""
+
+cleanup_staged_sources() {
+    if [[ -n "${BUILD_TMPDIR:-}" && -d "$BUILD_TMPDIR" ]]; then
+        for f in "$BUILD_TMPDIR"/nvmev_die_*.ko; do
+            [[ -f "$f" ]] && cp "$f" .
+        done
+        rm -rf "$BUILD_TMPDIR"
+        BUILD_TMPDIR=""
+    fi
+    if [[ -f ssd.c.bak ]]; then
+        mv ssd.c.bak ssd.c
+    fi
+    if [[ -f conv_ftl.c.bak ]]; then
+        mv conv_ftl.c.bak conv_ftl.c
+    fi
+}
+
+trap cleanup_staged_sources EXIT
 
 # Map variant name to conv_ftl source file
 ftl_source_for() {
@@ -26,6 +47,8 @@ ftl_source_for() {
         die_no2)  echo "conv_ftl_no2.c"      ;;
         die_no3)  echo "conv_ftl_no3.c"      ;;
         die_base) echo "conv_ftl_baseline.c"  ;;
+        die_base_lru) echo "conv_ftl_baseline_lru.c" ;;
+        die_no4) echo "conv_ftl_no4.c"       ;;
         die_base2) echo "conv_ftl_base2.c"   ;;
         die_base3) echo "conv_ftl_base3.c"   ;;
         *) echo "UNKNOWN"; return 1           ;;
@@ -48,6 +71,7 @@ build_one() {
     # Save previously built die .ko files before make clean wipes them
     local tmpdir
     tmpdir="$(mktemp -d)"
+    BUILD_TMPDIR="$tmpdir"
     for f in nvmev_die_*.ko; do
         [[ -f "$f" ]] && cp "$f" "$tmpdir/"
     done
@@ -73,6 +97,7 @@ build_one() {
         [[ -f "$f" ]] && cp "$f" .
     done
     rm -rf "$tmpdir"
+    BUILD_TMPDIR=""
 
     cp ssd.c.bak ssd.c
     cp conv_ftl.c.bak conv_ftl.c
@@ -80,14 +105,14 @@ build_one() {
 }
 
 if [[ "${1:-}" == "all" ]]; then
-    for v in die_base die_base2 die_base3 die_no1 die_no2 die_no3 die_all; do
+    for v in die_base die_base_lru die_no4 die_base2 die_base3 die_no1 die_no2 die_no3 die_all; do
         build_one "$v"
     done
     echo ""
     echo "=== All variants built ==="
     ls -lh nvmev_die_*.ko
 else
-    VARIANT="${1:?Usage: $0 die_all|die_no1|die_no2|die_no3|die_base|die_base2|die_base3|all}"
+    VARIANT="${1:?Usage: $0 die_all|die_no1|die_no2|die_no3|die_no4|die_base|die_base_lru|die_base2|die_base3|all}"
     ftl_source_for "$VARIANT" >/dev/null || { echo "Unknown variant '$VARIANT'" >&2; exit 1; }
     build_one "$VARIANT"
 fi
