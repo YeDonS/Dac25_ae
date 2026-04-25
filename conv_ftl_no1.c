@@ -671,6 +671,9 @@ static inline bool block_meta_high_purity(struct conv_ftl *conv_ftl, const struc
 	return owner_pages * 4 >= valid_pages * 3;
 }
 
+/* Forward declaration needed before early debug/event helpers use it. */
+static inline uint32_t encode_die(struct ssdparams *spp, const struct ppa *ppa);
+
 struct chain_block_heat {
 	uint64_t heat_sum;
 	uint32_t heat_pages;
@@ -1097,7 +1100,6 @@ static inline bool qlc_zone_is_fast(uint8_t zone)
 /* 前向声明以避免隐式声明错误 */
 static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn);
 static noinline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa);
-static inline uint32_t encode_die(struct ssdparams *spp, const struct ppa *ppa);
 static inline bool mapped_ppa(struct ppa *ppa);
 static inline bool valid_ppa(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
@@ -2315,8 +2317,6 @@ static const struct file_operations page_tier_fops = {
 	.llseek = seq_lseek,
 	.release = single_release,
 };
-
-static inline uint32_t encode_die(struct ssdparams *spp, const struct ppa *ppa);
 
 static int page_die_show(struct seq_file *m, void *v)
 {
