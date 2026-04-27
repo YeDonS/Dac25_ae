@@ -72,9 +72,10 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #ifndef NVMEV_ENABLE_QLC_REBALANCE
 #define NVMEV_ENABLE_QLC_REBALANCE 0
 #endif
-/* Variant: no4 8MiB CMT with simple hot/cold translation-page eviction. */
+/* Variant: no4 keeps SLC-page mappings in DRAM and caches QLC mappings per LPN. */
 #define NVMEV_MAP_CACHE_POLICY_NAME "no4_hotcold"
 #define NVMEV_MAP_CACHE_HOTCOLD 1
+#define NVMEV_MAP_CACHE_SLC_DRAM 1
 
 #define RECENT_WRITE_GUARD_PCT 10U
 #define SLC_EMERGENCY_RESERVE 10
@@ -1306,14 +1307,14 @@ static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lp
 
 static inline uint64_t map_cache_tpage_id(uint64_t lpn)
 {
-	return div_u64(lpn, NVMEV_MAP_ENTRIES_PER_TPAGE);
+	return div_u64(lpn, NVMEV_MAP_CACHE_ENTRIES_PER_SLOT);
 }
 
 static inline uint32_t map_cache_tpage_off(uint64_t lpn)
 {
 	uint32_t rem;
 
-	div_u64_rem(lpn, NVMEV_MAP_ENTRIES_PER_TPAGE, &rem);
+	div_u64_rem(lpn, NVMEV_MAP_CACHE_ENTRIES_PER_SLOT, &rem);
 	return rem;
 }
 
@@ -1354,16 +1355,27 @@ static void map_cache_add_write_latency(struct conv_ftl *conv_ftl, uint64_t *nse
 }
 
 static struct nvmev_map_cache_entry *
-map_cache_find_locked(struct nvmev_map_cache *mc, uint64_t tpage_id)
+map_cache_find_locked(struct conv_ftl *conv_ftl, uint64_t tpage_id)
 {
-	uint32_t i;
+	struct nvmev_map_cache *mc;
+	struct nvmev_map_cache_entry *entry;
+	uint32_t idx;
 
-	for (i = 0; i < mc->nr_entries; i++) {
-		if (mc->entries[i].valid && mc->entries[i].tpage_id == tpage_id)
-			return &mc->entries[i];
-	}
+	if (!conv_ftl)
+		return NULL;
+	mc = &conv_ftl->map_cache;
+	if (!mc->slot_index || tpage_id >= conv_ftl->ssd->sp.tt_pgs)
+		return NULL;
 
-	return NULL;
+	idx = mc->slot_index[tpage_id];
+	if (idx == U32_MAX || idx >= mc->nr_entries)
+		return NULL;
+
+	entry = &mc->entries[idx];
+	if (!entry->valid || entry->tpage_id != tpage_id)
+		return NULL;
+
+	return entry;
 }
 
 static void map_cache_decay_locked(struct conv_ftl *conv_ftl)
@@ -1436,8 +1448,12 @@ map_cache_get_slot_locked(struct conv_ftl *conv_ftl, uint64_t *nsecs)
 
 	if (mc->used_entries < mc->nr_entries) {
 		for (i = 0; i < mc->nr_entries; i++) {
-			if (!mc->entries[i].valid)
-				return &mc->entries[i];
+			uint32_t idx = (mc->free_cursor + i) % mc->nr_entries;
+
+			if (!mc->entries[idx].valid) {
+				mc->free_cursor = (idx + 1) % mc->nr_entries;
+				return &mc->entries[idx];
+			}
 		}
 	}
 
@@ -1451,6 +1467,9 @@ map_cache_get_slot_locked(struct conv_ftl *conv_ftl, uint64_t *nsecs)
 		atomic64_inc(&mc->dirty_evictions);
 		map_cache_add_write_latency(conv_ftl, nsecs);
 	}
+	if (entry->valid && mc->slot_index &&
+	    entry->tpage_id < conv_ftl->ssd->sp.tt_pgs)
+		mc->slot_index[entry->tpage_id] = U32_MAX;
 
 	return entry;
 }
@@ -1460,15 +1479,16 @@ static void map_cache_fill_locked(struct conv_ftl *conv_ftl,
 				  uint64_t tpage_id)
 {
 	struct nvmev_map_cache *mc = &conv_ftl->map_cache;
-	uint64_t start = tpage_id * NVMEV_MAP_ENTRIES_PER_TPAGE;
+	uint64_t start = tpage_id * NVMEV_MAP_CACHE_ENTRIES_PER_SLOT;
 	uint64_t idx;
+	uint32_t slot = (uint32_t)(entry - mc->entries);
 	uint32_t i;
 	unsigned seq;
 	bool was_valid = entry->valid;
 
 	do {
 		seq = read_seqbegin(&conv_ftl->maptbl_lock);
-		for (i = 0; i < NVMEV_MAP_ENTRIES_PER_TPAGE; i++) {
+		for (i = 0; i < NVMEV_MAP_CACHE_ENTRIES_PER_SLOT; i++) {
 			idx = start + i;
 			if (idx < conv_ftl->ssd->sp.tt_pgs)
 				entry->entries[i] = conv_ftl->maptbl[idx];
@@ -1480,6 +1500,8 @@ static void map_cache_fill_locked(struct conv_ftl *conv_ftl,
 	entry->tpage_id = tpage_id;
 	entry->valid = true;
 	entry->dirty = false;
+	if (mc->slot_index && tpage_id < conv_ftl->ssd->sp.tt_pgs)
+		mc->slot_index[tpage_id] = slot;
 	mc->access_seq++;
 	map_cache_decay_locked(conv_ftl);
 	entry->heat = mc->hotcold ? 1 : 0;
@@ -1512,8 +1534,21 @@ static noinline struct ppa get_maptbl_ent_cached(struct conv_ftl *conv_ftl,
 	off = map_cache_tpage_off(lpn);
 	atomic64_inc(&mc->lookups);
 
+#if NVMEV_MAP_CACHE_SLC_DRAM
+	{
+		struct ppa backing = get_maptbl_ent(conv_ftl, lpn);
+
+		if (mapped_ppa(&backing) && valid_ppa(conv_ftl, &backing) &&
+		    is_slc_block(conv_ftl, backing.g.blk)) {
+			atomic64_inc(&mc->hits);
+			atomic64_inc(&mc->slc_dram_hits);
+			return backing;
+		}
+	}
+#endif
+
 	spin_lock_irqsave(&mc->lock, flags);
-	entry = map_cache_find_locked(mc, tpage_id);
+	entry = map_cache_find_locked(conv_ftl, tpage_id);
 	if (entry) {
 		atomic64_inc(&mc->hits);
 		ppa = entry->entries[off];
@@ -1554,7 +1589,26 @@ static void map_cache_update_lpn(struct conv_ftl *conv_ftl, uint64_t lpn,
 	off = map_cache_tpage_off(lpn);
 
 	spin_lock_irqsave(&mc->lock, flags);
-	entry = map_cache_find_locked(mc, tpage_id);
+	entry = map_cache_find_locked(conv_ftl, tpage_id);
+#if NVMEV_MAP_CACHE_SLC_DRAM
+	if (entry) {
+		struct ppa new_ppa = *ppa;
+
+		if (mapped_ppa(&new_ppa) && valid_ppa(conv_ftl, &new_ppa) &&
+		    is_slc_block(conv_ftl, new_ppa.g.blk)) {
+			if (mc->slot_index && tpage_id < conv_ftl->ssd->sp.tt_pgs)
+				mc->slot_index[tpage_id] = U32_MAX;
+			list_del_init(&entry->lru_node);
+			entry->valid = false;
+			entry->dirty = false;
+			if (mc->used_entries > 0)
+				mc->used_entries--;
+			mc->free_cursor = (uint32_t)(entry - mc->entries);
+			spin_unlock_irqrestore(&mc->lock, flags);
+			return;
+		}
+	}
+#endif
 	if (entry) {
 		entry->entries[off] = *ppa;
 		entry->dirty = true;
@@ -1566,6 +1620,7 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 {
 	struct nvmev_map_cache *mc;
 	uint32_t i;
+	uint64_t idx;
 
 	if (!conv_ftl || !conv_ftl->maptbl_initialized || !conv_ftl->maptbl)
 		return -EINVAL;
@@ -1574,26 +1629,31 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 	memset(mc, 0, sizeof(*mc));
 	spin_lock_init(&mc->lock);
 	INIT_LIST_HEAD(&mc->lru);
-	mc->nr_entries = NVMEV_MAP_CMT_TPAGES;
+	mc->nr_entries = NVMEV_MAP_CMT_SLOTS;
 	mc->hotcold = hotcold;
 
 	mc->entries = vzalloc(sizeof(*mc->entries) * mc->nr_entries);
 	mc->entry_storage = vmalloc(sizeof(struct ppa) *
 				    (size_t)mc->nr_entries *
-				    NVMEV_MAP_ENTRIES_PER_TPAGE);
-	if (!mc->entries || !mc->entry_storage) {
+				    NVMEV_MAP_CACHE_ENTRIES_PER_SLOT);
+	mc->slot_index = vmalloc(sizeof(uint32_t) * (size_t)conv_ftl->ssd->sp.tt_pgs);
+	if (!mc->entries || !mc->entry_storage || !mc->slot_index) {
 		vfree(mc->entries);
 		vfree(mc->entry_storage);
+		vfree(mc->slot_index);
 		memset(mc, 0, sizeof(*mc));
-		NVMEV_ERROR("Failed to allocate map CMT: tpages=%u bytes=%llu\n",
-			    (unsigned int)NVMEV_MAP_CMT_TPAGES,
+		NVMEV_ERROR("Failed to allocate map CMT: slots=%u bytes=%llu\n",
+			    (unsigned int)NVMEV_MAP_CMT_SLOTS,
 			    (unsigned long long)NVMEV_MAP_CMT_BYTES);
 		return -ENOMEM;
 	}
 
+	for (idx = 0; idx < conv_ftl->ssd->sp.tt_pgs; idx++)
+		mc->slot_index[idx] = U32_MAX;
+
 	for (i = 0; i < mc->nr_entries; i++) {
 		mc->entries[i].entries =
-			&mc->entry_storage[i * NVMEV_MAP_ENTRIES_PER_TPAGE];
+			&mc->entry_storage[i * NVMEV_MAP_CACHE_ENTRIES_PER_SLOT];
 		INIT_LIST_HEAD(&mc->entries[i].lru_node);
 	}
 
@@ -1606,13 +1666,14 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 	atomic64_set(&mc->metadata_writes, 0);
 	atomic64_set(&mc->metadata_read_ns, 0);
 	atomic64_set(&mc->metadata_write_ns, 0);
+	atomic64_set(&mc->slc_dram_hits, 0);
 	atomic64_set(&mc->heat_decays, 0);
 	mc->initialized = true;
 
-	NVMEV_INFO("Map CMT policy=%s budget=%llu bytes tpages=%u entries_per_tpage=%u\n",
+	NVMEV_INFO("Map CMT policy=%s budget=%llu bytes slots=%u entries_per_slot=%u\n",
 		   NVMEV_MAP_CACHE_POLICY_NAME,
 		   (unsigned long long)NVMEV_MAP_CMT_BYTES,
-		   mc->nr_entries, NVMEV_MAP_ENTRIES_PER_TPAGE);
+		   mc->nr_entries, NVMEV_MAP_CACHE_ENTRIES_PER_SLOT);
 	return 0;
 }
 
@@ -1626,6 +1687,7 @@ static void remove_map_cache(struct conv_ftl *conv_ftl)
 	mc = &conv_ftl->map_cache;
 	vfree(mc->entries);
 	vfree(mc->entry_storage);
+	vfree(mc->slot_index);
 	memset(mc, 0, sizeof(*mc));
 }
 
@@ -1989,12 +2051,15 @@ static int map_cache_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "cmt_bytes %llu\n", (unsigned long long)NVMEV_MAP_CMT_BYTES);
 	seq_printf(m, "translation_page_bytes %u\n", NVMEV_MAP_TPAGE_BYTES);
 	seq_printf(m, "entries_per_translation_page %u\n", NVMEV_MAP_ENTRIES_PER_TPAGE);
-	seq_printf(m, "cached_translation_pages %u\n", mc->nr_entries);
-	seq_printf(m, "used_translation_pages %u\n", mc->used_entries);
+	seq_printf(m, "cache_entries_per_slot %u\n", NVMEV_MAP_CACHE_ENTRIES_PER_SLOT);
+	seq_printf(m, "cached_mapping_entries %u\n", mc->nr_entries);
+	seq_printf(m, "used_mapping_entries %u\n", mc->used_entries);
 	seq_printf(m, "hotcold %u\n", mc->hotcold ? 1U : 0U);
 	seq_printf(m, "lookups %llu\n", (unsigned long long)lookups);
 	seq_printf(m, "hits %llu\n", (unsigned long long)hits);
 	seq_printf(m, "misses %llu\n", (unsigned long long)misses);
+	seq_printf(m, "slc_dram_hits %llu\n",
+		   (unsigned long long)atomic64_read(&mc->slc_dram_hits));
 	seq_printf(m, "hit_ratio_permille %llu\n",
 		   lookups ? (unsigned long long)div64_u64(hits * 1000ULL, lookups) : 0ULL);
 	seq_printf(m, "metadata_reads %llu\n",

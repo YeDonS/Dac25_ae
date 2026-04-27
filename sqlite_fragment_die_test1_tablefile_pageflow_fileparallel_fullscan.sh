@@ -16,7 +16,7 @@ source commonvariables.sh
 
 # ---------- tunables ----------
 THREAD_COUNTS="${THREAD_COUNTS:-1 8}"
-VARIANTS="${VARIANTS:-die_base die_no1 die_no2 die_no3 die_all}"
+VARIANTS="${VARIANTS:-die_base die_no1 die_base_lru die_no4}"
 
 SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
 SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-80}
@@ -43,12 +43,13 @@ SQLITE_COLD_FULL_READ_ITERS=${SQLITE_COLD_FULL_READ_ITERS:-1}
 SQLITE_COLD_FULL_READ_MODE=${SQLITE_COLD_FULL_READ_MODE:-full-scan-concurrent}
 SQLITE_COLD_EXTRA_APPEND_BYTES=${SQLITE_COLD_EXTRA_APPEND_BYTES:-0}
 SQLITE_COLD_EXTRA_MODE=${SQLITE_COLD_EXTRA_MODE:-off}
+SQLITE_ACCESS_DIST=${SQLITE_ACCESS_DIST:-zipf}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
 NORMAL_STDDEV=${NORMAL_STDDEV:-400}
 NORMAL_SEED=${NORMAL_SEED:-314159}
 ZIPF_SEED=${ZIPF_SEED:-42}
 EXP_SEED=${EXP_SEED:-4242}
-ZIPF_ALPHA=${ZIPF_ALPHA:-1.2}
+ZIPF_ALPHA=${ZIPF_ALPHA:-1.8}
 EXP_LAMBDA=${EXP_LAMBDA:-0.0008}
 # ---------- end tunables ----------
 
@@ -145,7 +146,7 @@ run_one_test() {
     echo "================================================================"
     echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  tag=$tag"
     echo "  per-table-db=ON  logical_row_bytes~32KB  est_row_pages~8  tables=$SQLITE_TABLE_COUNT  rows/tbl_override=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  cold_mode=$SQLITE_COLD_FULL_READ_MODE  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
+    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  cold_mode=$SQLITE_COLD_FULL_READ_MODE  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
     echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH"
     echo "  note: default run uses no dummy; cold scan uses one thread per table file within each batch"
     echo "================================================================"
@@ -188,7 +189,7 @@ run_one_test() {
         --interleave-pages "$SQLITE_INTERLEAVE_PAGES" \
         --interleave-reads "$SQLITE_INTERLEAVE_READS" \
         --ftl-host-page-bytes "$SQLITE_FTL_HOST_PAGE_BYTES" \
-        --distribution normal \
+        --distribution "$SQLITE_ACCESS_DIST" \
         --zipf-seed "$ZIPF_SEED" \
         --exp-seed "$EXP_SEED" \
         --normal-seed "$NORMAL_SEED" \

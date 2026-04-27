@@ -144,12 +144,13 @@ struct nvmev_gc_victim_event {
 #define NVMEV_MAP_TPAGE_BYTES 4096U
 #define NVMEV_MAP_ENTRIES_PER_TPAGE (NVMEV_MAP_TPAGE_BYTES / NVMEV_MAP_ENTRY_BYTES)
 #define NVMEV_MAP_CMT_BYTES (8ULL << 20)
-#define NVMEV_MAP_CMT_TPAGES (NVMEV_MAP_CMT_BYTES / NVMEV_MAP_TPAGE_BYTES)
+#define NVMEV_MAP_CACHE_ENTRIES_PER_SLOT 1U
+#define NVMEV_MAP_CMT_SLOTS (NVMEV_MAP_CMT_BYTES / NVMEV_MAP_ENTRY_BYTES)
 #define NVMEV_MAP_EVICT_SCAN 64U
 #define NVMEV_MAP_HEAT_DECAY_INTERVAL 100000ULL
 
 struct nvmev_map_cache_entry {
-	uint64_t tpage_id;
+	uint64_t tpage_id; /* page-level CMT: this is the owner LPN */
 	struct ppa *entries;
 	bool valid;
 	bool dirty;
@@ -161,9 +162,11 @@ struct nvmev_map_cache {
 	spinlock_t lock;
 	struct nvmev_map_cache_entry *entries;
 	struct ppa *entry_storage;
+	uint32_t *slot_index;
 	struct list_head lru;
 	uint32_t nr_entries;
 	uint32_t used_entries;
+	uint32_t free_cursor;
 	uint64_t access_seq;
 	bool initialized;
 	bool hotcold;
@@ -176,6 +179,7 @@ struct nvmev_map_cache {
 	atomic64_t metadata_writes;
 	atomic64_t metadata_read_ns;
 	atomic64_t metadata_write_ns;
+	atomic64_t slc_dram_hits;
 	atomic64_t heat_decays;
 };
 

@@ -130,11 +130,15 @@ struct map_cache_stats {
 	unsigned int initialized;
 	unsigned int hotcold;
 	unsigned long long cmt_bytes;
+	unsigned long long cache_entries_per_slot;
 	unsigned long long cached_translation_pages;
 	unsigned long long used_translation_pages;
+	unsigned long long cached_mapping_entries;
+	unsigned long long used_mapping_entries;
 	unsigned long long lookups;
 	unsigned long long hits;
 	unsigned long long misses;
+	unsigned long long slc_dram_hits;
 	unsigned long long metadata_reads;
 	unsigned long long metadata_writes;
 	unsigned long long metadata_read_ns;
@@ -822,11 +826,20 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 			continue;
 		if (sscanf(line, "cmt_bytes %llu", &tmp.cmt_bytes) == 1)
 			continue;
+		if (sscanf(line, "cache_entries_per_slot %llu",
+			   &tmp.cache_entries_per_slot) == 1)
+			continue;
 		if (sscanf(line, "cached_translation_pages %llu",
 			   &tmp.cached_translation_pages) == 1)
 			continue;
 		if (sscanf(line, "used_translation_pages %llu",
 			   &tmp.used_translation_pages) == 1)
+			continue;
+		if (sscanf(line, "cached_mapping_entries %llu",
+			   &tmp.cached_mapping_entries) == 1)
+			continue;
+		if (sscanf(line, "used_mapping_entries %llu",
+			   &tmp.used_mapping_entries) == 1)
 			continue;
 		if (sscanf(line, "hotcold %u", &tmp.hotcold) == 1)
 			continue;
@@ -835,6 +848,8 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 		if (sscanf(line, "hits %llu", &tmp.hits) == 1)
 			continue;
 		if (sscanf(line, "misses %llu", &tmp.misses) == 1)
+			continue;
+		if (sscanf(line, "slc_dram_hits %llu", &tmp.slc_dram_hits) == 1)
 			continue;
 		if (sscanf(line, "metadata_reads %llu", &tmp.metadata_reads) == 1)
 			continue;
@@ -864,6 +879,10 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 
 	if (!tmp.metadata_total_ns)
 		tmp.metadata_total_ns = tmp.metadata_read_ns + tmp.metadata_write_ns;
+	if (!tmp.cached_mapping_entries)
+		tmp.cached_mapping_entries = tmp.cached_translation_pages;
+	if (!tmp.used_mapping_entries)
+		tmp.used_mapping_entries = tmp.used_translation_pages;
 	if (!tmp.policy[0])
 		snprintf(tmp.policy, sizeof(tmp.policy), "%s", "unknown");
 	*stats = tmp;
@@ -918,6 +937,7 @@ static void map_cache_stats_delta(struct map_cache_stats *dst,
 	dst->lookups = diff_u64(after->lookups, before->lookups);
 	dst->hits = diff_u64(after->hits, before->hits);
 	dst->misses = diff_u64(after->misses, before->misses);
+	dst->slc_dram_hits = diff_u64(after->slc_dram_hits, before->slc_dram_hits);
 	dst->metadata_reads = diff_u64(after->metadata_reads, before->metadata_reads);
 	dst->metadata_writes = diff_u64(after->metadata_writes, before->metadata_writes);
 	dst->metadata_read_ns = diff_u64(after->metadata_read_ns, before->metadata_read_ns);
@@ -3572,16 +3592,19 @@ static int run_init_mode(const struct workload_options *opts)
 					map_cache_stats.metadata_write_ns / map_cache_stats.metadata_writes : 0ULL;
 
 				printf("[sqlite_init] map_cache scope=%s policy=%s initialized=%u hotcold=%u cmt_bytes=%llu "
-				       "cached_translation_pages=%llu used_translation_pages=%llu lookups=%llu hits=%llu "
-				       "misses=%llu hit_ratio=%.6f metadata_reads=%llu metadata_writes=%llu "
+				       "cache_entries_per_slot=%llu cached_mapping_entries=%llu used_mapping_entries=%llu "
+				       "lookups=%llu hits=%llu misses=%llu slc_dram_hits=%llu hit_ratio=%.6f "
+				       "metadata_reads=%llu metadata_writes=%llu "
 				       "metadata_read_time=%.9fs metadata_write_time=%.9fs metadata_total_time=%.9fs "
 				       "avg_metadata_read_ns=%llu avg_metadata_write_ns=%llu evictions=%llu dirty_evictions=%llu\n",
 				       map_cache_scope, map_cache_stats.policy, map_cache_stats.initialized,
 				       map_cache_stats.hotcold, map_cache_stats.cmt_bytes,
-				       map_cache_stats.cached_translation_pages,
-				       map_cache_stats.used_translation_pages,
+				       map_cache_stats.cache_entries_per_slot,
+				       map_cache_stats.cached_mapping_entries,
+				       map_cache_stats.used_mapping_entries,
 				       map_cache_stats.lookups, map_cache_stats.hits,
-				       map_cache_stats.misses, hit_ratio,
+				       map_cache_stats.misses,
+				       map_cache_stats.slc_dram_hits, hit_ratio,
 				       map_cache_stats.metadata_reads,
 				       map_cache_stats.metadata_writes,
 				       metadata_read_sec, metadata_write_sec,
@@ -3838,6 +3861,8 @@ int main(int argc, char **argv)
 {
 	struct workload_options opts;
 
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	setvbuf(stderr, NULL, _IOLBF, 0);
 	configure_options(argc, argv, &opts);
 	if (ensure_directory(TARGET_FOLDER) != 0 || ensure_directory(RESULT_FOLDER) != 0) {
 		fprintf(stderr, "Failed to create target/result directories\n");
