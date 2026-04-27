@@ -88,6 +88,7 @@ enum cold_extra_mode {
 enum cold_full_read_mode {
 	COLD_FULL_READ_FULL_SCAN = 0,
 	COLD_FULL_READ_RANDOM_CHUNK,
+	COLD_FULL_READ_RANDOM_ROW,
 };
 
 struct page_die_entry {
@@ -129,18 +130,29 @@ struct map_cache_stats {
 	char policy[64];
 	unsigned int initialized;
 	unsigned int hotcold;
+	unsigned int qlc_cmt_enabled;
 	unsigned long long cmt_bytes;
 	unsigned long long cache_entries_per_slot;
 	unsigned long long cached_translation_pages;
 	unsigned long long used_translation_pages;
 	unsigned long long cached_mapping_entries;
 	unsigned long long used_mapping_entries;
+	unsigned long long gtd_entries;
+	unsigned long long gtd_dram_bytes;
+	unsigned long long slc_dram_map_bytes;
+	unsigned long long flash_translation_store_bytes;
+	unsigned long long slc_log_entries_pending;
 	unsigned long long lookups;
 	unsigned long long hits;
 	unsigned long long misses;
 	unsigned long long slc_dram_hits;
+	unsigned long long gtd_lookups;
+	unsigned long long qlc_flash_reads;
 	unsigned long long metadata_reads;
 	unsigned long long metadata_writes;
+	unsigned long long slc_meta_log_writes;
+	unsigned long long qlc_meta_folds;
+	unsigned long long qlc_meta_writes;
 	unsigned long long metadata_read_ns;
 	unsigned long long metadata_write_ns;
 	unsigned long long metadata_total_ns;
@@ -375,6 +387,11 @@ static enum cold_full_read_mode parse_cold_full_read_mode(const char *arg)
 	    !strcasecmp(arg, "random-chunk") ||
 	    !strcasecmp(arg, "random-chunk-concurrent"))
 		return COLD_FULL_READ_RANDOM_CHUNK;
+	if (!strcasecmp(arg, "random-row") ||
+	    !strcasecmp(arg, "random-row-concurrent") ||
+	    !strcasecmp(arg, "random-point") ||
+	    !strcasecmp(arg, "random-point-concurrent"))
+		return COLD_FULL_READ_RANDOM_ROW;
 	return COLD_FULL_READ_FULL_SCAN;
 }
 
@@ -383,6 +400,8 @@ static const char *cold_full_read_mode_label(enum cold_full_read_mode mode)
 	switch (mode) {
 	case COLD_FULL_READ_RANDOM_CHUNK:
 		return "random-chunk-concurrent";
+	case COLD_FULL_READ_RANDOM_ROW:
+		return "random-row-concurrent";
 	case COLD_FULL_READ_FULL_SCAN:
 	default:
 		return "full-scan-concurrent";
@@ -824,6 +843,8 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 			continue;
 		if (sscanf(line, "initialized %u", &tmp.initialized) == 1)
 			continue;
+		if (sscanf(line, "qlc_cmt_enabled %u", &tmp.qlc_cmt_enabled) == 1)
+			continue;
 		if (sscanf(line, "cmt_bytes %llu", &tmp.cmt_bytes) == 1)
 			continue;
 		if (sscanf(line, "cache_entries_per_slot %llu",
@@ -838,23 +859,47 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 		if (sscanf(line, "cached_mapping_entries %llu",
 			   &tmp.cached_mapping_entries) == 1)
 			continue;
-		if (sscanf(line, "used_mapping_entries %llu",
-			   &tmp.used_mapping_entries) == 1)
-			continue;
-		if (sscanf(line, "hotcold %u", &tmp.hotcold) == 1)
-			continue;
-		if (sscanf(line, "lookups %llu", &tmp.lookups) == 1)
-			continue;
+			if (sscanf(line, "used_mapping_entries %llu",
+				   &tmp.used_mapping_entries) == 1)
+				continue;
+			if (sscanf(line, "gtd_entries %llu", &tmp.gtd_entries) == 1)
+				continue;
+			if (sscanf(line, "gtd_dram_bytes %llu", &tmp.gtd_dram_bytes) == 1)
+				continue;
+			if (sscanf(line, "slc_dram_map_bytes %llu",
+				   &tmp.slc_dram_map_bytes) == 1)
+				continue;
+			if (sscanf(line, "flash_translation_store_bytes %llu",
+				   &tmp.flash_translation_store_bytes) == 1)
+				continue;
+			if (sscanf(line, "slc_log_entries_pending %llu",
+				   &tmp.slc_log_entries_pending) == 1)
+				continue;
+			if (sscanf(line, "hotcold %u", &tmp.hotcold) == 1)
+				continue;
+			if (sscanf(line, "lookups %llu", &tmp.lookups) == 1)
+				continue;
 		if (sscanf(line, "hits %llu", &tmp.hits) == 1)
 			continue;
 		if (sscanf(line, "misses %llu", &tmp.misses) == 1)
 			continue;
-		if (sscanf(line, "slc_dram_hits %llu", &tmp.slc_dram_hits) == 1)
-			continue;
-		if (sscanf(line, "metadata_reads %llu", &tmp.metadata_reads) == 1)
-			continue;
-		if (sscanf(line, "metadata_writes %llu", &tmp.metadata_writes) == 1)
-			continue;
+			if (sscanf(line, "slc_dram_hits %llu", &tmp.slc_dram_hits) == 1)
+				continue;
+			if (sscanf(line, "gtd_lookups %llu", &tmp.gtd_lookups) == 1)
+				continue;
+			if (sscanf(line, "qlc_flash_reads %llu", &tmp.qlc_flash_reads) == 1)
+				continue;
+			if (sscanf(line, "metadata_reads %llu", &tmp.metadata_reads) == 1)
+				continue;
+			if (sscanf(line, "metadata_writes %llu", &tmp.metadata_writes) == 1)
+				continue;
+			if (sscanf(line, "slc_meta_log_writes %llu",
+				   &tmp.slc_meta_log_writes) == 1)
+				continue;
+			if (sscanf(line, "qlc_meta_folds %llu", &tmp.qlc_meta_folds) == 1)
+				continue;
+			if (sscanf(line, "qlc_meta_writes %llu", &tmp.qlc_meta_writes) == 1)
+				continue;
 		if (sscanf(line, "metadata_read_ns %llu", &tmp.metadata_read_ns) == 1)
 			continue;
 		if (sscanf(line, "metadata_write_ns %llu", &tmp.metadata_write_ns) == 1)
@@ -883,6 +928,8 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 		tmp.cached_mapping_entries = tmp.cached_translation_pages;
 	if (!tmp.used_mapping_entries)
 		tmp.used_mapping_entries = tmp.used_translation_pages;
+	if (!tmp.qlc_cmt_enabled && tmp.cmt_bytes)
+		tmp.qlc_cmt_enabled = 1;
 	if (!tmp.policy[0])
 		snprintf(tmp.policy, sizeof(tmp.policy), "%s", "unknown");
 	*stats = tmp;
@@ -938,8 +985,15 @@ static void map_cache_stats_delta(struct map_cache_stats *dst,
 	dst->hits = diff_u64(after->hits, before->hits);
 	dst->misses = diff_u64(after->misses, before->misses);
 	dst->slc_dram_hits = diff_u64(after->slc_dram_hits, before->slc_dram_hits);
+	dst->gtd_lookups = diff_u64(after->gtd_lookups, before->gtd_lookups);
+	dst->qlc_flash_reads = diff_u64(after->qlc_flash_reads, before->qlc_flash_reads);
 	dst->metadata_reads = diff_u64(after->metadata_reads, before->metadata_reads);
 	dst->metadata_writes = diff_u64(after->metadata_writes, before->metadata_writes);
+	dst->slc_meta_log_writes = diff_u64(after->slc_meta_log_writes,
+					    before->slc_meta_log_writes);
+	dst->qlc_meta_folds = diff_u64(after->qlc_meta_folds, before->qlc_meta_folds);
+	dst->qlc_meta_writes = diff_u64(after->qlc_meta_writes,
+					before->qlc_meta_writes);
 	dst->metadata_read_ns = diff_u64(after->metadata_read_ns, before->metadata_read_ns);
 	dst->metadata_write_ns = diff_u64(after->metadata_write_ns, before->metadata_write_ns);
 	dst->metadata_total_ns = diff_u64(after->metadata_total_ns, before->metadata_total_ns);
@@ -2166,6 +2220,12 @@ static int scan_stmt_range(sqlite3_stmt *stmt, int begin, int end,
 	return rc;
 }
 
+static int scan_stmt_one_row(sqlite3_stmt *stmt, int row_id,
+			     unsigned long long *rows_read)
+{
+	return scan_stmt_range(stmt, row_id, row_id + 1, rows_read);
+}
+
 static void shuffle_u32(unsigned int *order, unsigned int count, unsigned int *state)
 {
 	if (!order || !state)
@@ -2235,11 +2295,28 @@ static void *full_scan_worker(void *arg)
 					break;
 				}
 			}
-		}
-		free(order);
-	} else {
-		for (unsigned int rep = 0; rep < ctx->repeats; ++rep) {
-			int rc = scan_stmt_range(stmt, ctx->record_id_begin,
+			}
+			free(order);
+		} else if (ctx->mode == COLD_FULL_READ_RANDOM_ROW) {
+			unsigned int total_rows = (ctx->record_id_end > ctx->record_id_begin) ?
+				(unsigned int)(ctx->record_id_end - ctx->record_id_begin) : 0U;
+			unsigned int state = ctx->rng_seed ? ctx->rng_seed : 1U;
+
+			for (unsigned int rep = 0; rep < ctx->repeats && total_rows > 0; ++rep) {
+				for (unsigned int i = 0; i < total_rows; ++i) {
+					int row_id = ctx->record_id_begin +
+						(int)(next_rand(&state) % total_rows);
+					int rc = scan_stmt_one_row(stmt, row_id, &ctx->rows_read);
+
+					if (rc != SQLITE_DONE) {
+						rep = ctx->repeats;
+						break;
+					}
+				}
+			}
+		} else {
+			for (unsigned int rep = 0; rep < ctx->repeats; ++rep) {
+				int rc = scan_stmt_range(stmt, ctx->record_id_begin,
 					      ctx->record_id_end, &ctx->rows_read);
 			if (rc != SQLITE_DONE)
 				break;
@@ -3531,13 +3608,11 @@ static int run_init_mode(const struct workload_options *opts)
 			printf("[sqlite_init] table_bytes=%.2fGiB dummy_bytes=%.2fGiB combined_write_bytes=%.2fGiB\n",
 			       table_gib, dummy_gib, table_gib + dummy_gib);
 			if (opts->cold_extra_append_bytes > 0 && opts->cold_extra_mode != COLD_EXTRA_MODE_OFF) {
+				const char *read_mode = cold_full_read_mode_label(opts->cold_full_read_mode);
+
 				cold_mode = opts->cold_extra_mode == COLD_EXTRA_MODE_CONCURRENT ?
-					(opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CHUNK ?
-					 "random-chunk-concurrent+append-concurrent" :
-					 "full-scan-concurrent+append-concurrent") :
-					(opts->cold_full_read_mode == COLD_FULL_READ_RANDOM_CHUNK ?
-					 "append-serial+random-chunk-concurrent" :
-					 "append-serial+full-scan-concurrent");
+					"read-concurrent+append-concurrent" :
+					read_mode;
 				printf("[sqlite_init] cold_extra_append mode=%s target_bytes=%llu actual_payload_bytes=%llu "
 				       "rows_written=%llu page_growth=%llu append_time=%.6fs stage_total=%.6fs\n",
 				       cold_extra_mode_label(opts->cold_extra_mode),
@@ -3591,22 +3666,34 @@ static int run_init_mode(const struct workload_options *opts)
 				unsigned long long avg_write_ns = map_cache_stats.metadata_writes ?
 					map_cache_stats.metadata_write_ns / map_cache_stats.metadata_writes : 0ULL;
 
-				printf("[sqlite_init] map_cache scope=%s policy=%s initialized=%u hotcold=%u cmt_bytes=%llu "
+				printf("[sqlite_init] map_cache scope=%s policy=%s initialized=%u hotcold=%u qlc_cmt_enabled=%u cmt_bytes=%llu "
 				       "cache_entries_per_slot=%llu cached_mapping_entries=%llu used_mapping_entries=%llu "
-				       "lookups=%llu hits=%llu misses=%llu slc_dram_hits=%llu hit_ratio=%.6f "
-				       "metadata_reads=%llu metadata_writes=%llu "
+				       "gtd_entries=%llu gtd_dram_bytes=%llu slc_dram_map_bytes=%llu flash_translation_store_bytes=%llu slc_log_entries_pending=%llu "
+				       "lookups=%llu hits=%llu misses=%llu slc_dram_hits=%llu gtd_lookups=%llu qlc_flash_reads=%llu hit_ratio=%.6f "
+				       "metadata_reads=%llu metadata_writes=%llu slc_meta_log_writes=%llu qlc_meta_folds=%llu qlc_meta_writes=%llu "
 				       "metadata_read_time=%.9fs metadata_write_time=%.9fs metadata_total_time=%.9fs "
 				       "avg_metadata_read_ns=%llu avg_metadata_write_ns=%llu evictions=%llu dirty_evictions=%llu\n",
 				       map_cache_scope, map_cache_stats.policy, map_cache_stats.initialized,
-				       map_cache_stats.hotcold, map_cache_stats.cmt_bytes,
+				       map_cache_stats.hotcold, map_cache_stats.qlc_cmt_enabled,
+				       map_cache_stats.cmt_bytes,
 				       map_cache_stats.cache_entries_per_slot,
 				       map_cache_stats.cached_mapping_entries,
 				       map_cache_stats.used_mapping_entries,
+				       map_cache_stats.gtd_entries,
+				       map_cache_stats.gtd_dram_bytes,
+				       map_cache_stats.slc_dram_map_bytes,
+				       map_cache_stats.flash_translation_store_bytes,
+				       map_cache_stats.slc_log_entries_pending,
 				       map_cache_stats.lookups, map_cache_stats.hits,
 				       map_cache_stats.misses,
-				       map_cache_stats.slc_dram_hits, hit_ratio,
+				       map_cache_stats.slc_dram_hits,
+				       map_cache_stats.gtd_lookups,
+				       map_cache_stats.qlc_flash_reads, hit_ratio,
 				       map_cache_stats.metadata_reads,
 				       map_cache_stats.metadata_writes,
+				       map_cache_stats.slc_meta_log_writes,
+				       map_cache_stats.qlc_meta_folds,
+				       map_cache_stats.qlc_meta_writes,
 				       metadata_read_sec, metadata_write_sec,
 				       metadata_total_sec, avg_read_ns, avg_write_ns,
 				       map_cache_stats.evictions,
@@ -3664,7 +3751,7 @@ static void usage(const char *prog)
 		"  --interleave-pages N\n"
 		"  --interleave-reads N\n"
 			"  --cold-concurrent-threads N\n"
-			"  --cold-full-read-mode full-scan-concurrent|random-chunk-concurrent\n"
+				"  --cold-full-read-mode full-scan-concurrent|random-chunk-concurrent|random-row-concurrent\n"
 			"  --cold-full-read-iters N\n"
 			"  --page-chain-path PATH\n"
 		"  --page-die-transition-path PATH\n"

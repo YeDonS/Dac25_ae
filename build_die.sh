@@ -1,4 +1,5 @@
 #!/bin/bash -e
+set -e
 #
 # build_die.sh - Build NVMeVirt kernel module with die-contention timing enabled.
 #
@@ -9,10 +10,11 @@
 #   ./build_die.sh die_no3       # repromotion ON  + QLC internal migration OFF
 #   ./build_die.sh die_base      # repromotion OFF + QLC internal migration OFF (baseline)
 #   ./build_die.sh die_base_lru  # baseline + 8MiB demand-loaded mapping CMT + LRU
-#   ./build_die.sh die_no4       # baseline + same 8MiB CMT + simple hot/cold eviction
+#   ./build_die.sh die_no4       # structured GTD + SLC-metadata-log + QLC flash mappings
 #   ./build_die.sh die_base2     # baseline + random die placement for internal moves
 #   ./build_die.sh die_base3     # baseline + shared host lunpointer for internal moves
 #   ./build_die.sh all           # build all variants
+#   ./build_die.sh die_base die_no1 die_no4 die_base_lru
 #
 # All variants use ssd_die.c which adds per-die conflict counters
 # and a runtime gc_nand_timing toggle via sysfs.
@@ -111,8 +113,13 @@ if [[ "${1:-}" == "all" ]]; then
     echo ""
     echo "=== All variants built ==="
     ls -lh nvmev_die_*.ko
+elif [[ "$#" -gt 1 ]]; then
+    for v in "$@"; do
+        ftl_source_for "$v" >/dev/null || { echo "Unknown variant '$v'" >&2; exit 1; }
+        build_one "$v"
+    done
 else
-    VARIANT="${1:?Usage: $0 die_all|die_no1|die_no2|die_no3|die_no4|die_base|die_base_lru|die_base2|die_base3|all}"
+    VARIANT="${1:?Usage: $0 die_all|die_no1|die_no2|die_no3|die_no4|die_base|die_base_lru|die_base2|die_base3|all [more variants...]}"
     ftl_source_for "$VARIANT" >/dev/null || { echo "Unknown variant '$VARIANT'" >&2; exit 1; }
     build_one "$VARIANT"
 fi

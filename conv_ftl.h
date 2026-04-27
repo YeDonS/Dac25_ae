@@ -148,6 +148,15 @@ struct nvmev_gc_victim_event {
 #define NVMEV_MAP_CMT_SLOTS (NVMEV_MAP_CMT_BYTES / NVMEV_MAP_ENTRY_BYTES)
 #define NVMEV_MAP_EVICT_SCAN 64U
 #define NVMEV_MAP_HEAT_DECAY_INTERVAL 100000ULL
+#define NVMEV_MAP_META_TIER_SLC 0U
+#define NVMEV_MAP_META_TIER_QLC 1U
+
+struct nvmev_map_gtd_entry {
+	struct ppa ppa;
+	uint16_t dirty_entries;
+	uint8_t tier;
+	uint8_t valid;
+};
 
 struct nvmev_map_cache_entry {
 	uint64_t tpage_id; /* page-level CMT: this is the owner LPN */
@@ -163,10 +172,15 @@ struct nvmev_map_cache {
 	struct nvmev_map_cache_entry *entries;
 	struct ppa *entry_storage;
 	uint32_t *slot_index;
+	struct nvmev_map_gtd_entry *gtd;
+	struct ppa *flash_entries;
 	struct list_head lru;
 	uint32_t nr_entries;
 	uint32_t used_entries;
 	uint32_t free_cursor;
+	uint32_t gtd_entries;
+	uint32_t slc_log_entries_pending;
+	uint64_t meta_alloc_seq;
 	uint64_t access_seq;
 	bool initialized;
 	bool hotcold;
@@ -181,6 +195,11 @@ struct nvmev_map_cache {
 	atomic64_t metadata_write_ns;
 	atomic64_t slc_dram_hits;
 	atomic64_t heat_decays;
+	atomic64_t gtd_lookups;
+	atomic64_t qlc_flash_reads;
+	atomic64_t slc_meta_log_writes;
+	atomic64_t qlc_meta_folds;
+	atomic64_t qlc_meta_writes;
 };
 
 struct conv_ftl {

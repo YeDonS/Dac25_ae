@@ -72,10 +72,11 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #ifndef NVMEV_ENABLE_QLC_REBALANCE
 #define NVMEV_ENABLE_QLC_REBALANCE 0
 #endif
-/* Variant: no4 keeps SLC-page mappings in DRAM and caches QLC mappings per LPN. */
-#define NVMEV_MAP_CACHE_POLICY_NAME "no4_hotcold"
+	/* Variant: no4 uses DRAM SLC mappings plus flash-resident QLC translation pages. */
+	#define NVMEV_MAP_CACHE_POLICY_NAME "no4_structured"
 #define NVMEV_MAP_CACHE_HOTCOLD 1
 #define NVMEV_MAP_CACHE_SLC_DRAM 1
+#define NVMEV_MAP_CACHE_NO_QLC_CMT 1
 
 #define RECENT_WRITE_GUARD_PCT 10U
 #define SLC_EMERGENCY_RESERVE 10
@@ -1318,40 +1319,224 @@ static inline uint32_t map_cache_tpage_off(uint64_t lpn)
 	return rem;
 }
 
-static void map_cache_add_read_latency(struct conv_ftl *conv_ftl, uint64_t *nsecs)
+static inline uint64_t map_flash_tpage_id(uint64_t lpn)
 {
-	struct ssdparams *spp;
-	uint64_t lat;
-
-	if (!conv_ftl || !conv_ftl->ssd)
-		return;
-
-	spp = &conv_ftl->ssd->sp;
-	lat = (uint64_t)spp->fw_4kb_rd_lat + spp->qlc_pg_4kb_rd_lat[0];
-	if (!lat)
-		lat = (uint64_t)spp->fw_4kb_rd_lat + spp->pg_4kb_rd_lat[CELL_TYPE_LSB];
-	if (nsecs)
-		*nsecs += lat;
-	atomic64_inc(&conv_ftl->map_cache.metadata_reads);
-	atomic64_add(lat, &conv_ftl->map_cache.metadata_read_ns);
+	return div_u64(lpn, (uint32_t)NVMEV_MAP_ENTRIES_PER_TPAGE);
 }
 
-static void map_cache_add_write_latency(struct conv_ftl *conv_ftl, uint64_t *nsecs)
+static struct ppa map_meta_make_ppa(struct conv_ftl *conv_ftl, uint64_t seq,
+				    bool slc_tier)
 {
+	struct ppa ppa = { .ppa = UNMAPPED_PPA };
 	struct ssdparams *spp;
-	uint64_t lat;
+	uint64_t total_dies;
+	uint64_t cursor;
+	uint32_t rem;
+	uint32_t base_blk;
+	uint32_t nr_blks;
+	uint32_t nr_pgs;
 
 	if (!conv_ftl || !conv_ftl->ssd)
-		return;
+		return ppa;
 
 	spp = &conv_ftl->ssd->sp;
-	lat = (uint64_t)spp->fw_wbuf_lat0 + spp->qlc_pg_wr_lat;
-	if (!lat)
-		lat = (uint64_t)spp->fw_wbuf_lat0 + spp->pg_wr_lat;
+	if (!spp->nchs || !spp->luns_per_ch || !spp->pls_per_lun ||
+	    !spp->blks_per_pl)
+		return ppa;
+
+	total_dies = (uint64_t)spp->nchs * spp->luns_per_ch;
+	div_u64_rem(seq, (uint32_t)total_dies, &rem);
+	ppa.g.ch = rem % spp->nchs;
+	ppa.g.lun = rem / spp->nchs;
+
+	cursor = div64_u64(seq, total_dies);
+	cursor = div_u64_rem(cursor, (uint32_t)spp->pls_per_lun, &rem);
+	ppa.g.pl = rem;
+
+	if (slc_tier) {
+		base_blk = 0;
+		nr_blks = conv_ftl->slc_blks_per_pl ? conv_ftl->slc_blks_per_pl :
+			  spp->slc_blks_per_pl;
+		nr_pgs = conv_ftl->slc_pgs_per_blk ? conv_ftl->slc_pgs_per_blk :
+			 spp->slc_pgs_per_blk;
+	} else {
+		base_blk = conv_ftl->slc_blks_per_pl ? conv_ftl->slc_blks_per_pl :
+			   spp->slc_blks_per_pl;
+		if (base_blk >= spp->blks_per_pl)
+			base_blk = spp->blks_per_pl - 1;
+		nr_blks = spp->blks_per_pl - base_blk;
+		nr_pgs = conv_ftl->qlc_pgs_per_blk ? conv_ftl->qlc_pgs_per_blk :
+			 spp->qlc_pgs_per_blk;
+	}
+	if (!nr_blks)
+		nr_blks = 1;
+	if (!nr_pgs)
+		nr_pgs = spp->pgs_per_blk ? spp->pgs_per_blk : 1;
+
+	cursor = div_u64_rem(cursor, nr_blks, &rem);
+	ppa.g.blk = base_blk + rem;
+	div_u64_rem(cursor, nr_pgs, &rem);
+	ppa.g.pg = rem;
+
+	return ppa;
+}
+
+static uint64_t map_cache_issue_metadata_nand(struct conv_ftl *conv_ftl,
+					      struct ppa *ppa, int cmd,
+					      uint64_t *nsecs)
+{
+	struct nand_cmd mcmd;
+	uint64_t start;
+	uint64_t completed;
+	uint64_t delta;
+
+	if (!conv_ftl || !conv_ftl->ssd || !ppa || ppa->ppa == UNMAPPED_PPA)
+		return nsecs ? *nsecs : 0;
+
+	start = nsecs ? *nsecs : __get_ioclock(conv_ftl->ssd);
+	memset(&mcmd, 0, sizeof(mcmd));
+	mcmd.type = USER_IO;
+	mcmd.cmd = cmd;
+	mcmd.xfer_size = NVMEV_MAP_TPAGE_BYTES;
+	mcmd.stime = start;
+	mcmd.interleave_pci_dma = (cmd == NAND_READ);
+	mcmd.ppa = ppa;
+
+	completed = ssd_advance_nand(conv_ftl->ssd, &mcmd);
 	if (nsecs)
-		*nsecs += lat;
-	atomic64_inc(&conv_ftl->map_cache.metadata_writes);
-	atomic64_add(lat, &conv_ftl->map_cache.metadata_write_ns);
+		*nsecs = completed;
+	delta = completed > start ? completed - start : 0;
+
+	if (cmd == NAND_READ) {
+		atomic64_inc(&conv_ftl->map_cache.metadata_reads);
+		atomic64_add(delta, &conv_ftl->map_cache.metadata_read_ns);
+	} else if (cmd == NAND_WRITE) {
+		atomic64_inc(&conv_ftl->map_cache.metadata_writes);
+		atomic64_add(delta, &conv_ftl->map_cache.metadata_write_ns);
+	}
+
+	return completed;
+}
+
+static int map_flash_store_init(struct conv_ftl *conv_ftl)
+{
+	struct nvmev_map_cache *mc;
+	struct ssdparams *spp;
+	uint64_t lpn;
+	uint32_t i;
+
+	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->maptbl)
+		return -EINVAL;
+
+	mc = &conv_ftl->map_cache;
+	spp = &conv_ftl->ssd->sp;
+	mc->gtd_entries = div_u64(spp->tt_pgs + NVMEV_MAP_ENTRIES_PER_TPAGE - 1,
+				  (uint32_t)NVMEV_MAP_ENTRIES_PER_TPAGE);
+	mc->gtd = vzalloc(sizeof(*mc->gtd) * mc->gtd_entries);
+	mc->flash_entries = vmalloc(sizeof(*mc->flash_entries) * (size_t)spp->tt_pgs);
+	if (!mc->gtd || !mc->flash_entries) {
+		vfree(mc->gtd);
+		vfree(mc->flash_entries);
+		mc->gtd = NULL;
+		mc->flash_entries = NULL;
+		mc->gtd_entries = 0;
+		return -ENOMEM;
+	}
+
+	for (lpn = 0; lpn < spp->tt_pgs; lpn++)
+		mc->flash_entries[lpn] = conv_ftl->maptbl[lpn];
+
+	for (i = 0; i < mc->gtd_entries; i++) {
+		mc->gtd[i].ppa = map_meta_make_ppa(conv_ftl, i, false);
+		mc->gtd[i].tier = NVMEV_MAP_META_TIER_QLC;
+		mc->gtd[i].valid = 1;
+		mc->gtd[i].dirty_entries = 0;
+	}
+
+	return 0;
+}
+
+static struct ppa map_flash_read_lpn(struct conv_ftl *conv_ftl, uint64_t lpn,
+				     uint64_t *nsecs)
+{
+	struct nvmev_map_cache *mc;
+	struct ppa meta_ppa;
+	uint64_t ftpage;
+
+	if (!conv_ftl || !conv_ftl->ssd)
+		return (struct ppa){ .ppa = UNMAPPED_PPA };
+
+	mc = &conv_ftl->map_cache;
+	ftpage = map_flash_tpage_id(lpn);
+	if (!mc->gtd || !mc->flash_entries || ftpage >= mc->gtd_entries)
+		return get_maptbl_ent(conv_ftl, lpn);
+
+	atomic64_inc(&mc->gtd_lookups);
+	meta_ppa = mc->gtd[ftpage].ppa;
+	map_cache_issue_metadata_nand(conv_ftl, &meta_ppa, NAND_READ, nsecs);
+	atomic64_inc(&mc->qlc_flash_reads);
+
+	return mc->flash_entries[lpn];
+}
+
+static void map_flash_update_lpn(struct conv_ftl *conv_ftl, uint64_t lpn,
+				 const struct ppa *ppa, uint64_t *nsecs)
+{
+	struct nvmev_map_cache *mc;
+	struct ppa log_ppa = { .ppa = UNMAPPED_PPA };
+	struct ppa fold_ppa = { .ppa = UNMAPPED_PPA };
+	uint64_t ftpage;
+	uint64_t seq;
+	bool flush_log = false;
+	bool fold_qlc = false;
+	bool qlc_mapping = false;
+	unsigned long flags;
+
+	if (!conv_ftl || !conv_ftl->ssd || !ppa ||
+	    lpn >= conv_ftl->ssd->sp.tt_pgs)
+		return;
+
+	mc = &conv_ftl->map_cache;
+	ftpage = map_flash_tpage_id(lpn);
+	if (!mc->gtd || !mc->flash_entries || ftpage >= mc->gtd_entries)
+		return;
+
+	qlc_mapping = mapped_ppa((struct ppa *)ppa) &&
+		      !is_slc_block(conv_ftl, ppa->g.blk);
+
+	spin_lock_irqsave(&mc->lock, flags);
+	mc->flash_entries[lpn] = *ppa;
+
+	mc->slc_log_entries_pending++;
+	if (mc->slc_log_entries_pending >= NVMEV_MAP_ENTRIES_PER_TPAGE) {
+		seq = mc->meta_alloc_seq++;
+		log_ppa = map_meta_make_ppa(conv_ftl, seq, true);
+		mc->slc_log_entries_pending = 0;
+		flush_log = true;
+	}
+
+	if (qlc_mapping) {
+		mc->gtd[ftpage].dirty_entries++;
+		if (mc->gtd[ftpage].dirty_entries >= NVMEV_MAP_ENTRIES_PER_TPAGE) {
+			seq = mc->meta_alloc_seq++;
+			fold_ppa = map_meta_make_ppa(conv_ftl, seq, false);
+			mc->gtd[ftpage].ppa = fold_ppa;
+			mc->gtd[ftpage].tier = NVMEV_MAP_META_TIER_QLC;
+			mc->gtd[ftpage].dirty_entries = 0;
+			fold_qlc = true;
+		}
+	}
+	spin_unlock_irqrestore(&mc->lock, flags);
+
+	if (flush_log) {
+		map_cache_issue_metadata_nand(conv_ftl, &log_ppa, NAND_WRITE, nsecs);
+		atomic64_inc(&mc->slc_meta_log_writes);
+	}
+	if (fold_qlc) {
+		map_cache_issue_metadata_nand(conv_ftl, &fold_ppa, NAND_WRITE, nsecs);
+		atomic64_inc(&mc->qlc_meta_folds);
+		atomic64_inc(&mc->qlc_meta_writes);
+	}
 }
 
 static struct nvmev_map_cache_entry *
@@ -1464,8 +1649,16 @@ map_cache_get_slot_locked(struct conv_ftl *conv_ftl, uint64_t *nsecs)
 
 	atomic64_inc(&mc->evictions);
 	if (entry->dirty) {
+		uint64_t ftpage = map_flash_tpage_id(entry->tpage_id);
+
 		atomic64_inc(&mc->dirty_evictions);
-		map_cache_add_write_latency(conv_ftl, nsecs);
+		if (mc->gtd && ftpage < mc->gtd_entries) {
+			struct ppa meta_ppa = mc->gtd[ftpage].ppa;
+
+			map_cache_issue_metadata_nand(conv_ftl, &meta_ppa, NAND_WRITE,
+						      nsecs);
+			atomic64_inc(&mc->qlc_meta_writes);
+		}
 	}
 	if (entry->valid && mc->slot_index &&
 	    entry->tpage_id < conv_ftl->ssd->sp.tt_pgs)
@@ -1547,6 +1740,11 @@ static noinline struct ppa get_maptbl_ent_cached(struct conv_ftl *conv_ftl,
 	}
 #endif
 
+#if NVMEV_MAP_CACHE_NO_QLC_CMT
+	atomic64_inc(&mc->misses);
+	return map_flash_read_lpn(conv_ftl, lpn, nsecs);
+#endif
+
 	spin_lock_irqsave(&mc->lock, flags);
 	entry = map_cache_find_locked(conv_ftl, tpage_id);
 	if (entry) {
@@ -1560,7 +1758,14 @@ static noinline struct ppa get_maptbl_ent_cached(struct conv_ftl *conv_ftl,
 	atomic64_inc(&mc->misses);
 	entry = map_cache_get_slot_locked(conv_ftl, nsecs);
 	if (entry) {
-		map_cache_add_read_latency(conv_ftl, nsecs);
+		struct ppa meta_ppa;
+		uint64_t ftpage = map_flash_tpage_id(lpn);
+
+		if (mc->gtd && ftpage < mc->gtd_entries) {
+			meta_ppa = mc->gtd[ftpage].ppa;
+			map_cache_issue_metadata_nand(conv_ftl, &meta_ppa, NAND_READ,
+						      nsecs);
+		}
 		map_cache_fill_locked(conv_ftl, entry, tpage_id);
 		ppa = entry->entries[off];
 	}
@@ -1572,7 +1777,7 @@ static noinline struct ppa get_maptbl_ent_cached(struct conv_ftl *conv_ftl,
 }
 
 static void map_cache_update_lpn(struct conv_ftl *conv_ftl, uint64_t lpn,
-				 const struct ppa *ppa)
+				 const struct ppa *ppa, uint64_t *nsecs)
 {
 	struct nvmev_map_cache *mc;
 	struct nvmev_map_cache_entry *entry;
@@ -1588,14 +1793,18 @@ static void map_cache_update_lpn(struct conv_ftl *conv_ftl, uint64_t lpn,
 	tpage_id = map_cache_tpage_id(lpn);
 	off = map_cache_tpage_off(lpn);
 
+#if NVMEV_MAP_CACHE_NO_QLC_CMT
+	map_flash_update_lpn(conv_ftl, lpn, ppa, nsecs);
+	return;
+#endif
+
 	spin_lock_irqsave(&mc->lock, flags);
 	entry = map_cache_find_locked(conv_ftl, tpage_id);
 #if NVMEV_MAP_CACHE_SLC_DRAM
 	if (entry) {
 		struct ppa new_ppa = *ppa;
 
-		if (mapped_ppa(&new_ppa) && valid_ppa(conv_ftl, &new_ppa) &&
-		    is_slc_block(conv_ftl, new_ppa.g.blk)) {
+		if (mapped_ppa(&new_ppa) && is_slc_block(conv_ftl, new_ppa.g.blk)) {
 			if (mc->slot_index && tpage_id < conv_ftl->ssd->sp.tt_pgs)
 				mc->slot_index[tpage_id] = U32_MAX;
 			list_del_init(&entry->lru_node);
@@ -1629,6 +1838,38 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 	memset(mc, 0, sizeof(*mc));
 	spin_lock_init(&mc->lock);
 	INIT_LIST_HEAD(&mc->lru);
+#if NVMEV_MAP_CACHE_NO_QLC_CMT
+	mc->nr_entries = 0;
+	mc->hotcold = hotcold;
+	if (map_flash_store_init(conv_ftl) != 0) {
+		vfree(mc->gtd);
+		vfree(mc->flash_entries);
+		memset(mc, 0, sizeof(*mc));
+		NVMEV_ERROR("Failed to allocate structured mapping metadata\n");
+		return -ENOMEM;
+	}
+	atomic64_set(&mc->lookups, 0);
+	atomic64_set(&mc->hits, 0);
+	atomic64_set(&mc->misses, 0);
+	atomic64_set(&mc->evictions, 0);
+	atomic64_set(&mc->dirty_evictions, 0);
+	atomic64_set(&mc->metadata_reads, 0);
+	atomic64_set(&mc->metadata_writes, 0);
+	atomic64_set(&mc->metadata_read_ns, 0);
+	atomic64_set(&mc->metadata_write_ns, 0);
+	atomic64_set(&mc->slc_dram_hits, 0);
+	atomic64_set(&mc->heat_decays, 0);
+	atomic64_set(&mc->gtd_lookups, 0);
+	atomic64_set(&mc->qlc_flash_reads, 0);
+	atomic64_set(&mc->slc_meta_log_writes, 0);
+	atomic64_set(&mc->qlc_meta_folds, 0);
+	atomic64_set(&mc->qlc_meta_writes, 0);
+	mc->initialized = true;
+
+	NVMEV_INFO("Map policy=%s gtd_entries=%u SLC mappings in DRAM; QLC mappings in flash translation pages\n",
+		   NVMEV_MAP_CACHE_POLICY_NAME, mc->gtd_entries);
+	return 0;
+#endif
 	mc->nr_entries = NVMEV_MAP_CMT_SLOTS;
 	mc->hotcold = hotcold;
 
@@ -1668,6 +1909,11 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 	atomic64_set(&mc->metadata_write_ns, 0);
 	atomic64_set(&mc->slc_dram_hits, 0);
 	atomic64_set(&mc->heat_decays, 0);
+	atomic64_set(&mc->gtd_lookups, 0);
+	atomic64_set(&mc->qlc_flash_reads, 0);
+	atomic64_set(&mc->slc_meta_log_writes, 0);
+	atomic64_set(&mc->qlc_meta_folds, 0);
+	atomic64_set(&mc->qlc_meta_writes, 0);
 	mc->initialized = true;
 
 	NVMEV_INFO("Map CMT policy=%s budget=%llu bytes slots=%u entries_per_slot=%u\n",
@@ -1688,6 +1934,8 @@ static void remove_map_cache(struct conv_ftl *conv_ftl)
 	vfree(mc->entries);
 	vfree(mc->entry_storage);
 	vfree(mc->slot_index);
+	vfree(mc->gtd);
+	vfree(mc->flash_entries);
 	memset(mc, 0, sizeof(*mc));
 }
 
@@ -1743,8 +1991,9 @@ static inline void die_change_reason_dec(struct conv_ftl *conv_ftl, uint8_t reas
 	}
 }
 
-static inline void set_maptbl_ent_reason(struct conv_ftl *conv_ftl, uint64_t lpn,
-					 struct ppa *ppa, uint8_t reason)
+static inline void set_maptbl_ent_reason_timed(struct conv_ftl *conv_ftl, uint64_t lpn,
+					       struct ppa *ppa, uint8_t reason,
+					       uint64_t *nsecs)
 {
 	uint32_t new_die = 0;
 	uint32_t old_die = 0;
@@ -1807,7 +2056,13 @@ static inline void set_maptbl_ent_reason(struct conv_ftl *conv_ftl, uint64_t lpn
 	}
 	conv_ftl->maptbl[lpn] = *ppa;
 	write_sequnlock(&conv_ftl->maptbl_lock);
-	map_cache_update_lpn(conv_ftl, lpn, ppa);
+	map_cache_update_lpn(conv_ftl, lpn, ppa, nsecs);
+}
+
+static inline void set_maptbl_ent_reason(struct conv_ftl *conv_ftl, uint64_t lpn,
+					 struct ppa *ppa, uint8_t reason)
+{
+	set_maptbl_ent_reason_timed(conv_ftl, lpn, ppa, reason, NULL);
 }
 
 static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
@@ -2048,24 +2303,48 @@ static int map_cache_stats_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "policy %s\n", NVMEV_MAP_CACHE_POLICY_NAME);
 	seq_printf(m, "initialized %u\n", mc->initialized ? 1U : 0U);
-	seq_printf(m, "cmt_bytes %llu\n", (unsigned long long)NVMEV_MAP_CMT_BYTES);
+	seq_printf(m, "cmt_bytes %llu\n",
+		   (unsigned long long)(NVMEV_MAP_CACHE_NO_QLC_CMT ? 0ULL : NVMEV_MAP_CMT_BYTES));
+	seq_printf(m, "qlc_cmt_enabled %u\n", NVMEV_MAP_CACHE_NO_QLC_CMT ? 0U : 1U);
 	seq_printf(m, "translation_page_bytes %u\n", NVMEV_MAP_TPAGE_BYTES);
 	seq_printf(m, "entries_per_translation_page %u\n", NVMEV_MAP_ENTRIES_PER_TPAGE);
 	seq_printf(m, "cache_entries_per_slot %u\n", NVMEV_MAP_CACHE_ENTRIES_PER_SLOT);
 	seq_printf(m, "cached_mapping_entries %u\n", mc->nr_entries);
 	seq_printf(m, "used_mapping_entries %u\n", mc->used_entries);
+	seq_printf(m, "gtd_entries %u\n", mc->gtd_entries);
+	seq_printf(m, "gtd_dram_bytes %llu\n",
+		   (unsigned long long)((uint64_t)mc->gtd_entries *
+					sizeof(struct nvmev_map_gtd_entry)));
+	seq_printf(m, "slc_dram_map_bytes %llu\n",
+		   (unsigned long long)(total_slc_pages(conv_ftl) *
+					NVMEV_MAP_ENTRY_BYTES));
+	seq_printf(m, "flash_translation_store_bytes %llu\n",
+		   (unsigned long long)((uint64_t)conv_ftl->ssd->sp.tt_pgs *
+					NVMEV_MAP_ENTRY_BYTES));
+	seq_printf(m, "slc_log_entries_pending %u\n",
+		   mc->slc_log_entries_pending);
 	seq_printf(m, "hotcold %u\n", mc->hotcold ? 1U : 0U);
 	seq_printf(m, "lookups %llu\n", (unsigned long long)lookups);
 	seq_printf(m, "hits %llu\n", (unsigned long long)hits);
 	seq_printf(m, "misses %llu\n", (unsigned long long)misses);
 	seq_printf(m, "slc_dram_hits %llu\n",
 		   (unsigned long long)atomic64_read(&mc->slc_dram_hits));
+	seq_printf(m, "gtd_lookups %llu\n",
+		   (unsigned long long)atomic64_read(&mc->gtd_lookups));
+	seq_printf(m, "qlc_flash_reads %llu\n",
+		   (unsigned long long)atomic64_read(&mc->qlc_flash_reads));
 	seq_printf(m, "hit_ratio_permille %llu\n",
 		   lookups ? (unsigned long long)div64_u64(hits * 1000ULL, lookups) : 0ULL);
 	seq_printf(m, "metadata_reads %llu\n",
 		   (unsigned long long)atomic64_read(&mc->metadata_reads));
 	seq_printf(m, "metadata_writes %llu\n",
 		   (unsigned long long)atomic64_read(&mc->metadata_writes));
+	seq_printf(m, "slc_meta_log_writes %llu\n",
+		   (unsigned long long)atomic64_read(&mc->slc_meta_log_writes));
+	seq_printf(m, "qlc_meta_folds %llu\n",
+		   (unsigned long long)atomic64_read(&mc->qlc_meta_folds));
+	seq_printf(m, "qlc_meta_writes %llu\n",
+		   (unsigned long long)atomic64_read(&mc->qlc_meta_writes));
 	seq_printf(m, "metadata_read_ns %llu\n",
 		   (unsigned long long)metadata_read_ns);
 	seq_printf(m, "metadata_write_ns %llu\n",
@@ -6958,9 +7237,10 @@ retry_wb_alloc:
 		/* update maptbl */
 			if (conv_ftl->lpn_chain_id && local_lpn < conv_ftl->ssd->sp.tt_pgs)
 				conv_ftl->lpn_chain_id[local_lpn] = chain_id;
-			set_maptbl_ent_reason(conv_ftl, local_lpn, &ppa,
-					      bOverwrite ? NVMEV_DIE_CHANGE_HOST_OVERWRITE :
-					      NVMEV_DIE_CHANGE_HOST_APPEND);
+				set_maptbl_ent_reason_timed(conv_ftl, local_lpn, &ppa,
+						      bOverwrite ? NVMEV_DIE_CHANGE_HOST_OVERWRITE :
+						      NVMEV_DIE_CHANGE_HOST_APPEND,
+						      &swr.stime);
 		NVMEV_DEBUG("conv_write: got new ppa %lld, ", ppa2pgidx(conv_ftl, &ppa));
 		/* update rmap */
 		set_rmap_ent(conv_ftl, local_lpn, &ppa);
