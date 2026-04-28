@@ -48,6 +48,10 @@ static unsigned long long nvmev_ftl_slow_ns;
 module_param_named(ftl_slow_ns, nvmev_ftl_slow_ns, ullong, 0644);
 MODULE_PARM_DESC(ftl_slow_ns, "Log FTL command time if above threshold (ns), 0 disables");
 
+static unsigned long long nvmev_map_cmt_bytes = NVMEV_MAP_CMT_BYTES;
+module_param_named(map_cmt_bytes, nvmev_map_cmt_bytes, ullong, 0644);
+MODULE_PARM_DESC(map_cmt_bytes, "Mapping cache budget in bytes; default 8MiB");
+
 void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			      struct buffer *write_buffer, unsigned int buffs_to_release);
 
@@ -1319,6 +1323,33 @@ static inline uint32_t map_cache_tpage_off(uint64_t lpn)
 	return rem;
 }
 
+static uint64_t map_cache_budget_bytes(void)
+{
+	uint64_t bytes = nvmev_map_cmt_bytes ? nvmev_map_cmt_bytes :
+		NVMEV_MAP_CMT_BYTES;
+	uint64_t slot_bytes = (uint64_t)NVMEV_MAP_ENTRY_BYTES *
+		NVMEV_MAP_CACHE_ENTRIES_PER_SLOT;
+
+	if (bytes < slot_bytes)
+		bytes = slot_bytes;
+	return div64_u64(bytes, slot_bytes) * slot_bytes;
+}
+
+static uint32_t map_cache_budget_slots(struct conv_ftl *conv_ftl)
+{
+	uint64_t slots = div64_u64(map_cache_budget_bytes(),
+				   (uint64_t)NVMEV_MAP_ENTRY_BYTES *
+				   NVMEV_MAP_CACHE_ENTRIES_PER_SLOT);
+
+	if (!slots)
+		slots = 1;
+	if (conv_ftl && conv_ftl->ssd && slots > conv_ftl->ssd->sp.tt_pgs)
+		slots = conv_ftl->ssd->sp.tt_pgs;
+	if (slots > U32_MAX)
+		slots = U32_MAX;
+	return (uint32_t)slots;
+}
+
 static inline uint64_t map_flash_tpage_id(uint64_t lpn)
 {
 	return div_u64(lpn, (uint32_t)NVMEV_MAP_ENTRIES_PER_TPAGE);
@@ -1760,7 +1791,8 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 	memset(mc, 0, sizeof(*mc));
 	spin_lock_init(&mc->lock);
 	INIT_LIST_HEAD(&mc->lru);
-	mc->nr_entries = NVMEV_MAP_CMT_SLOTS;
+	mc->cmt_budget_bytes = map_cache_budget_bytes();
+	mc->nr_entries = map_cache_budget_slots(conv_ftl);
 	mc->hotcold = hotcold;
 
 	mc->entries = vzalloc(sizeof(*mc->entries) * mc->nr_entries);
@@ -1774,8 +1806,8 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 		vfree(mc->slot_index);
 		memset(mc, 0, sizeof(*mc));
 		NVMEV_ERROR("Failed to allocate map CMT: slots=%u bytes=%llu\n",
-			    (unsigned int)NVMEV_MAP_CMT_SLOTS,
-			    (unsigned long long)NVMEV_MAP_CMT_BYTES);
+			    mc->nr_entries,
+			    (unsigned long long)mc->cmt_budget_bytes);
 		return -ENOMEM;
 	}
 	if (map_flash_store_init(conv_ftl) != 0) {
@@ -1818,7 +1850,7 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 
 	NVMEV_INFO("Map CMT policy=%s budget=%llu bytes slots=%u entries_per_slot=%u gtd_entries=%u\n",
 		   NVMEV_MAP_CACHE_POLICY_NAME,
-		   (unsigned long long)NVMEV_MAP_CMT_BYTES,
+		   (unsigned long long)mc->cmt_budget_bytes,
 		   mc->nr_entries, NVMEV_MAP_CACHE_ENTRIES_PER_SLOT,
 		   mc->gtd_entries);
 	return 0;
@@ -2198,7 +2230,8 @@ static int map_cache_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "policy %s\n", NVMEV_MAP_CACHE_POLICY_NAME);
 	seq_printf(m, "initialized %u\n", mc->initialized ? 1U : 0U);
 	seq_printf(m, "cmt_bytes %llu\n",
-		   (unsigned long long)(NVMEV_MAP_CACHE_NO_QLC_CMT ? 0ULL : NVMEV_MAP_CMT_BYTES));
+		   (unsigned long long)(NVMEV_MAP_CACHE_NO_QLC_CMT ? 0ULL :
+					mc->cmt_budget_bytes));
 	seq_printf(m, "qlc_cmt_enabled %u\n", NVMEV_MAP_CACHE_NO_QLC_CMT ? 0U : 1U);
 	seq_printf(m, "translation_page_bytes %u\n", NVMEV_MAP_TPAGE_BYTES);
 	seq_printf(m, "entries_per_translation_page %u\n", NVMEV_MAP_ENTRIES_PER_TPAGE);

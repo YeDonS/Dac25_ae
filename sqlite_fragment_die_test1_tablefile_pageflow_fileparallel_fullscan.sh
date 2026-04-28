@@ -40,8 +40,10 @@ SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
 SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
 SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-0}
 SQLITE_COLD_FULL_READ_ITERS=${SQLITE_COLD_FULL_READ_ITERS:-1}
-# Multiple modes are allowed, e.g. "quota-row-shuffled random-row-concurrent".
-# Recommended mapping-cache main mode: quota-row-shuffled.
+SQLITE_MAP_CMT_BYTES=${SQLITE_MAP_CMT_BYTES:-8M}
+SQLITE_MAP_CMT_BYTES_LIST=${SQLITE_MAP_CMT_BYTES_LIST:-$SQLITE_MAP_CMT_BYTES}
+# Multiple modes are allowed, e.g. "quota-page-shuffled quota-row-shuffled".
+# Recommended mapping-cache isolation mode: quota-page-shuffled.
 SQLITE_COLD_FULL_READ_MODE=${SQLITE_COLD_FULL_READ_MODE:-full-scan-concurrent}
 SQLITE_COLD_EXTRA_APPEND_BYTES=${SQLITE_COLD_EXTRA_APPEND_BYTES:-0}
 SQLITE_COLD_EXTRA_MODE=${SQLITE_COLD_EXTRA_MODE:-off}
@@ -87,6 +89,7 @@ print_init_log_tail() {
 validate_workload_outputs() {
     local tag="$1"
     local init_txt="$2"
+    local expected_cold_mode="$3"
     local ok=0
 
     if [[ -f "${RESULT_FOLDER}/sqlite_table_tier_${tag}.csv" ]]; then
@@ -108,7 +111,29 @@ validate_workload_outputs() {
         ok=1
     fi
 
-    return $(( ok == 1 ? 0 : 1 ))
+    if [[ "$ok" != "1" ]]; then
+        return 1
+    fi
+    if [[ -n "$expected_cold_mode" ]] &&
+       ! grep -q "\\[sqlite_init\\].*tag=${tag}.*cold_mode=${expected_cold_mode}" "$init_txt" 2>/dev/null; then
+        echo "ERROR: cold mode mismatch for tag=${tag}; expected cold_mode=${expected_cold_mode}" >&2
+        print_init_log_tail "$init_txt"
+        return 1
+    fi
+    if [[ "$expected_cold_mode" == "quota-row-shuffled" ]] &&
+       ! grep -q "\\[sqlite_cold_global\\]" "$init_txt" 2>/dev/null; then
+        echo "ERROR: quota-row-shuffled run did not emit sqlite_cold_global logs for tag=${tag}" >&2
+        print_init_log_tail "$init_txt"
+        return 1
+    fi
+    if [[ "$expected_cold_mode" == "quota-page-shuffled" ]] &&
+       ! grep -q "\\[sqlite_cold_global_page\\]" "$init_txt" 2>/dev/null; then
+        echo "ERROR: quota-page-shuffled run did not emit sqlite_cold_global_page logs for tag=${tag}" >&2
+        print_init_log_tail "$init_txt"
+        return 1
+    fi
+
+    return 0
 }
 
 drop_caches() {
@@ -116,8 +141,34 @@ drop_caches() {
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 }
 
+size_to_bytes() {
+    local raw="$1"
+    local num unit
+
+    if [[ "$raw" =~ ^([0-9]+)([KkMmGg]?)$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+    else
+        echo "ERROR: invalid size '$raw'; use integer bytes or K/M/G suffix" >&2
+        return 1
+    fi
+
+    case "$unit" in
+        K|k) echo $((num * 1024)) ;;
+        M|m) echo $((num * 1024 * 1024)) ;;
+        G|g) echo $((num * 1024 * 1024 * 1024)) ;;
+        *) echo "$num" ;;
+    esac
+}
+
+size_tag() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'
+}
+
 load_die_module() {
     local variant="$1"
+    local map_cmt_bytes="$2"
+    local extra_module_params=""
     local ko_path="${NVMEV_DIR}/nvmev_${variant}.ko"
     if [[ ! -f "$ko_path" ]]; then
         echo "ERROR: $ko_path not found. Run build_die.sh first." >&2
@@ -128,7 +179,12 @@ load_die_module() {
         cp ./nvmev_on.ko ./nvmev_on.ko.die_bak
     fi
     cp "$ko_path" ./nvmev_on.ko
-    ./nvmevstart_on.sh
+    case "$variant" in
+        die_base_lru|die_no4)
+            extra_module_params="map_cmt_bytes=${map_cmt_bytes}"
+            ;;
+    esac
+    NVMEV_EXTRA_MODULE_PARAMS="$extra_module_params" ./nvmevstart_on.sh
     if [[ -f ./nvmev_on.ko.die_bak ]]; then
         mv ./nvmev_on.ko.die_bak ./nvmev_on.ko
     fi
@@ -139,24 +195,28 @@ run_one_test() {
     local variant="$1"
     local threads="$2"
     local cold_mode="$3"
+    local cmt_label="$4"
+    local cmt_bytes="$5"
     local mode_tag
+    local cmt_tag
     mode_tag="$(printf '%s' "$cold_mode" | tr -c 'A-Za-z0-9' '_')"
-    local tag="die_tablefile_pageflow_fileparallel_fullscan_${variant}_${mode_tag}_t${threads}"
-    local init_txt="${RESULT_FOLDER%/}/sqlite_die_tablefile_pageflow_fileparallel_fullscan_init_${variant}_${mode_tag}_t${threads}.txt"
-    local out_dir="${DIE_RESULT_BASE}/${variant}/${mode_tag}/t${threads}"
+    cmt_tag="$(size_tag "$cmt_label")"
+    local tag="die_tablefile_pageflow_fileparallel_fullscan_${variant}_${mode_tag}_cmt_${cmt_tag}_t${threads}"
+    local init_txt="${RESULT_FOLDER%/}/sqlite_die_tablefile_pageflow_fileparallel_fullscan_init_${variant}_${mode_tag}_cmt_${cmt_tag}_t${threads}.txt"
+    local out_dir="${DIE_RESULT_BASE}/${variant}/${mode_tag}/cmt_${cmt_tag}/t${threads}"
 
     mkdir -p "$out_dir"
 
     echo ""
     echo "================================================================"
-    echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  cold_mode=$cold_mode  tag=$tag"
+    echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  cold_mode=$cold_mode  cmt=$cmt_label($cmt_bytes bytes)  tag=$tag"
     echo "  per-table-db=ON  logical_row_bytes~32KB  est_row_pages~8  tables=$SQLITE_TABLE_COUNT  rows/tbl_override=$SQLITE_ROWS_PER_TABLE"
     echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  cold_mode=$cold_mode  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
     echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH"
     echo "  note: default run uses no dummy; cold scan uses one thread per table file within each batch"
     echo "================================================================"
 
-    load_die_module "$variant"
+    load_die_module "$variant" "$cmt_bytes"
 
     lsblk
     source setdevice.sh
@@ -219,7 +279,7 @@ run_one_test() {
         return 1
     fi
 
-    if ! validate_workload_outputs "$tag" "$init_txt"; then
+    if ! validate_workload_outputs "$tag" "$init_txt" "$cold_mode"; then
         echo "ERROR: workload exited without producing expected outputs for variant=$variant threads=$threads" >&2
         print_init_log_tail "$init_txt"
         return 1
@@ -295,8 +355,11 @@ mkdir -p "$DIE_RESULT_BASE"
 
 for threads in $THREAD_COUNTS; do
     for variant in $VARIANTS; do
-        for cold_mode in $SQLITE_COLD_FULL_READ_MODE; do
-            run_one_test "$variant" "$threads" "$cold_mode" || exit 1
+        for cmt_label in $SQLITE_MAP_CMT_BYTES_LIST; do
+            cmt_bytes="$(size_to_bytes "$cmt_label")" || exit 1
+            for cold_mode in $SQLITE_COLD_FULL_READ_MODE; do
+                run_one_test "$variant" "$threads" "$cold_mode" "$cmt_label" "$cmt_bytes" || exit 1
+            done
         done
     done
 done

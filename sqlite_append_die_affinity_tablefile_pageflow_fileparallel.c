@@ -34,6 +34,10 @@
 #define O_CLOEXEC 0
 #endif
 
+#ifndef O_DIRECT
+#define O_DIRECT 0
+#endif
+
 #ifndef TARGET_FOLDER
 #define TARGET_FOLDER "./device/"
 #endif
@@ -91,6 +95,7 @@ enum cold_full_read_mode {
 	COLD_FULL_READ_RANDOM_ROW,
 	COLD_FULL_READ_QUOTA_ROW_GROUPED,
 	COLD_FULL_READ_QUOTA_ROW_SHUFFLED,
+	COLD_FULL_READ_QUOTA_PAGE_SHUFFLED,
 };
 
 struct page_die_entry {
@@ -255,6 +260,11 @@ struct quota_row_event {
 	int row_id;
 };
 
+struct quota_page_event {
+	unsigned int table_id;
+	unsigned long long page_idx;
+};
+
 struct append_phase_stats {
 	unsigned long long rows_written;
 	unsigned long long payload_bytes_written;
@@ -408,6 +418,11 @@ static enum cold_full_read_mode parse_cold_full_read_mode(const char *arg)
 	    !strcasecmp(arg, "global-random-row") ||
 	    !strcasecmp(arg, "global-random-row-shuffled"))
 		return COLD_FULL_READ_QUOTA_ROW_SHUFFLED;
+	if (!strcasecmp(arg, "quota-page-shuffled") ||
+	    !strcasecmp(arg, "quota-page-shuffled-global") ||
+	    !strcasecmp(arg, "global-random-page") ||
+	    !strcasecmp(arg, "global-random-page-shuffled"))
+		return COLD_FULL_READ_QUOTA_PAGE_SHUFFLED;
 	return COLD_FULL_READ_FULL_SCAN;
 }
 
@@ -422,6 +437,8 @@ static const char *cold_full_read_mode_label(enum cold_full_read_mode mode)
 		return "quota-row-grouped";
 	case COLD_FULL_READ_QUOTA_ROW_SHUFFLED:
 		return "quota-row-shuffled";
+	case COLD_FULL_READ_QUOTA_PAGE_SHUFFLED:
+		return "quota-page-shuffled";
 	case COLD_FULL_READ_FULL_SCAN:
 	default:
 		return "full-scan-concurrent";
@@ -2272,6 +2289,57 @@ static void shuffle_quota_row_events(struct quota_row_event *events, size_t coun
 	}
 }
 
+static void shuffle_quota_page_events(struct quota_page_event *events, size_t count,
+				      unsigned int *state)
+{
+	if (!events || !state)
+		return;
+	for (size_t i = count; i > 1; --i) {
+		size_t j = (size_t)(next_rand(state) % (unsigned int)i);
+		struct quota_page_event tmp = events[i - 1];
+
+		events[i - 1] = events[j];
+		events[j] = tmp;
+	}
+}
+
+static int open_cold_page_fd(const char *path, bool direct_io)
+{
+	int flags = O_RDONLY | O_CLOEXEC;
+	int fd;
+
+	if (direct_io)
+		flags |= O_DIRECT;
+	fd = open(path, flags);
+	if (fd < 0 && direct_io && O_DIRECT != 0)
+		fd = open(path, O_RDONLY | O_CLOEXEC);
+#if defined(__linux__)
+	if (fd >= 0)
+		posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+	return fd;
+}
+
+static int pread_full(int fd, void *buf, size_t bytes, off_t off)
+{
+	size_t done = 0;
+
+	while (done < bytes) {
+		ssize_t n = pread(fd, (char *)buf + done, bytes - done,
+				  off + (off_t)done);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		if (n == 0)
+			return -EIO;
+		done += (size_t)n;
+	}
+	return 0;
+}
+
 static void *full_scan_worker(void *arg)
 {
 	struct concurrent_read_ctx *ctx = arg;
@@ -2519,6 +2587,176 @@ out:
 	return rc == 0 ? wall_start : 0.0;
 }
 
+static double run_cold_quota_page_shuffled(const struct dataset_layout *layout,
+					   struct table_file_state *tables,
+					   const struct workload_options *opts,
+					   const unsigned int *read_plan,
+					   double *cold_per_table,
+					   unsigned long long *total_pages_out)
+{
+	struct quota_page_event *events = NULL;
+	unsigned long long *page_counts = NULL;
+	unsigned long long *table_events = NULL;
+	int *fds = NULL;
+	void *buf = NULL;
+	size_t event_count = 0;
+	size_t pos = 0;
+	size_t io_bytes;
+	unsigned long long page_bytes;
+	unsigned int state;
+	unsigned int iters;
+	unsigned int active_tables = 0;
+	double wall_start = 0.0;
+	int rc = 0;
+
+	if (!layout || !tables || !opts || !total_pages_out)
+		return 0.0;
+
+	page_bytes = opts->ftl_host_page_bytes ? opts->ftl_host_page_bytes :
+		DEFAULT_FTL_HOST_PAGE_BYTES;
+	if (page_bytes < sizeof(void *) || (page_bytes & (page_bytes - 1ULL)) != 0 ||
+	    page_bytes > (unsigned long long)SIZE_MAX)
+		page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
+	io_bytes = (size_t)page_bytes;
+	iters = opts->cold_full_read_iters ? opts->cold_full_read_iters : 1U;
+	*total_pages_out = 0;
+
+	page_counts = calloc(layout->table_count ? layout->table_count : 1U,
+			     sizeof(*page_counts));
+	if (!page_counts)
+		return 0.0;
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned long long quota = (unsigned long long)(read_plan ? read_plan[tbl] : 1U) *
+					   (unsigned long long)iters;
+		struct stat st;
+
+		if (tables[tbl].rows_inserted == 0 || quota == 0)
+			continue;
+		if (stat(tables[tbl].db_path, &st) != 0 || st.st_size <= 0)
+			continue;
+		page_counts[tbl] = (unsigned long long)st.st_size / page_bytes;
+		if (page_counts[tbl] == 0)
+			continue;
+		if (quota > (unsigned long long)(SIZE_MAX - event_count)) {
+			free(page_counts);
+			return 0.0;
+		}
+		event_count += (size_t)quota;
+		active_tables++;
+	}
+
+	if (event_count == 0) {
+		free(page_counts);
+		return 0.0;
+	}
+
+	events = calloc(event_count, sizeof(*events));
+	fds = calloc(layout->table_count ? layout->table_count : 1U, sizeof(*fds));
+	table_events = calloc(layout->table_count ? layout->table_count : 1U,
+			      sizeof(*table_events));
+	if (!events || !fds || !table_events ||
+	    posix_memalign(&buf, io_bytes, io_bytes) != 0) {
+		free(events);
+		free(fds);
+		free(table_events);
+		free(page_counts);
+		return 0.0;
+	}
+	memset(buf, 0, io_bytes);
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl)
+		fds[tbl] = -1;
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned long long quota = (unsigned long long)(read_plan ? read_plan[tbl] : 1U) *
+					   (unsigned long long)iters;
+		unsigned long long first_page;
+		unsigned long long selectable_pages;
+		unsigned int page_state;
+
+		if (page_counts[tbl] == 0 || quota == 0)
+			continue;
+
+		first_page = page_counts[tbl] > 1ULL ? 1ULL : 0ULL;
+		selectable_pages = page_counts[tbl] - first_page;
+		if (selectable_pages == 0)
+			continue;
+
+		page_state = (opts->seed ? opts->seed : 42U) ^
+			     (0x85ebca6bU * (tbl + 1U));
+		drop_file_cache(tables[tbl].db_path);
+		for (unsigned long long i = 0; i < quota; ++i) {
+			events[pos].table_id = tbl;
+			events[pos].page_idx = first_page +
+				(unsigned long long)(next_rand(&page_state) %
+						     (unsigned int)selectable_pages);
+			pos++;
+		}
+	}
+
+	event_count = pos;
+	state = (opts->seed ? opts->seed : 42U) ^ 0x51ed270bU;
+	shuffle_quota_page_events(events, event_count, &state);
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		if (page_counts[tbl] == 0 || !(read_plan ? read_plan[tbl] : 1U))
+			continue;
+		fds[tbl] = open_cold_page_fd(tables[tbl].db_path, opts->direct_io);
+		if (fds[tbl] < 0) {
+			rc = -errno;
+			goto out;
+		}
+	}
+
+	printf("[sqlite_cold_global_page] mode=%s events=%zu active_tables=%u iters=%u page_bytes=%llu skip_header_page=1 direct_io=%u\n",
+	       cold_full_read_mode_label(opts->cold_full_read_mode),
+	       event_count, active_tables, iters, page_bytes,
+	       opts->direct_io ? 1U : 0U);
+
+	wall_start = monotonic_sec();
+	for (size_t i = 0; i < event_count; ++i) {
+		unsigned int tbl = events[i].table_id;
+		unsigned long long off = events[i].page_idx * page_bytes;
+		double t0;
+		double dt;
+
+		if (tbl >= layout->table_count || fds[tbl] < 0)
+			continue;
+		t0 = monotonic_sec();
+		rc = pread_full(fds[tbl], buf, io_bytes, (off_t)off);
+		if (rc != 0)
+			break;
+		dt = monotonic_sec() - t0;
+		cold_per_table[tbl] += dt;
+		table_events[tbl]++;
+		(*total_pages_out)++;
+	}
+	wall_start = monotonic_sec() - wall_start;
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		if (table_events[tbl])
+			printf("[sqlite_cold_global_page] table=%u page_events=%llu file_pages=%llu time=%.6fs\n",
+			       tbl, table_events[tbl], page_counts[tbl],
+			       cold_per_table[tbl]);
+	}
+
+out:
+	if (fds) {
+		for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+			if (fds[tbl] >= 0)
+				close(fds[tbl]);
+		}
+	}
+	free(buf);
+	free(events);
+	free(fds);
+	free(table_events);
+	free(page_counts);
+	if (rc != 0)
+		fprintf(stderr, "warning: quota-page-shuffled cold read failed rc=%d\n", rc);
+	return rc == 0 ? wall_start : 0.0;
+}
+
 static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 					    struct table_file_state *tables,
 					    const struct workload_options *opts,
@@ -2535,6 +2773,9 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 	if (opts && opts->cold_full_read_mode == COLD_FULL_READ_QUOTA_ROW_SHUFFLED)
 		return run_cold_quota_row_shuffled(layout, tables, opts, read_plan,
 						   cold_per_table, total_rows_out);
+	if (opts && opts->cold_full_read_mode == COLD_FULL_READ_QUOTA_PAGE_SHUFFLED)
+		return run_cold_quota_page_shuffled(layout, tables, opts, read_plan,
+						    cold_per_table, total_rows_out);
 
 	if (threads == 0)
 		threads = 1;
@@ -3771,7 +4012,12 @@ static int run_init_mode(const struct workload_options *opts)
 	dataset_layout_to_file(layout_path, &layout);
 
 	{
-		double cold_mb = (double)cold_rows * ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+		double cold_unit_bytes =
+			opts->cold_full_read_mode == COLD_FULL_READ_QUOTA_PAGE_SHUFFLED ?
+			(double)(opts->ftl_host_page_bytes ? opts->ftl_host_page_bytes :
+				 DEFAULT_FTL_HOST_PAGE_BYTES) :
+			(double)ROW_PAYLOAD_BYTES;
+		double cold_mb = (double)cold_rows * cold_unit_bytes / (1024.0 * 1024.0);
 		double tp = cold_read_time > 0.0 ? cold_mb / cold_read_time : 0.0;
 		double table_gib = (double)layout.total_rows * (double)ROW_PAYLOAD_BYTES /
 				   (1024.0 * 1024.0 * 1024.0);
@@ -3945,7 +4191,7 @@ static void usage(const char *prog)
 		"  --interleave-pages N\n"
 		"  --interleave-reads N\n"
 			"  --cold-concurrent-threads N\n"
-				"  --cold-full-read-mode full-scan-concurrent|random-chunk-concurrent|random-row-concurrent|quota-row-grouped|quota-row-shuffled\n"
+				"  --cold-full-read-mode full-scan-concurrent|random-chunk-concurrent|random-row-concurrent|quota-row-grouped|quota-row-shuffled|quota-page-shuffled\n"
 			"  --cold-full-read-iters N\n"
 			"  --page-chain-path PATH\n"
 		"  --page-die-transition-path PATH\n"

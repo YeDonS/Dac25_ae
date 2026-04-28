@@ -180,6 +180,7 @@ struct nvmev_map_cache {
 	uint32_t free_cursor;
 	uint32_t gtd_entries;
 	uint32_t slc_log_entries_pending;
+	uint64_t cmt_budget_bytes;
 	uint64_t meta_alloc_seq;
 	uint64_t access_seq;
 	bool initialized;

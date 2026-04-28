@@ -48,6 +48,10 @@ static unsigned long long nvmev_ftl_slow_ns;
 module_param_named(ftl_slow_ns, nvmev_ftl_slow_ns, ullong, 0644);
 MODULE_PARM_DESC(ftl_slow_ns, "Log FTL command time if above threshold (ns), 0 disables");
 
+static unsigned long long nvmev_map_cmt_bytes = NVMEV_MAP_CMT_BYTES;
+module_param_named(map_cmt_bytes, nvmev_map_cmt_bytes, ullong, 0644);
+MODULE_PARM_DESC(map_cmt_bytes, "Total mapping DRAM budget in bytes; default 8MiB");
+
 void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			      struct buffer *write_buffer, unsigned int buffs_to_release);
 
@@ -1319,6 +1323,45 @@ static inline uint32_t map_cache_tpage_off(uint64_t lpn)
 	return rem;
 }
 
+static uint64_t map_cache_budget_bytes(void)
+{
+	uint64_t bytes = nvmev_map_cmt_bytes ? nvmev_map_cmt_bytes :
+		NVMEV_MAP_CMT_BYTES;
+	uint64_t slot_bytes = (uint64_t)NVMEV_MAP_ENTRY_BYTES *
+		NVMEV_MAP_CACHE_ENTRIES_PER_SLOT;
+
+	if (bytes < slot_bytes)
+		bytes = slot_bytes;
+	return div64_u64(bytes, slot_bytes) * slot_bytes;
+}
+
+static uint32_t map_cache_budget_slots(struct conv_ftl *conv_ftl)
+{
+	uint64_t slots = div64_u64(map_cache_budget_bytes(),
+				   (uint64_t)NVMEV_MAP_ENTRY_BYTES *
+				   NVMEV_MAP_CACHE_ENTRIES_PER_SLOT);
+
+	if (!slots)
+		slots = 1;
+	if (conv_ftl && conv_ftl->ssd && slots > conv_ftl->ssd->sp.tt_pgs)
+		slots = conv_ftl->ssd->sp.tt_pgs;
+	if (slots > U32_MAX)
+		slots = U32_MAX;
+	return (uint32_t)slots;
+}
+
+static bool map_cache_covers_all_slc(struct conv_ftl *conv_ftl)
+{
+	struct nvmev_map_cache *mc;
+	uint64_t slc_map_bytes;
+
+	if (!conv_ftl)
+		return false;
+	mc = &conv_ftl->map_cache;
+	slc_map_bytes = total_slc_pages(conv_ftl) * NVMEV_MAP_ENTRY_BYTES;
+	return slc_map_bytes > 0 && mc->cmt_budget_bytes >= slc_map_bytes;
+}
+
 static inline uint64_t map_flash_tpage_id(uint64_t lpn)
 {
 	return div_u64(lpn, (uint32_t)NVMEV_MAP_ENTRIES_PER_TPAGE);
@@ -1732,8 +1775,42 @@ static noinline struct ppa get_maptbl_ent_cached(struct conv_ftl *conv_ftl,
 
 		if (mapped_ppa(&backing) && valid_ppa(conv_ftl, &backing) &&
 		    is_slc_block(conv_ftl, backing.g.blk)) {
-			atomic64_inc(&mc->hits);
-			atomic64_inc(&mc->slc_dram_hits);
+			if (map_cache_covers_all_slc(conv_ftl)) {
+				atomic64_inc(&mc->hits);
+				atomic64_inc(&mc->slc_dram_hits);
+				return backing;
+			}
+
+			spin_lock_irqsave(&mc->lock, flags);
+			entry = map_cache_find_locked(conv_ftl, tpage_id);
+			if (entry) {
+				atomic64_inc(&mc->hits);
+				atomic64_inc(&mc->slc_dram_hits);
+				ppa = entry->entries[off];
+				map_cache_touch_locked(conv_ftl, entry);
+				spin_unlock_irqrestore(&mc->lock, flags);
+				return ppa;
+			}
+
+			atomic64_inc(&mc->misses);
+			atomic64_inc(&mc->gtd_lookups);
+			{
+				struct ppa meta_ppa =
+					map_meta_make_ppa(conv_ftl,
+							  map_flash_tpage_id(lpn),
+							  true);
+
+				map_cache_issue_metadata_nand(conv_ftl, &meta_ppa,
+							      NAND_READ, nsecs);
+			}
+			entry = map_cache_get_slot_locked(conv_ftl, nsecs);
+			if (entry) {
+				map_cache_fill_locked(conv_ftl, entry, tpage_id);
+				ppa = entry->entries[off];
+				spin_unlock_irqrestore(&mc->lock, flags);
+				return ppa;
+			}
+			spin_unlock_irqrestore(&mc->lock, flags);
 			return backing;
 		}
 	}
@@ -1794,6 +1871,27 @@ static void map_cache_update_lpn(struct conv_ftl *conv_ftl, uint64_t lpn,
 
 #if NVMEV_MAP_CACHE_NO_QLC_CMT
 	map_flash_update_lpn(conv_ftl, lpn, ppa, nsecs);
+	if (map_cache_covers_all_slc(conv_ftl))
+		return;
+	spin_lock_irqsave(&mc->lock, flags);
+	entry = map_cache_find_locked(conv_ftl, tpage_id);
+	if (entry) {
+		if (mapped_ppa(ppa) && is_slc_block(conv_ftl, ppa->g.blk)) {
+			entry->entries[off] = *ppa;
+			entry->dirty = false;
+			map_cache_touch_locked(conv_ftl, entry);
+		} else {
+			if (mc->slot_index && tpage_id < conv_ftl->ssd->sp.tt_pgs)
+				mc->slot_index[tpage_id] = U32_MAX;
+			list_del_init(&entry->lru_node);
+			entry->valid = false;
+			entry->dirty = false;
+			if (mc->used_entries > 0)
+				mc->used_entries--;
+			mc->free_cursor = (uint32_t)(entry - mc->entries);
+		}
+	}
+	spin_unlock_irqrestore(&mc->lock, flags);
 	return;
 #endif
 
@@ -1838,7 +1936,9 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 	spin_lock_init(&mc->lock);
 	INIT_LIST_HEAD(&mc->lru);
 #if NVMEV_MAP_CACHE_NO_QLC_CMT
-	mc->nr_entries = 0;
+	mc->cmt_budget_bytes = map_cache_budget_bytes();
+	mc->nr_entries = map_cache_covers_all_slc(conv_ftl) ? 0 :
+		map_cache_budget_slots(conv_ftl);
 	mc->hotcold = hotcold;
 	if (map_flash_store_init(conv_ftl) != 0) {
 		vfree(mc->gtd);
@@ -1846,6 +1946,33 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 		memset(mc, 0, sizeof(*mc));
 		NVMEV_ERROR("Failed to allocate structured mapping metadata\n");
 		return -ENOMEM;
+	}
+	if (mc->nr_entries) {
+		mc->entries = vzalloc(sizeof(*mc->entries) * mc->nr_entries);
+		mc->entry_storage = vmalloc(sizeof(struct ppa) *
+					    (size_t)mc->nr_entries *
+					    NVMEV_MAP_CACHE_ENTRIES_PER_SLOT);
+		mc->slot_index = vmalloc(sizeof(uint32_t) *
+					 (size_t)conv_ftl->ssd->sp.tt_pgs);
+		if (!mc->entries || !mc->entry_storage || !mc->slot_index) {
+			vfree(mc->entries);
+			vfree(mc->entry_storage);
+			vfree(mc->slot_index);
+			vfree(mc->gtd);
+			vfree(mc->flash_entries);
+			memset(mc, 0, sizeof(*mc));
+			NVMEV_ERROR("Failed to allocate no4 SLC map cache: slots=%u bytes=%llu\n",
+				    mc->nr_entries,
+				    (unsigned long long)mc->cmt_budget_bytes);
+			return -ENOMEM;
+		}
+		for (idx = 0; idx < conv_ftl->ssd->sp.tt_pgs; idx++)
+			mc->slot_index[idx] = U32_MAX;
+		for (i = 0; i < mc->nr_entries; i++) {
+			mc->entries[i].entries =
+				&mc->entry_storage[i * NVMEV_MAP_CACHE_ENTRIES_PER_SLOT];
+			INIT_LIST_HEAD(&mc->entries[i].lru_node);
+		}
 	}
 	atomic64_set(&mc->lookups, 0);
 	atomic64_set(&mc->hits, 0);
@@ -1865,11 +1992,15 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 	atomic64_set(&mc->qlc_meta_writes, 0);
 	mc->initialized = true;
 
-	NVMEV_INFO("Map policy=%s gtd_entries=%u SLC mappings in DRAM; QLC mappings in flash translation pages\n",
-		   NVMEV_MAP_CACHE_POLICY_NAME, mc->gtd_entries);
+	NVMEV_INFO("Map policy=%s budget=%llu bytes slc_full_dram=%u slc_cache_slots=%u gtd_entries=%u; QLC mappings in flash translation pages\n",
+		   NVMEV_MAP_CACHE_POLICY_NAME,
+		   (unsigned long long)mc->cmt_budget_bytes,
+		   map_cache_covers_all_slc(conv_ftl) ? 1U : 0U,
+		   mc->nr_entries, mc->gtd_entries);
 	return 0;
 #endif
-	mc->nr_entries = NVMEV_MAP_CMT_SLOTS;
+	mc->cmt_budget_bytes = map_cache_budget_bytes();
+	mc->nr_entries = map_cache_budget_slots(conv_ftl);
 	mc->hotcold = hotcold;
 
 	mc->entries = vzalloc(sizeof(*mc->entries) * mc->nr_entries);
@@ -1883,8 +2014,8 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 		vfree(mc->slot_index);
 		memset(mc, 0, sizeof(*mc));
 		NVMEV_ERROR("Failed to allocate map CMT: slots=%u bytes=%llu\n",
-			    (unsigned int)NVMEV_MAP_CMT_SLOTS,
-			    (unsigned long long)NVMEV_MAP_CMT_BYTES);
+			    mc->nr_entries,
+			    (unsigned long long)mc->cmt_budget_bytes);
 		return -ENOMEM;
 	}
 
@@ -1917,7 +2048,7 @@ static int init_map_cache(struct conv_ftl *conv_ftl, bool hotcold)
 
 	NVMEV_INFO("Map CMT policy=%s budget=%llu bytes slots=%u entries_per_slot=%u\n",
 		   NVMEV_MAP_CACHE_POLICY_NAME,
-		   (unsigned long long)NVMEV_MAP_CMT_BYTES,
+		   (unsigned long long)mc->cmt_budget_bytes,
 		   mc->nr_entries, NVMEV_MAP_CACHE_ENTRIES_PER_SLOT);
 	return 0;
 }
@@ -2303,7 +2434,7 @@ static int map_cache_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "policy %s\n", NVMEV_MAP_CACHE_POLICY_NAME);
 	seq_printf(m, "initialized %u\n", mc->initialized ? 1U : 0U);
 	seq_printf(m, "cmt_bytes %llu\n",
-		   (unsigned long long)(NVMEV_MAP_CACHE_NO_QLC_CMT ? 0ULL : NVMEV_MAP_CMT_BYTES));
+		   (unsigned long long)mc->cmt_budget_bytes);
 	seq_printf(m, "qlc_cmt_enabled %u\n", NVMEV_MAP_CACHE_NO_QLC_CMT ? 0U : 1U);
 	seq_printf(m, "translation_page_bytes %u\n", NVMEV_MAP_TPAGE_BYTES);
 	seq_printf(m, "entries_per_translation_page %u\n", NVMEV_MAP_ENTRIES_PER_TPAGE);
@@ -2315,8 +2446,11 @@ static int map_cache_stats_show(struct seq_file *m, void *v)
 		   (unsigned long long)((uint64_t)mc->gtd_entries *
 					sizeof(struct nvmev_map_gtd_entry)));
 	seq_printf(m, "slc_dram_map_bytes %llu\n",
-		   (unsigned long long)(total_slc_pages(conv_ftl) *
-					NVMEV_MAP_ENTRY_BYTES));
+		   (unsigned long long)
+		   ((total_slc_pages(conv_ftl) * NVMEV_MAP_ENTRY_BYTES) <
+		    mc->cmt_budget_bytes ?
+		    (total_slc_pages(conv_ftl) * NVMEV_MAP_ENTRY_BYTES) :
+		    mc->cmt_budget_bytes));
 	seq_printf(m, "flash_translation_store_bytes %llu\n",
 		   (unsigned long long)((uint64_t)conv_ftl->ssd->sp.tt_pgs *
 					NVMEV_MAP_ENTRY_BYTES));
