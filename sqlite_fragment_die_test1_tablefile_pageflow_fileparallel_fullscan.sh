@@ -40,6 +40,8 @@ SQLITE_FTL_HOST_PAGE_BYTES=${SQLITE_FTL_HOST_PAGE_BYTES:-4K}
 SQLITE_DIRECT_IO=${SQLITE_DIRECT_IO:-1}
 SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-0}
 SQLITE_COLD_FULL_READ_ITERS=${SQLITE_COLD_FULL_READ_ITERS:-1}
+# Multiple modes are allowed, e.g. "quota-row-shuffled random-row-concurrent".
+# Recommended mapping-cache main mode: quota-row-shuffled.
 SQLITE_COLD_FULL_READ_MODE=${SQLITE_COLD_FULL_READ_MODE:-full-scan-concurrent}
 SQLITE_COLD_EXTRA_APPEND_BYTES=${SQLITE_COLD_EXTRA_APPEND_BYTES:-0}
 SQLITE_COLD_EXTRA_MODE=${SQLITE_COLD_EXTRA_MODE:-off}
@@ -136,17 +138,20 @@ load_die_module() {
 run_one_test() {
     local variant="$1"
     local threads="$2"
-    local tag="die_tablefile_pageflow_fileparallel_fullscan_${variant}_t${threads}"
-    local init_txt="${RESULT_FOLDER%/}/sqlite_die_tablefile_pageflow_fileparallel_fullscan_init_${variant}_t${threads}.txt"
-    local out_dir="${DIE_RESULT_BASE}/${variant}/t${threads}"
+    local cold_mode="$3"
+    local mode_tag
+    mode_tag="$(printf '%s' "$cold_mode" | tr -c 'A-Za-z0-9' '_')"
+    local tag="die_tablefile_pageflow_fileparallel_fullscan_${variant}_${mode_tag}_t${threads}"
+    local init_txt="${RESULT_FOLDER%/}/sqlite_die_tablefile_pageflow_fileparallel_fullscan_init_${variant}_${mode_tag}_t${threads}.txt"
+    local out_dir="${DIE_RESULT_BASE}/${variant}/${mode_tag}/t${threads}"
 
     mkdir -p "$out_dir"
 
     echo ""
     echo "================================================================"
-    echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  tag=$tag"
+    echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  cold_mode=$cold_mode  tag=$tag"
     echo "  per-table-db=ON  logical_row_bytes~32KB  est_row_pages~8  tables=$SQLITE_TABLE_COUNT  rows/tbl_override=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  cold_mode=$SQLITE_COLD_FULL_READ_MODE  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
+    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  cold_mode=$cold_mode  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
     echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH"
     echo "  note: default run uses no dummy; cold scan uses one thread per table file within each batch"
     echo "================================================================"
@@ -197,7 +202,7 @@ run_one_test() {
         --lambda "$EXP_LAMBDA" \
         --normal-mean "$NORMAL_MEAN" \
         --normal-stddev "$NORMAL_STDDEV" \
-        --cold-full-read-mode "$SQLITE_COLD_FULL_READ_MODE" \
+        --cold-full-read-mode "$cold_mode" \
         --cold-full-read-iters "$SQLITE_COLD_FULL_READ_ITERS" \
         --cold-extra-append-bytes "$SQLITE_COLD_EXTRA_APPEND_BYTES" \
         --cold-extra-mode "$SQLITE_COLD_EXTRA_MODE" \
@@ -290,7 +295,9 @@ mkdir -p "$DIE_RESULT_BASE"
 
 for threads in $THREAD_COUNTS; do
     for variant in $VARIANTS; do
-        run_one_test "$variant" "$threads" || exit 1
+        for cold_mode in $SQLITE_COLD_FULL_READ_MODE; do
+            run_one_test "$variant" "$threads" "$cold_mode" || exit 1
+        done
     done
 done
 

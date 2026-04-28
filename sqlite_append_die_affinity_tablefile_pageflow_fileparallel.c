@@ -89,6 +89,8 @@ enum cold_full_read_mode {
 	COLD_FULL_READ_FULL_SCAN = 0,
 	COLD_FULL_READ_RANDOM_CHUNK,
 	COLD_FULL_READ_RANDOM_ROW,
+	COLD_FULL_READ_QUOTA_ROW_GROUPED,
+	COLD_FULL_READ_QUOTA_ROW_SHUFFLED,
 };
 
 struct page_die_entry {
@@ -248,6 +250,11 @@ struct concurrent_read_ctx {
 	unsigned long long rows_read;
 };
 
+struct quota_row_event {
+	unsigned int table_id;
+	int row_id;
+};
+
 struct append_phase_stats {
 	unsigned long long rows_written;
 	unsigned long long payload_bytes_written;
@@ -392,6 +399,15 @@ static enum cold_full_read_mode parse_cold_full_read_mode(const char *arg)
 	    !strcasecmp(arg, "random-point") ||
 	    !strcasecmp(arg, "random-point-concurrent"))
 		return COLD_FULL_READ_RANDOM_ROW;
+	if (!strcasecmp(arg, "quota-row") ||
+	    !strcasecmp(arg, "quota-row-grouped") ||
+	    !strcasecmp(arg, "quota-row-grouped-concurrent"))
+		return COLD_FULL_READ_QUOTA_ROW_GROUPED;
+	if (!strcasecmp(arg, "quota-row-shuffled") ||
+	    !strcasecmp(arg, "quota-row-shuffled-global") ||
+	    !strcasecmp(arg, "global-random-row") ||
+	    !strcasecmp(arg, "global-random-row-shuffled"))
+		return COLD_FULL_READ_QUOTA_ROW_SHUFFLED;
 	return COLD_FULL_READ_FULL_SCAN;
 }
 
@@ -402,6 +418,10 @@ static const char *cold_full_read_mode_label(enum cold_full_read_mode mode)
 		return "random-chunk-concurrent";
 	case COLD_FULL_READ_RANDOM_ROW:
 		return "random-row-concurrent";
+	case COLD_FULL_READ_QUOTA_ROW_GROUPED:
+		return "quota-row-grouped";
+	case COLD_FULL_READ_QUOTA_ROW_SHUFFLED:
+		return "quota-row-shuffled";
 	case COLD_FULL_READ_FULL_SCAN:
 	default:
 		return "full-scan-concurrent";
@@ -2238,6 +2258,20 @@ static void shuffle_u32(unsigned int *order, unsigned int count, unsigned int *s
 	}
 }
 
+static void shuffle_quota_row_events(struct quota_row_event *events, size_t count,
+				     unsigned int *state)
+{
+	if (!events || !state)
+		return;
+	for (size_t i = count; i > 1; --i) {
+		size_t j = (size_t)(next_rand(state) % (unsigned int)i);
+		struct quota_row_event tmp = events[i - 1];
+
+		events[i - 1] = events[j];
+		events[j] = tmp;
+	}
+}
+
 static void *full_scan_worker(void *arg)
 {
 	struct concurrent_read_ctx *ctx = arg;
@@ -2297,6 +2331,19 @@ static void *full_scan_worker(void *arg)
 			}
 			}
 			free(order);
+		} else if (ctx->mode == COLD_FULL_READ_QUOTA_ROW_GROUPED) {
+			unsigned int total_rows = (ctx->record_id_end > ctx->record_id_begin) ?
+				(unsigned int)(ctx->record_id_end - ctx->record_id_begin) : 0U;
+			unsigned int state = ctx->rng_seed ? ctx->rng_seed : 1U;
+
+			for (unsigned int i = 0; i < ctx->repeats && total_rows > 0; ++i) {
+				int row_id = ctx->record_id_begin +
+					(int)(next_rand(&state) % total_rows);
+				int rc = scan_stmt_one_row(stmt, row_id, &ctx->rows_read);
+
+				if (rc != SQLITE_DONE)
+					break;
+			}
 		} else if (ctx->mode == COLD_FULL_READ_RANDOM_ROW) {
 			unsigned int total_rows = (ctx->record_id_end > ctx->record_id_begin) ?
 				(unsigned int)(ctx->record_id_end - ctx->record_id_begin) : 0U;
@@ -2329,6 +2376,149 @@ static void *full_scan_worker(void *arg)
 	return NULL;
 }
 
+static double run_cold_quota_row_shuffled(const struct dataset_layout *layout,
+					  struct table_file_state *tables,
+					  const struct workload_options *opts,
+					  const unsigned int *read_plan,
+					  double *cold_per_table,
+					  unsigned long long *total_rows_out)
+{
+	struct quota_row_event *events = NULL;
+	sqlite3 **dbs = NULL;
+	sqlite3_stmt **stmts = NULL;
+	unsigned long long *table_events = NULL;
+	size_t event_count = 0;
+	size_t pos = 0;
+	unsigned int state;
+	unsigned int iters;
+	unsigned int active_tables = 0;
+	double wall_start;
+	char sql[256];
+	int rc = 0;
+
+	if (!layout || !tables || !opts || !total_rows_out)
+		return 0.0;
+
+	iters = opts->cold_full_read_iters ? opts->cold_full_read_iters : 1U;
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned long long quota = (unsigned long long)(read_plan ? read_plan[tbl] : 1U) *
+					   (unsigned long long)iters;
+
+		if (tables[tbl].rows_inserted == 0 || quota == 0)
+			continue;
+		if (quota > (unsigned long long)(SIZE_MAX - event_count))
+			return 0.0;
+		event_count += (size_t)quota;
+		active_tables++;
+	}
+
+	*total_rows_out = 0;
+	if (event_count == 0)
+		return 0.0;
+
+	events = calloc(event_count, sizeof(*events));
+	dbs = calloc(layout->table_count ? layout->table_count : 1U, sizeof(*dbs));
+	stmts = calloc(layout->table_count ? layout->table_count : 1U, sizeof(*stmts));
+	table_events = calloc(layout->table_count ? layout->table_count : 1U, sizeof(*table_events));
+	if (!events || !dbs || !stmts || !table_events) {
+		free(events);
+		free(dbs);
+		free(stmts);
+		free(table_events);
+		return 0.0;
+	}
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned int total_rows;
+		unsigned int row_state;
+		unsigned long long quota = (unsigned long long)(read_plan ? read_plan[tbl] : 1U) *
+					   (unsigned long long)iters;
+
+		if (tables[tbl].rows_inserted == 0 || quota == 0)
+			continue;
+
+		total_rows = (tables[tbl].max_record_id_exclusive > tables[tbl].next_record_id + 1) ?
+			(unsigned int)(tables[tbl].max_record_id_exclusive -
+				       (tables[tbl].next_record_id + 1)) : 0U;
+		if (total_rows == 0)
+			continue;
+
+		row_state = (opts->seed ? opts->seed : 42U) ^ (0x9e3779b9U * (tbl + 1U));
+		drop_file_cache(tables[tbl].db_path);
+		for (unsigned long long i = 0; i < quota; ++i) {
+			events[pos].table_id = tbl;
+			events[pos].row_id = tables[tbl].next_record_id + 1 +
+					     (int)(next_rand(&row_state) % total_rows);
+			pos++;
+		}
+	}
+	event_count = pos;
+	state = (opts->seed ? opts->seed : 42U) ^ 0xa5a5f00dU;
+	shuffle_quota_row_events(events, event_count, &state);
+
+	snprintf(sql, sizeof(sql),
+		 "SELECT str1,str2,str3,str4 FROM DB1 WHERE id >= ? AND id < ? ORDER BY id;");
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		if (tables[tbl].rows_inserted == 0 || !(read_plan ? read_plan[tbl] : 1U))
+			continue;
+		if (sqlite3_open_v2(tables[tbl].db_path, &dbs[tbl],
+				    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK) {
+			rc = -EIO;
+			goto out;
+		}
+		sqlite3_busy_timeout(dbs[tbl], 30000);
+		if (sqlite3_prepare_v2(dbs[tbl], sql, -1, &stmts[tbl], NULL) != SQLITE_OK) {
+			rc = -EIO;
+			goto out;
+		}
+	}
+
+	printf("[sqlite_cold_global] mode=%s events=%zu active_tables=%u iters=%u\n",
+	       cold_full_read_mode_label(opts->cold_full_read_mode),
+	       event_count, active_tables, iters);
+
+	wall_start = monotonic_sec();
+	for (size_t i = 0; i < event_count; ++i) {
+		unsigned int tbl = events[i].table_id;
+		unsigned long long rows_before = *total_rows_out;
+		double t0;
+		double dt;
+
+		if (tbl >= layout->table_count || !stmts[tbl])
+			continue;
+		t0 = monotonic_sec();
+		if (scan_stmt_one_row(stmts[tbl], events[i].row_id, total_rows_out) != SQLITE_DONE) {
+			rc = -EIO;
+			break;
+		}
+		dt = monotonic_sec() - t0;
+		cold_per_table[tbl] += dt;
+		table_events[tbl] += (*total_rows_out > rows_before) ? 1ULL : 0ULL;
+	}
+	wall_start = monotonic_sec() - wall_start;
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		if (table_events[tbl])
+			printf("[sqlite_cold_global] table=%u events=%llu time=%.6fs\n",
+			       tbl, table_events[tbl], cold_per_table[tbl]);
+	}
+
+out:
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		if (stmts[tbl])
+			sqlite3_finalize(stmts[tbl]);
+		if (dbs[tbl])
+			sqlite3_close(dbs[tbl]);
+	}
+	free(events);
+	free(dbs);
+	free(stmts);
+	free(table_events);
+	if (rc != 0)
+		fprintf(stderr, "warning: quota-row-shuffled cold read failed rc=%d\n", rc);
+	return rc == 0 ? wall_start : 0.0;
+}
+
 static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 					    struct table_file_state *tables,
 					    const struct workload_options *opts,
@@ -2341,6 +2531,10 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 	struct concurrent_read_ctx *ctxs = NULL;
 	double wall_start;
 	unsigned long long total_rows = 0;
+
+	if (opts && opts->cold_full_read_mode == COLD_FULL_READ_QUOTA_ROW_SHUFFLED)
+		return run_cold_quota_row_shuffled(layout, tables, opts, read_plan,
+						   cold_per_table, total_rows_out);
 
 	if (threads == 0)
 		threads = 1;
@@ -3751,7 +3945,7 @@ static void usage(const char *prog)
 		"  --interleave-pages N\n"
 		"  --interleave-reads N\n"
 			"  --cold-concurrent-threads N\n"
-				"  --cold-full-read-mode full-scan-concurrent|random-chunk-concurrent|random-row-concurrent\n"
+				"  --cold-full-read-mode full-scan-concurrent|random-chunk-concurrent|random-row-concurrent|quota-row-grouped|quota-row-shuffled\n"
 			"  --cold-full-read-iters N\n"
 			"  --page-chain-path PATH\n"
 		"  --page-die-transition-path PATH\n"
