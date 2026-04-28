@@ -61,7 +61,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_ENABLE_QLC_HOTCOLD 0
 #endif
 #ifndef NVMEV_ENABLE_READ_REPROMOTION
-#define NVMEV_ENABLE_READ_REPROMOTION 0
+#define NVMEV_ENABLE_READ_REPROMOTION 1
 #endif
 #ifndef NVMEV_ENABLE_INTERNAL_DIE_AFFINITY
 #define NVMEV_ENABLE_INTERNAL_DIE_AFFINITY 0
@@ -1507,15 +1507,14 @@ static void map_flash_update_lpn(struct conv_ftl *conv_ftl, uint64_t lpn,
 	spin_lock_irqsave(&mc->lock, flags);
 	mc->flash_entries[lpn] = *ppa;
 
-	mc->slc_log_entries_pending++;
-	if (mc->slc_log_entries_pending >= NVMEV_MAP_ENTRIES_PER_TPAGE) {
-		seq = mc->meta_alloc_seq++;
-		log_ppa = map_meta_make_ppa(conv_ftl, seq, true);
-		mc->slc_log_entries_pending = 0;
-		flush_log = true;
-	}
-
 	if (qlc_mapping) {
+		mc->slc_log_entries_pending++;
+		if (mc->slc_log_entries_pending >= NVMEV_MAP_ENTRIES_PER_TPAGE) {
+			seq = mc->meta_alloc_seq++;
+			log_ppa = map_meta_make_ppa(conv_ftl, seq, true);
+			mc->slc_log_entries_pending = 0;
+			flush_log = true;
+		}
 		mc->gtd[ftpage].dirty_entries++;
 		if (mc->gtd[ftpage].dirty_entries >= NVMEV_MAP_ENTRIES_PER_TPAGE) {
 			seq = mc->meta_alloc_seq++;

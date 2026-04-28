@@ -61,7 +61,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_ENABLE_QLC_HOTCOLD 0
 #endif
 #ifndef NVMEV_ENABLE_READ_REPROMOTION
-#define NVMEV_ENABLE_READ_REPROMOTION 0
+#define NVMEV_ENABLE_READ_REPROMOTION 1
 #endif
 #ifndef NVMEV_ENABLE_INTERNAL_DIE_AFFINITY
 #define NVMEV_ENABLE_INTERNAL_DIE_AFFINITY 0
