@@ -42,11 +42,14 @@ SQLITE_FAST_INIT_PROFILE=${SQLITE_FAST_INIT_PROFILE:-0}
 SQLITE_COLD_FULL_READ_ITERS=${SQLITE_COLD_FULL_READ_ITERS:-1}
 SQLITE_MAP_CMT_BYTES=${SQLITE_MAP_CMT_BYTES:-8M}
 SQLITE_MAP_CMT_BYTES_LIST=${SQLITE_MAP_CMT_BYTES_LIST:-$SQLITE_MAP_CMT_BYTES}
+SQLITE_REBUILD_DIE_MODULES=${SQLITE_REBUILD_DIE_MODULES:-0}
 # Multiple modes are allowed, e.g. "quota-page-shuffled quota-row-shuffled".
 # Recommended mapping-cache isolation mode: quota-page-shuffled.
 SQLITE_COLD_FULL_READ_MODE=${SQLITE_COLD_FULL_READ_MODE:-full-scan-concurrent}
 SQLITE_COLD_EXTRA_APPEND_BYTES=${SQLITE_COLD_EXTRA_APPEND_BYTES:-0}
 SQLITE_COLD_EXTRA_MODE=${SQLITE_COLD_EXTRA_MODE:-off}
+SQLITE_COLD_EXTRA_READ_RATIO=${SQLITE_COLD_EXTRA_READ_RATIO:-10}
+SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH=${SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH:-0}
 SQLITE_ACCESS_DIST=${SQLITE_ACCESS_DIST:-zipf}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
 NORMAL_STDDEV=${NORMAL_STDDEV:-400}
@@ -77,6 +80,11 @@ fi
 mkdir -p "$RESULT_FOLDER"
 mkdir -p "$TARGET_FOLDER"
 
+if [[ "$SQLITE_REBUILD_DIE_MODULES" == 1 ]]; then
+    echo "=== Rebuilding die modules: $VARIANTS ==="
+    (cd "$NVMEV_DIR" && bash build_die.sh $VARIANTS)
+fi
+
 print_init_log_tail() {
     local path="$1"
     if [[ -f "$path" ]]; then
@@ -91,6 +99,13 @@ validate_workload_outputs() {
     local init_txt="$2"
     local expected_cold_mode="$3"
     local ok=0
+    local cold_extra_mixed=0
+
+    case "$SQLITE_COLD_EXTRA_MODE" in
+        serial-mixed|mixed|interleaved|write-read|write-then-read)
+            cold_extra_mixed=1
+            ;;
+    esac
 
     if [[ -f "${RESULT_FOLDER}/sqlite_table_tier_${tag}.csv" ]]; then
         ok=1
@@ -121,6 +136,7 @@ validate_workload_outputs() {
         return 1
     fi
     if [[ "$expected_cold_mode" == "quota-row-shuffled" ]] &&
+       [[ "$cold_extra_mixed" != "1" ]] &&
        ! grep -q "\\[sqlite_cold_global\\]" "$init_txt" 2>/dev/null; then
         echo "ERROR: quota-row-shuffled run did not emit sqlite_cold_global logs for tag=${tag}" >&2
         print_init_log_tail "$init_txt"
@@ -211,7 +227,7 @@ run_one_test() {
     echo "================================================================"
     echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  cold_mode=$cold_mode  cmt=$cmt_label($cmt_bytes bytes)  tag=$tag"
     echo "  per-table-db=ON  logical_row_bytes~32KB  est_row_pages~8  tables=$SQLITE_TABLE_COUNT  rows/tbl_override=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  cold_mode=$cold_mode  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
+    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$SQLITE_WINDOW_PAGES_PER_TABLE  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  cold_mode=$cold_mode  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  cold_extra_read_ratio=$SQLITE_COLD_EXTRA_READ_RATIO  cold_extra_row_reads_per_batch=$SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
     echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH"
     echo "  note: default run uses no dummy; cold scan uses one thread per table file within each batch"
     echo "================================================================"
@@ -266,6 +282,8 @@ run_one_test() {
         --cold-full-read-iters "$SQLITE_COLD_FULL_READ_ITERS" \
         --cold-extra-append-bytes "$SQLITE_COLD_EXTRA_APPEND_BYTES" \
         --cold-extra-mode "$SQLITE_COLD_EXTRA_MODE" \
+        --cold-extra-read-ratio "$SQLITE_COLD_EXTRA_READ_RATIO" \
+        --cold-extra-row-reads-per-batch "$SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH" \
         --cold-concurrent-threads "$threads" \
         --test-phase-path "$SQLITE_TEST_PHASE_PATH" \
         --gc-nand-timing-path "$SQLITE_GC_NAND_TIMING_PATH" \

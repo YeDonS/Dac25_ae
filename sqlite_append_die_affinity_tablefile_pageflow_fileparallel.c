@@ -87,6 +87,7 @@ enum cold_extra_mode {
 	COLD_EXTRA_MODE_OFF = 0,
 	COLD_EXTRA_MODE_SERIAL,
 	COLD_EXTRA_MODE_CONCURRENT,
+	COLD_EXTRA_MODE_SERIAL_MIXED,
 };
 
 enum cold_full_read_mode {
@@ -219,6 +220,8 @@ struct workload_options {
 	const char *bg_nand_stats_path;
 	unsigned long long cold_extra_append_bytes;
 	enum cold_extra_mode cold_extra_mode;
+	double cold_extra_read_ratio;
+	unsigned int cold_extra_row_reads_per_batch;
 };
 
 struct refstyle_dummy_state {
@@ -280,6 +283,18 @@ struct append_phase_ctx {
 	struct append_phase_stats *stats;
 };
 
+struct cold_mixed_phase_stats {
+	unsigned long long rows_written;
+	unsigned long long payload_bytes_written;
+	unsigned long long page_growth;
+	unsigned long long row_reads;
+	unsigned long long payload_bytes_read;
+	double append_sec;
+	double read_sec;
+	double elapsed_sec;
+	int rc;
+};
+
 static const struct option long_opts[] = {
 	{"mode", required_argument, NULL, 'm'},
 	{"tag", required_argument, NULL, 1000},
@@ -321,6 +336,8 @@ static const struct option long_opts[] = {
 	{"cold-extra-append-bytes", required_argument, NULL, 1035},
 	{"cold-extra-mode", required_argument, NULL, 1036},
 	{"map-cache-stats-path", required_argument, NULL, 1037},
+	{"cold-extra-read-ratio", required_argument, NULL, 1038},
+	{"cold-extra-row-reads-per-batch", required_argument, NULL, 1039},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -389,6 +406,12 @@ static enum cold_extra_mode parse_cold_extra_mode(const char *arg)
 		return COLD_EXTRA_MODE_SERIAL;
 	if (!strcasecmp(arg, "concurrent") || !strcasecmp(arg, "overlap"))
 		return COLD_EXTRA_MODE_CONCURRENT;
+	if (!strcasecmp(arg, "serial-mixed") ||
+	    !strcasecmp(arg, "mixed") ||
+	    !strcasecmp(arg, "interleaved") ||
+	    !strcasecmp(arg, "write-read") ||
+	    !strcasecmp(arg, "write-then-read"))
+		return COLD_EXTRA_MODE_SERIAL_MIXED;
 	return COLD_EXTRA_MODE_OFF;
 }
 
@@ -452,6 +475,8 @@ static const char *cold_extra_mode_label(enum cold_extra_mode mode)
 		return "serial";
 	case COLD_EXTRA_MODE_CONCURRENT:
 		return "concurrent";
+	case COLD_EXTRA_MODE_SERIAL_MIXED:
+		return "serial-mixed";
 	case COLD_EXTRA_MODE_OFF:
 	default:
 		return "off";
@@ -864,6 +889,7 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 	FILE *fp;
 	char line[256];
 	struct map_cache_stats tmp = {};
+	bool have_qlc_cmt_enabled = false;
 
 	if (!stats)
 		return -EINVAL;
@@ -880,8 +906,10 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 			continue;
 		if (sscanf(line, "initialized %u", &tmp.initialized) == 1)
 			continue;
-		if (sscanf(line, "qlc_cmt_enabled %u", &tmp.qlc_cmt_enabled) == 1)
+		if (sscanf(line, "qlc_cmt_enabled %u", &tmp.qlc_cmt_enabled) == 1) {
+			have_qlc_cmt_enabled = true;
 			continue;
+		}
 		if (sscanf(line, "cmt_bytes %llu", &tmp.cmt_bytes) == 1)
 			continue;
 		if (sscanf(line, "cache_entries_per_slot %llu",
@@ -965,7 +993,7 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 		tmp.cached_mapping_entries = tmp.cached_translation_pages;
 	if (!tmp.used_mapping_entries)
 		tmp.used_mapping_entries = tmp.used_translation_pages;
-	if (!tmp.qlc_cmt_enabled && tmp.cmt_bytes)
+	if (!have_qlc_cmt_enabled && tmp.cmt_bytes)
 		tmp.qlc_cmt_enabled = 1;
 	if (!tmp.policy[0])
 		snprintf(tmp.policy, sizeof(tmp.policy), "%s", "unknown");
@@ -1041,6 +1069,64 @@ static void map_cache_stats_delta(struct map_cache_stats *dst,
 	dst->heat_decays = diff_u64(after->heat_decays, before->heat_decays);
 }
 
+static void print_map_cache_stats_line(const char *scope,
+				       const struct map_cache_stats *stats)
+{
+	double hit_ratio;
+	double metadata_read_sec;
+	double metadata_write_sec;
+	double metadata_total_sec;
+	unsigned long long avg_read_ns;
+	unsigned long long avg_write_ns;
+
+	if (!stats)
+		return;
+
+	hit_ratio = stats->lookups ?
+		(double)stats->hits / (double)stats->lookups : 0.0;
+	metadata_read_sec = (double)stats->metadata_read_ns / 1000000000.0;
+	metadata_write_sec = (double)stats->metadata_write_ns / 1000000000.0;
+	metadata_total_sec = (double)stats->metadata_total_ns / 1000000000.0;
+	avg_read_ns = stats->metadata_reads ?
+		stats->metadata_read_ns / stats->metadata_reads : 0ULL;
+	avg_write_ns = stats->metadata_writes ?
+		stats->metadata_write_ns / stats->metadata_writes : 0ULL;
+
+	printf("[sqlite_init] map_cache scope=%s policy=%s initialized=%u hotcold=%u qlc_cmt_enabled=%u cmt_bytes=%llu "
+	       "cache_entries_per_slot=%llu cached_mapping_entries=%llu used_mapping_entries=%llu "
+	       "gtd_entries=%llu gtd_dram_bytes=%llu slc_dram_map_bytes=%llu flash_translation_store_bytes=%llu slc_log_entries_pending=%llu "
+	       "lookups=%llu hits=%llu misses=%llu slc_dram_hits=%llu gtd_lookups=%llu qlc_flash_reads=%llu hit_ratio=%.6f "
+	       "metadata_reads=%llu metadata_writes=%llu slc_meta_log_writes=%llu qlc_meta_folds=%llu qlc_meta_writes=%llu "
+	       "metadata_read_time=%.9fs metadata_write_time=%.9fs metadata_total_time=%.9fs "
+	       "avg_metadata_read_ns=%llu avg_metadata_write_ns=%llu evictions=%llu dirty_evictions=%llu\n",
+	       scope ? scope : "final",
+	       stats->policy, stats->initialized,
+	       stats->hotcold, stats->qlc_cmt_enabled,
+	       stats->cmt_bytes,
+	       stats->cache_entries_per_slot,
+	       stats->cached_mapping_entries,
+	       stats->used_mapping_entries,
+	       stats->gtd_entries,
+	       stats->gtd_dram_bytes,
+	       stats->slc_dram_map_bytes,
+	       stats->flash_translation_store_bytes,
+	       stats->slc_log_entries_pending,
+	       stats->lookups, stats->hits,
+	       stats->misses,
+	       stats->slc_dram_hits,
+	       stats->gtd_lookups,
+	       stats->qlc_flash_reads, hit_ratio,
+	       stats->metadata_reads,
+	       stats->metadata_writes,
+	       stats->slc_meta_log_writes,
+	       stats->qlc_meta_folds,
+	       stats->qlc_meta_writes,
+	       metadata_read_sec, metadata_write_sec,
+	       metadata_total_sec, avg_read_ns, avg_write_ns,
+	       stats->evictions,
+	       stats->dirty_evictions);
+}
+
 static void bg_nand_stats_delta(struct bg_nand_stats *dst,
 				const struct bg_nand_stats *after,
 				const struct bg_nand_stats *before)
@@ -1055,6 +1141,22 @@ static void bg_nand_stats_delta(struct bg_nand_stats *dst,
 	dst->read_ops = diff_u64(after->read_ops, before->read_ops);
 	dst->write_ops = diff_u64(after->write_ops, before->write_ops);
 	dst->erase_ops = diff_u64(after->erase_ops, before->erase_ops);
+}
+
+static void bg_nand_stats_sum(struct bg_nand_stats *dst,
+			      const struct bg_nand_stats *a,
+			      const struct bg_nand_stats *b)
+{
+	if (!dst || !a || !b)
+		return;
+
+	dst->busy_ns = a->busy_ns + b->busy_ns;
+	dst->read_ns = a->read_ns + b->read_ns;
+	dst->write_ns = a->write_ns + b->write_ns;
+	dst->erase_ns = a->erase_ns + b->erase_ns;
+	dst->read_ops = a->read_ops + b->read_ops;
+	dst->write_ops = a->write_ops + b->write_ops;
+	dst->erase_ops = a->erase_ops + b->erase_ops;
 }
 
 static void print_bg_nand_stats_line(const char *phase,
@@ -2086,6 +2188,241 @@ static void *append_tables_round_robin_worker(void *arg)
 	stats->elapsed_sec = monotonic_sec() - start;
 	stats->rc = 0;
 	return NULL;
+}
+
+static unsigned int pick_table(unsigned int table_count, const struct workload_options *opts,
+			       unsigned int *state);
+static void drop_file_cache(const char *path);
+
+static unsigned long long cold_mixed_target_reads(unsigned long long rows_written,
+						  double ratio)
+{
+	long double target;
+
+	if (ratio <= 0.0 || rows_written == 0)
+		return 0;
+	target = (long double)rows_written * (long double)ratio;
+	if (target >= (long double)ULLONG_MAX)
+		return ULLONG_MAX;
+	return (unsigned long long)target;
+}
+
+static int run_random_row_read_burst(const struct dataset_layout *layout,
+				     struct table_file_state *tables,
+				     const struct workload_options *opts,
+				     sqlite3_stmt **stmts,
+				     unsigned long long events,
+				     unsigned int *rng_state,
+				     double *cold_per_table,
+				     double *table_latency,
+				     unsigned long long *table_read_ops,
+				     unsigned long long *total_rows_out,
+				     double *elapsed_out)
+{
+	double start;
+
+	if (!layout || !tables || !opts || !stmts || !rng_state || events == 0) {
+		if (elapsed_out)
+			*elapsed_out = 0.0;
+		return 0;
+	}
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		if (tables[tbl].rows_inserted > 0)
+			drop_file_cache(tables[tbl].db_path);
+	}
+
+	start = monotonic_sec();
+	for (unsigned long long i = 0; i < events; ++i) {
+		unsigned int tbl = pick_table(layout->table_count, opts, rng_state);
+		struct table_file_state *table = &tables[tbl];
+		int lower_bound = table->next_record_id + 1;
+		int upper_bound = table->max_record_id_exclusive;
+		unsigned int selectable_rows;
+		int row_id;
+		unsigned int row_index;
+		double t0;
+		double dt;
+		int rc;
+
+		if (upper_bound <= lower_bound || !stmts[tbl])
+			continue;
+		selectable_rows = (unsigned int)(upper_bound - lower_bound);
+		row_id = lower_bound + (int)(next_rand(rng_state) % selectable_rows);
+
+		t0 = monotonic_sec();
+		sqlite3_reset(stmts[tbl]);
+		sqlite3_clear_bindings(stmts[tbl]);
+		sqlite3_bind_int(stmts[tbl], 1, row_id);
+		rc = sqlite3_step(stmts[tbl]);
+		if (rc != SQLITE_ROW)
+			return -EIO;
+		rc = sqlite3_step(stmts[tbl]);
+		if (rc != SQLITE_DONE)
+			return -EIO;
+		dt = monotonic_sec() - t0;
+
+		if (cold_per_table)
+			cold_per_table[tbl] += dt;
+		if (table_latency)
+			table_latency[tbl] += dt;
+		if (table_read_ops)
+			table_read_ops[tbl]++;
+		if (total_rows_out)
+			(*total_rows_out)++;
+
+		row_index = (unsigned int)(table->max_record_id_exclusive - 1 - row_id);
+		if (row_index < table->total_rows) {
+			table->row_reads[row_index]++;
+			table->row_latency[row_index] += dt;
+		}
+	}
+
+	if (elapsed_out)
+		*elapsed_out = monotonic_sec() - start;
+	return 0;
+}
+
+static int run_cold_mixed_append_random_read(const struct dataset_layout *layout,
+					     struct table_file_state *tables,
+					     const struct workload_options *opts,
+					     struct refstyle_dummy_state *dummy,
+					     double *cold_per_table,
+					     double *table_latency,
+					     unsigned long long *table_read_ops,
+					     struct cold_mixed_phase_stats *stats)
+{
+	sqlite3_stmt **stmts = NULL;
+	unsigned int *active = NULL;
+	unsigned int active_count = 0;
+	unsigned int page_budget;
+	unsigned int rng_state;
+	unsigned int round_id = 0;
+	double start;
+	int rc = 0;
+
+	if (!layout || !tables || !opts || !dummy || !stats)
+		return -EINVAL;
+
+	memset(stats, 0, sizeof(*stats));
+	page_budget = opts->window_pages_per_table ? opts->window_pages_per_table :
+		DEFAULT_WINDOW_PAGES_PER_TABLE;
+	rng_state = (opts->seed ? opts->seed : 42U) ^ 0xc01d5eedU;
+
+	active = calloc(layout->table_count ? layout->table_count : 1U, sizeof(*active));
+	stmts = calloc(layout->table_count ? layout->table_count : 1U, sizeof(*stmts));
+	if (!active || !stmts) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		const char *sql = "SELECT str1,str2,str3,str4 FROM DB1 WHERE id = ?;";
+
+		active[active_count++] = tbl;
+		rc = sqlite3_prepare_v2(tables[tbl].db, sql, -1, &stmts[tbl], NULL);
+		if (rc != SQLITE_OK) {
+			rc = -EIO;
+			goto out;
+		}
+	}
+
+	printf("[sqlite_cold_mixed] mode=serial-mixed read_model=random-row-point "
+	       "target_write_bytes=%llu read_ratio=%.3f fixed_reads_per_round=%u\n",
+	       opts->cold_extra_append_bytes, opts->cold_extra_read_ratio,
+	       opts->cold_extra_row_reads_per_batch);
+
+	start = monotonic_sec();
+	while (active_count > 0) {
+		unsigned int next_active = 0;
+
+		for (unsigned int i = 0; i < active_count; ++i) {
+			unsigned int table_id = active[i];
+			struct table_file_state *table = &tables[table_id];
+			unsigned int rows_step = 0;
+			unsigned int pages_step = 0;
+			double t0;
+
+			if (table->rows_inserted >= table->total_rows)
+				continue;
+
+			t0 = monotonic_sec();
+			rc = insert_table_window_by_pages(table, page_budget, opts, dummy,
+							  &rows_step, &pages_step);
+			stats->append_sec += monotonic_sec() - t0;
+			if (rc != 0)
+				goto out;
+
+			table->rows_inserted += rows_step;
+			stats->rows_written += rows_step;
+			stats->payload_bytes_written +=
+				(unsigned long long)rows_step * ROW_PAYLOAD_BYTES;
+			stats->page_growth += pages_step;
+
+			printf("[sqlite_cold_mixed] round=%u table=%u wrote_rows=%u wrote_bytes=%llu "
+			       "total_write_bytes=%llu\n",
+			       round_id,
+			       table_id, rows_step,
+			       (unsigned long long)rows_step * ROW_PAYLOAD_BYTES,
+			       stats->payload_bytes_written);
+
+			if (table->rows_inserted < table->total_rows)
+				active[next_active++] = table_id;
+		}
+
+		{
+			unsigned long long reads_due = 0;
+			unsigned long long reads_before = stats->row_reads;
+			double read_elapsed = 0.0;
+
+			if (opts->cold_extra_row_reads_per_batch > 0) {
+				reads_due = opts->cold_extra_row_reads_per_batch;
+			} else {
+				unsigned long long target_reads =
+					cold_mixed_target_reads(stats->rows_written,
+								opts->cold_extra_read_ratio);
+
+				if (target_reads > stats->row_reads)
+					reads_due = target_reads - stats->row_reads;
+			}
+
+			rc = run_random_row_read_burst(layout, tables, opts, stmts, reads_due,
+						       &rng_state, cold_per_table,
+						       table_latency, table_read_ops,
+						       &stats->row_reads, &read_elapsed);
+			stats->read_sec += read_elapsed;
+			if (rc != 0)
+				goto out;
+
+			printf("[sqlite_cold_mixed] round=%u completed active_tables=%u "
+			       "read_rows=%llu total_write_bytes=%llu total_read_bytes=%llu\n",
+			       round_id, active_count, stats->row_reads - reads_before,
+			       stats->payload_bytes_written, stats->row_reads * ROW_PAYLOAD_BYTES);
+		}
+
+		active_count = next_active;
+		round_id++;
+	}
+
+	stats->payload_bytes_read = stats->row_reads * ROW_PAYLOAD_BYTES;
+	stats->elapsed_sec = monotonic_sec() - start;
+	stats->rc = 0;
+
+out:
+	if (stmts) {
+		for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+			if (stmts[tbl])
+				sqlite3_finalize(stmts[tbl]);
+		}
+	}
+	free(stmts);
+	free(active);
+	if (rc != 0) {
+		stats->rc = rc;
+		if (stats->elapsed_sec == 0.0 && stats->append_sec + stats->read_sec > 0.0)
+			stats->elapsed_sec = stats->append_sec + stats->read_sec;
+	}
+	return rc;
 }
 
 static unsigned int cold_extra_rows_per_table(const struct workload_options *opts,
@@ -3592,13 +3929,17 @@ static int run_init_mode(const struct workload_options *opts)
 	unsigned long long cold_extra_rows = 0;
 	unsigned long long cold_extra_payload_bytes = 0;
 	unsigned long long cold_extra_page_growth = 0;
+	unsigned long long cold_extra_read_rows = 0;
+	unsigned long long cold_extra_read_payload_bytes = 0;
 	unsigned int cold_extra_rows_each = 0;
 	struct refstyle_dummy_state ref_dummy = { .fd = -1 };
 	struct append_phase_stats cold_append_stats = {};
 	struct append_phase_ctx cold_append_ctx = {};
+	struct cold_mixed_phase_stats cold_mixed_stats = {};
 	pthread_t cold_append_thread;
 	struct bg_nand_stats bg_nand_before = {};
 	struct bg_nand_stats bg_nand_after_mixed = {};
+	struct bg_nand_stats bg_nand_before_cold = {};
 	struct bg_nand_stats bg_nand_after_cold = {};
 	struct bg_nand_stats bg_nand_mixed = {};
 	struct bg_nand_stats bg_nand_cold = {};
@@ -3606,6 +3947,9 @@ static int run_init_mode(const struct workload_options *opts)
 	struct map_cache_stats map_cache_stats = {};
 	struct map_cache_stats map_cache_before = {};
 	struct map_cache_stats map_cache_after = {};
+	struct map_cache_stats map_cache_cold_before = {};
+	struct map_cache_stats map_cache_cold_after = {};
+	struct map_cache_stats map_cache_cold_stats = {};
 	char layout_path[PATH_MAX];
 	char row_stats_path[PATH_MAX];
 	char table_stats_path[PATH_MAX];
@@ -3627,11 +3971,15 @@ static int run_init_mode(const struct workload_options *opts)
 	bool test_phase_toggled = false;
 	bool gc_nand_timing_toggled = false;
 	bool bg_nand_before_valid = false;
+	bool bg_nand_before_cold_valid = false;
 	bool bg_nand_mixed_valid = false;
 	bool bg_nand_cold_valid = false;
 	bool bg_nand_total_valid = false;
 	bool map_cache_before_valid = false;
 	bool map_cache_stats_valid = false;
+	bool map_cache_cold_before_valid = false;
+	bool map_cache_cold_stats_valid = false;
+	bool cold_mixed_stage = false;
 	const char *map_cache_scope = "final";
 	bool cold_append_thread_started = false;
 
@@ -3871,46 +4219,69 @@ static int run_init_mode(const struct workload_options *opts)
 	test_phase_toggled = true;
 	reset_die_stats();
 	drop_page_cache();
+	if (load_bg_nand_stats(opts->bg_nand_stats_path, &bg_nand_before_cold) == 0)
+		bg_nand_before_cold_valid = true;
+	if (load_map_cache_stats(opts->map_cache_stats_path, &map_cache_cold_before) == 0)
+		map_cache_cold_before_valid = true;
 
 	cold_stage_total_time = monotonic_sec();
 	cold_append_ctx.opts = opts;
 	cold_append_ctx.tables = tables;
 	cold_append_ctx.dummy = &ref_dummy;
 	cold_append_ctx.stats = &cold_append_stats;
-	if (cold_extra_rows_each > 0 && opts->cold_extra_mode == COLD_EXTRA_MODE_SERIAL) {
-		append_tables_round_robin_worker(&cold_append_ctx);
-		if (cold_append_stats.rc != 0) {
-			rc = cold_append_stats.rc;
+	if (cold_extra_rows_each > 0 && opts->cold_extra_mode == COLD_EXTRA_MODE_SERIAL_MIXED) {
+		rc = run_cold_mixed_append_random_read(&layout, tables, opts, &ref_dummy,
+						       cold_per_table, table_latency,
+						       table_read_ops, &cold_mixed_stats);
+		if (rc != 0 || cold_mixed_stats.rc != 0) {
+			rc = rc != 0 ? rc : cold_mixed_stats.rc;
 			goto out;
 		}
-		cold_append_time = cold_append_stats.elapsed_sec;
-		cold_extra_rows = cold_append_stats.rows_written;
-		cold_extra_payload_bytes = cold_append_stats.payload_bytes_written;
-		cold_extra_page_growth = cold_append_stats.page_growth;
-	}
-	if (cold_extra_rows_each > 0 && opts->cold_extra_mode == COLD_EXTRA_MODE_CONCURRENT) {
-		if (pthread_create(&cold_append_thread, NULL, append_tables_round_robin_worker,
-				   &cold_append_ctx) != 0) {
-			rc = -errno;
-			goto out;
+		cold_mixed_stage = true;
+		cold_append_time = cold_mixed_stats.append_sec;
+		cold_read_time = cold_mixed_stats.read_sec;
+		cold_extra_rows = cold_mixed_stats.rows_written;
+		cold_extra_payload_bytes = cold_mixed_stats.payload_bytes_written;
+		cold_extra_page_growth = cold_mixed_stats.page_growth;
+		cold_extra_read_rows = cold_mixed_stats.row_reads;
+		cold_extra_read_payload_bytes = cold_mixed_stats.payload_bytes_read;
+		cold_rows = cold_mixed_stats.row_reads;
+	} else {
+		if (cold_extra_rows_each > 0 && opts->cold_extra_mode == COLD_EXTRA_MODE_SERIAL) {
+			append_tables_round_robin_worker(&cold_append_ctx);
+			if (cold_append_stats.rc != 0) {
+				rc = cold_append_stats.rc;
+				goto out;
+			}
+			cold_append_time = cold_append_stats.elapsed_sec;
+			cold_extra_rows = cold_append_stats.rows_written;
+			cold_extra_payload_bytes = cold_append_stats.payload_bytes_written;
+			cold_extra_page_growth = cold_append_stats.page_growth;
 		}
-		cold_append_thread_started = true;
-	}
+		if (cold_extra_rows_each > 0 && opts->cold_extra_mode == COLD_EXTRA_MODE_CONCURRENT) {
+			if (pthread_create(&cold_append_thread, NULL, append_tables_round_robin_worker,
+					   &cold_append_ctx) != 0) {
+				rc = -errno;
+				goto out;
+			}
+			cold_append_thread_started = true;
+		}
 
-	cold_read_time = run_cold_full_scan_concurrent(&layout, tables, opts,
-						       opts->cold_concurrent_threads,
-						       read_plan, cold_per_table, &cold_rows);
-	if (cold_append_thread_started) {
-		pthread_join(cold_append_thread, NULL);
-		cold_append_thread_started = false;
-		if (cold_append_stats.rc != 0) {
-			rc = cold_append_stats.rc;
-			goto out;
+		cold_read_time = run_cold_full_scan_concurrent(&layout, tables, opts,
+							       opts->cold_concurrent_threads,
+							       read_plan, cold_per_table, &cold_rows);
+		if (cold_append_thread_started) {
+			pthread_join(cold_append_thread, NULL);
+			cold_append_thread_started = false;
+			if (cold_append_stats.rc != 0) {
+				rc = cold_append_stats.rc;
+				goto out;
+			}
+			cold_append_time = cold_append_stats.elapsed_sec;
+			cold_extra_rows = cold_append_stats.rows_written;
+			cold_extra_payload_bytes = cold_append_stats.payload_bytes_written;
+			cold_extra_page_growth = cold_append_stats.page_growth;
 		}
-		cold_append_time = cold_append_stats.elapsed_sec;
-		cold_extra_rows = cold_append_stats.rows_written;
-		cold_extra_payload_bytes = cold_append_stats.payload_bytes_written;
-		cold_extra_page_growth = cold_append_stats.page_growth;
 	}
 	cold_stage_total_time = monotonic_sec() - cold_stage_total_time;
 
@@ -3918,13 +4289,22 @@ static int run_init_mode(const struct workload_options *opts)
 	if (rc != 0)
 		goto out;
 	test_phase_toggled = false;
-	if (bg_nand_before_valid &&
+	if (bg_nand_before_cold_valid &&
 	    load_bg_nand_stats(opts->bg_nand_stats_path, &bg_nand_after_cold) == 0) {
-		bg_nand_stats_delta(&bg_nand_total, &bg_nand_after_cold, &bg_nand_before);
-		bg_nand_total_valid = true;
 		bg_nand_stats_delta(&bg_nand_cold, &bg_nand_after_cold,
-				    bg_nand_mixed_valid ? &bg_nand_after_mixed : &bg_nand_before);
+				    &bg_nand_before_cold);
 		bg_nand_cold_valid = true;
+		if (bg_nand_mixed_valid) {
+			bg_nand_stats_sum(&bg_nand_total, &bg_nand_mixed,
+					  &bg_nand_cold);
+			bg_nand_total_valid = true;
+		}
+	}
+	if (map_cache_cold_before_valid &&
+	    load_map_cache_stats(opts->map_cache_stats_path, &map_cache_cold_after) == 0) {
+		map_cache_stats_delta(&map_cache_cold_stats, &map_cache_cold_after,
+				      &map_cache_cold_before);
+		map_cache_cold_stats_valid = true;
 	}
 	if (gc_nand_timing_toggled) {
 		set_gc_nand_timing_state(opts, false, "cold-read-end");
@@ -4013,7 +4393,8 @@ static int run_init_mode(const struct workload_options *opts)
 
 	{
 		double cold_unit_bytes =
-			opts->cold_full_read_mode == COLD_FULL_READ_QUOTA_PAGE_SHUFFLED ?
+			(!cold_mixed_stage &&
+			 opts->cold_full_read_mode == COLD_FULL_READ_QUOTA_PAGE_SHUFFLED) ?
 			(double)(opts->ftl_host_page_bytes ? opts->ftl_host_page_bytes :
 				 DEFAULT_FTL_HOST_PAGE_BYTES) :
 			(double)ROW_PAYLOAD_BYTES;
@@ -4063,6 +4444,19 @@ static int run_init_mode(const struct workload_options *opts)
 				       cold_append_time,
 				       cold_stage_total_time > 0.0 ? cold_stage_total_time :
 				       cold_read_time + cold_append_time);
+				if (cold_mixed_stage) {
+					double observed_ratio = cold_extra_payload_bytes ?
+						(double)cold_extra_read_payload_bytes /
+						(double)cold_extra_payload_bytes : 0.0;
+
+					printf("[sqlite_init] cold_extra_mixed read_rows=%llu "
+					       "read_payload_bytes=%llu read_time=%.6fs "
+					       "observed_read_write_ratio=%.3f\n",
+					       cold_extra_read_rows,
+					       cold_extra_read_payload_bytes,
+					       cold_read_time,
+					       observed_ratio);
+				}
 			}
 			printf("[sqlite_init] tag=%s tables=%u total_rows=%u read_events=%u interleaved_read_time=%.6fs "
 			       "cold_full_read=%.6fs cold_full_read_tp=%.2fMB/s cold_mode=%s multifile=1\n",
@@ -4092,53 +4486,10 @@ static int run_init_mode(const struct workload_options *opts)
 					       bg_nand_phase_csv_path);
 				}
 			}
-			if (map_cache_stats_valid) {
-				double hit_ratio = map_cache_stats.lookups ?
-					(double)map_cache_stats.hits / (double)map_cache_stats.lookups : 0.0;
-				double metadata_read_sec =
-					(double)map_cache_stats.metadata_read_ns / 1000000000.0;
-				double metadata_write_sec =
-					(double)map_cache_stats.metadata_write_ns / 1000000000.0;
-				double metadata_total_sec =
-					(double)map_cache_stats.metadata_total_ns / 1000000000.0;
-				unsigned long long avg_read_ns = map_cache_stats.metadata_reads ?
-					map_cache_stats.metadata_read_ns / map_cache_stats.metadata_reads : 0ULL;
-				unsigned long long avg_write_ns = map_cache_stats.metadata_writes ?
-					map_cache_stats.metadata_write_ns / map_cache_stats.metadata_writes : 0ULL;
-
-				printf("[sqlite_init] map_cache scope=%s policy=%s initialized=%u hotcold=%u qlc_cmt_enabled=%u cmt_bytes=%llu "
-				       "cache_entries_per_slot=%llu cached_mapping_entries=%llu used_mapping_entries=%llu "
-				       "gtd_entries=%llu gtd_dram_bytes=%llu slc_dram_map_bytes=%llu flash_translation_store_bytes=%llu slc_log_entries_pending=%llu "
-				       "lookups=%llu hits=%llu misses=%llu slc_dram_hits=%llu gtd_lookups=%llu qlc_flash_reads=%llu hit_ratio=%.6f "
-				       "metadata_reads=%llu metadata_writes=%llu slc_meta_log_writes=%llu qlc_meta_folds=%llu qlc_meta_writes=%llu "
-				       "metadata_read_time=%.9fs metadata_write_time=%.9fs metadata_total_time=%.9fs "
-				       "avg_metadata_read_ns=%llu avg_metadata_write_ns=%llu evictions=%llu dirty_evictions=%llu\n",
-				       map_cache_scope, map_cache_stats.policy, map_cache_stats.initialized,
-				       map_cache_stats.hotcold, map_cache_stats.qlc_cmt_enabled,
-				       map_cache_stats.cmt_bytes,
-				       map_cache_stats.cache_entries_per_slot,
-				       map_cache_stats.cached_mapping_entries,
-				       map_cache_stats.used_mapping_entries,
-				       map_cache_stats.gtd_entries,
-				       map_cache_stats.gtd_dram_bytes,
-				       map_cache_stats.slc_dram_map_bytes,
-				       map_cache_stats.flash_translation_store_bytes,
-				       map_cache_stats.slc_log_entries_pending,
-				       map_cache_stats.lookups, map_cache_stats.hits,
-				       map_cache_stats.misses,
-				       map_cache_stats.slc_dram_hits,
-				       map_cache_stats.gtd_lookups,
-				       map_cache_stats.qlc_flash_reads, hit_ratio,
-				       map_cache_stats.metadata_reads,
-				       map_cache_stats.metadata_writes,
-				       map_cache_stats.slc_meta_log_writes,
-				       map_cache_stats.qlc_meta_folds,
-				       map_cache_stats.qlc_meta_writes,
-				       metadata_read_sec, metadata_write_sec,
-				       metadata_total_sec, avg_read_ns, avg_write_ns,
-				       map_cache_stats.evictions,
-				       map_cache_stats.dirty_evictions);
-			}
+			if (map_cache_stats_valid)
+				print_map_cache_stats_line(map_cache_scope, &map_cache_stats);
+			if (map_cache_cold_stats_valid)
+				print_map_cache_stats_line("cold_stage_delta", &map_cache_cold_stats);
 				printf("[sqlite_init] row_stats=%s table_stats=%s table_tier=%s table_die=%s "
 			       "table_chain=%s table_chain_die=%s page_tier=%s table_die_transition=%s page_die_transition=%s "
 			       "chain_alloc_events=%s chain_cold_events=%s gc_victim_events=%s map_cache_stats=%s\n",
@@ -4200,7 +4551,9 @@ static void usage(const char *prog)
 			"  --bg-nand-stats-path PATH\n"
 			"  --map-cache-stats-path PATH\n"
 			"  --cold-extra-append-bytes SIZE\n"
-		"  --cold-extra-mode off|serial|concurrent\n"
+		"  --cold-extra-mode off|serial|concurrent|serial-mixed\n"
+			"  --cold-extra-read-ratio N\n"
+			"  --cold-extra-row-reads-per-batch N\n"
 		"  --tag TAG\n", prog);
 }
 
@@ -4243,6 +4596,8 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->map_cache_stats_path = DEFAULT_MAP_CACHE_STATS_PATH;
 	opts->cold_extra_append_bytes = DEFAULT_COLD_EXTRA_APPEND_BYTES;
 	opts->cold_extra_mode = COLD_EXTRA_MODE_OFF;
+	opts->cold_extra_read_ratio = 10.0;
+	opts->cold_extra_row_reads_per_batch = 0;
 	opts->cold_full_read_mode = COLD_FULL_READ_FULL_SCAN;
 	opts->cold_full_read_iters = DEFAULT_COLD_FULL_READ_ITERS;
 	opts->cold_random_chunk_rows = DEFAULT_COLD_RANDOM_CHUNK_ROWS;
@@ -4375,6 +4730,15 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 					break;
 				case 1037:
 					opts->map_cache_stats_path = optarg;
+					break;
+				case 1038:
+					opts->cold_extra_read_ratio = strtod(optarg, NULL);
+					if (opts->cold_extra_read_ratio < 0.0)
+						opts->cold_extra_read_ratio = 0.0;
+					break;
+				case 1039:
+					opts->cold_extra_row_reads_per_batch =
+						(unsigned int)strtoul(optarg, NULL, 10);
 					break;
 				case 'h':
 		default:

@@ -61,7 +61,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_ENABLE_QLC_HOTCOLD 0
 #endif
 #ifndef NVMEV_ENABLE_READ_REPROMOTION
-#define NVMEV_ENABLE_READ_REPROMOTION 0
+#define NVMEV_ENABLE_READ_REPROMOTION 1
 #endif
 #ifndef NVMEV_ENABLE_INTERNAL_DIE_AFFINITY
 #define NVMEV_ENABLE_INTERNAL_DIE_AFFINITY 0
@@ -87,6 +87,9 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define QLC_PROMOTE_RATIO_NUM 1U
 #define QLC_PROMOTE_RATIO_DEN 1U
 #define QLC_REBALANCE_SCAN_LIMIT 4096U
+#define BASELINE_REPROMOTE_SCAN_BLOCKS 512U
+#define BASELINE_REPROMOTE_RATIO_NUM 2U
+#define BASELINE_REPROMOTE_RATIO_DEN 1U
 
 struct nvmev_cmd_debug {
 	bool valid;
@@ -854,6 +857,8 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
 static void qlc_maybe_rebalance_internal(struct conv_ftl *conv_ftl);
+static uint64_t baseline_repromote_hot_threshold(uint64_t avg_reads);
+static void migrate_hot_from_qlc(struct conv_ftl *conv_ftl);
 static void bg_repromotion_worker(struct work_struct *work);
 static void bg_qlc_rebalance_worker(struct work_struct *work);
 
@@ -3391,8 +3396,8 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->qlc_fast_count = 0;
 	conv_ftl->qlc_slow_count = 0;
 	conv_ftl->enable_read_repromotion = !!NVMEV_ENABLE_READ_REPROMOTION;
-	conv_ftl->repromote_period_reads = 100;
-	conv_ftl->repromote_budget_per_run = 32;
+	conv_ftl->repromote_period_reads = 10000;
+	conv_ftl->repromote_budget_per_run = 128;
 	spin_lock_init(&conv_ftl->qlc_zone_lock);
 
 	/* 后台迁移 workqueue 初始化 */
@@ -5620,29 +5625,7 @@ static void bg_repromotion_worker(struct work_struct *work)
 #if !NVMEV_ENABLE_READ_REPROMOTION
 	(void)conv_ftl;
 #elif !NVMEV_ENABLE_DIE_BATCHED_REPROMOTION
-	uint64_t lpn;
-	struct ppa ppa, cur;
-	uint64_t migration_done = 0;
-	uint32_t budget = conv_ftl->repromote_budget_per_run;
-	uint32_t processed = 0;
-
-	while (processed < budget) {
-		spin_lock(&conv_ftl->repromote_queue_lock);
-		if (conv_ftl->repromote_head == conv_ftl->repromote_tail) {
-			spin_unlock(&conv_ftl->repromote_queue_lock);
-			break;
-		}
-		lpn = conv_ftl->repromote_lpns[conv_ftl->repromote_head];
-		ppa = conv_ftl->repromote_ppas[conv_ftl->repromote_head];
-		conv_ftl->repromote_head =
-			(conv_ftl->repromote_head + 1) % REPROMOTE_QUEUE_SIZE;
-		spin_unlock(&conv_ftl->repromote_queue_lock);
-
-		cur = get_maptbl_ent(conv_ftl, lpn);
-		if (cur.ppa == ppa.ppa && !is_slc_block(conv_ftl, cur.g.blk))
-			migrate_page_to_slc(conv_ftl, lpn, &cur, &migration_done);
-		processed++;
-	}
+	migrate_hot_from_qlc(conv_ftl);
 #else
 	uint64_t lpns[REPROMOTE_QUEUE_SIZE];
 	struct ppa ppas[REPROMOTE_QUEUE_SIZE];
@@ -5824,21 +5807,11 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			if (NVMEV_ENABLE_READ_REPROMOTION &&
 			    conv_ftl->enable_read_repromotion &&
 			    !is_slc_block(conv_ftl, cur_ppa.g.blk) && has_avg &&
-			    ht && ht->access_count) {
+			ht && ht->access_count) {
 				uint64_t access_cnt = ht->access_count[local_lpn];
+				uint64_t hot_th = baseline_repromote_hot_threshold(avg_reads);
 
-				if (access_cnt > avg_reads) {
-					uint32_t next_tail;
-
-					spin_lock(&conv_ftl->repromote_queue_lock);
-					next_tail = (conv_ftl->repromote_tail + 1) %
-						    REPROMOTE_QUEUE_SIZE;
-					if (next_tail != conv_ftl->repromote_head) {
-						conv_ftl->repromote_lpns[conv_ftl->repromote_tail] = local_lpn;
-						conv_ftl->repromote_ppas[conv_ftl->repromote_tail] = cur_ppa;
-						conv_ftl->repromote_tail = next_tail;
-					}
-					spin_unlock(&conv_ftl->repromote_queue_lock);
+				if (access_cnt >= hot_th) {
 					conv_ftl->migration_read_path_count++;
 				}
 			}
@@ -6117,46 +6090,129 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	test_phase_note_bg_end(conv_ftl, test_phase_bg_tracked);
 }
 
-/* 扫描 QLC 热数据并迁移回 SLC */
+static uint64_t baseline_repromote_hot_threshold(uint64_t avg_reads)
+{
+	uint64_t th = avg_reads ? avg_reads : 1;
+
+	if (BASELINE_REPROMOTE_RATIO_NUM > 1 &&
+	    th > div64_u64(U64_MAX, BASELINE_REPROMOTE_RATIO_NUM))
+		return U64_MAX;
+	th = div64_u64(th * BASELINE_REPROMOTE_RATIO_NUM +
+		       BASELINE_REPROMOTE_RATIO_DEN - 1,
+		       BASELINE_REPROMOTE_RATIO_DEN);
+	return th ? th : 1;
+}
+
+/* 扫描 QLC 热数据并迁移回 SLC。Baseline 无 chain，只按 page 热度筛选。 */
 static void migrate_hot_from_qlc(struct conv_ftl *conv_ftl)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct heat_tracking *ht = &conv_ftl->heat_track;
-	static uint64_t cursor = 0;
+	struct ssdparams *spp;
+	struct heat_tracking *ht;
+	struct line_pool_stats slc_stats;
+	uint64_t avg_reads = 0;
+	uint64_t hot_th;
 	uint32_t scanned = 0;
 	uint32_t migrated = 0;
-	const uint32_t MAX_SCAN = 1024;
-	const uint32_t MAX_MIGRATE = 4;
-	uint64_t avg_reads = 0;
-	bool has_avg = false;
+	uint32_t budget;
+	uint32_t die_count;
+	uint64_t total_blocks;
+	uint64_t cursor;
 
+	if (!conv_ftl || !conv_ftl->ssd)
+		return;
+
+	spp = &conv_ftl->ssd->sp;
+	ht = &conv_ftl->heat_track;
 	if (!ht || !ht->access_count)
 		return;
-
-	has_avg = calc_global_avg_reads(conv_ftl, &avg_reads);
-	if (!has_avg)
+	if (!calc_global_avg_reads(conv_ftl, &avg_reads))
 		return;
 
-	uint64_t idx = cursor % spp->tt_pgs;
-	uint64_t start = idx;
+	if (conv_ftl->slc_repromote_guard_lines) {
+		collect_slc_stats(conv_ftl, &slc_stats);
+		if (slc_stats.free <= conv_ftl->slc_repromote_guard_lines)
+			return;
+	}
 
-	while (scanned < MAX_SCAN && migrated < MAX_MIGRATE) {
-		struct ppa ppa = get_maptbl_ent(conv_ftl, idx);
+	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	if (!conv_ftl->qlc_blks_per_pl || !spp->pls_per_lun)
+		return;
 
-		if (mapped_ppa(&ppa) && !is_slc_block(conv_ftl, ppa.g.blk)) {
-			uint64_t reads = ht->access_count[idx];
+	total_blocks = (uint64_t)die_count * spp->pls_per_lun * conv_ftl->qlc_blks_per_pl;
+	if (!total_blocks)
+		return;
 
-			if (reads > avg_reads) {
-				migrate_page_to_slc(conv_ftl, idx, &ppa, NULL);
-				migrated++;
-			}
+	budget = conv_ftl->repromote_budget_per_run ? conv_ftl->repromote_budget_per_run : 1;
+	hot_th = baseline_repromote_hot_threshold(avg_reads);
+	cursor = conv_ftl->qlc_promote_cursor % total_blocks;
+
+	while (scanned < BASELINE_REPROMOTE_SCAN_BLOCKS &&
+	       scanned < total_blocks && migrated < budget) {
+		uint64_t logical = (cursor + scanned) % total_blocks;
+		uint64_t rem;
+		uint32_t die;
+		uint32_t pl;
+		uint32_t qlc_blk_idx;
+		uint32_t ch = 0, lun = 0;
+		struct ppa block_ppa = { .ppa = 0 };
+		struct nand_block *blk;
+		uint32_t pg_idx;
+
+		die = (uint32_t)(logical % die_count);
+		rem = div64_u64(logical, die_count);
+		pl = (uint32_t)(rem % spp->pls_per_lun);
+		qlc_blk_idx = (uint32_t)div64_u64(rem, spp->pls_per_lun);
+
+		decode_die(spp, die, &ch, &lun);
+		block_ppa.g.ch = ch;
+		block_ppa.g.lun = lun;
+		block_ppa.g.pl = pl;
+		block_ppa.g.blk = conv_ftl->slc_blks_per_pl + qlc_blk_idx;
+		block_ppa.g.pg = 0;
+
+		blk = get_blk(conv_ftl->ssd, &block_ppa);
+		if (!blk || !blk->npgs) {
+			scanned++;
+			continue;
+		}
+
+		for (pg_idx = 0; pg_idx < blk->npgs && migrated < budget; pg_idx++) {
+			struct ppa ppa = block_ppa;
+			struct nand_page *pg;
+			struct ppa cur;
+			uint64_t lpn;
+			uint64_t reads;
+
+			ppa.g.pg = pg_idx;
+			pg = get_pg(conv_ftl->ssd, &ppa);
+			if (!pg || pg->status != PG_VALID)
+				continue;
+
+			lpn = get_rmap_ent(conv_ftl, &ppa);
+			if (lpn == INVALID_LPN || lpn >= conv_ftl->ssd->sp.tt_pgs)
+				continue;
+
+			reads = ht->access_count[lpn];
+			if (reads < hot_th)
+				continue;
+
+			cur = get_maptbl_ent(conv_ftl, lpn);
+			if (cur.ppa != ppa.ppa || is_slc_block(conv_ftl, cur.g.blk))
+				continue;
+
+			migrate_page_to_slc(conv_ftl, lpn, &cur, NULL);
+			migrated++;
 		}
 
 		scanned++;
-		idx = (idx + 1) % spp->tt_pgs;
-		if (idx == start) break;
 	}
-	cursor = idx;
+
+	conv_ftl->qlc_promote_cursor = (cursor + scanned) % total_blocks;
+	if (migrated) {
+		NVMEV_DEBUG("[REPROMOTE-BASELINE] avg=%llu hot_th=%llu scanned_blocks=%u migrated=%u budget=%u period_reads=%u\n",
+			    avg_reads, hot_th, scanned, migrated, budget,
+			    conv_ftl->repromote_period_reads);
+	}
 }
 
 static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
