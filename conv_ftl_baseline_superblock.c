@@ -4337,6 +4337,7 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	if (old_in_slc) {
 		struct line_pool_stats slc_st;
 		uint32_t actual_die;
+		uint32_t die_index;
 		bool chain_gc_to_qlc = false;
 
 		collect_slc_stats(conv_ftl, &slc_st);
@@ -4354,8 +4355,6 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 				conv_ftl->chain_gc_to_qlc_pages++;
 			return 0;
 		}
-
-		uint32_t die_index;
 
 		die_index = internal_place_die_for_lpn(conv_ftl, lpn, old_ppa,
 						       CHAIN_TIER_SLC, false);

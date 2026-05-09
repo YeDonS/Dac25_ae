@@ -85,15 +85,15 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_SUPERBLOCK_ACTIVE_LIMIT 14U
 
 /* superblock state machine.
- * SB_FREE:   not yet opened for writes (or just-erased)
- * SB_ACTIVE: open for writes; some dies may already be filled (die_full_mask)
- * SB_CLOSED: every die's portion is full; only readable until GC erases it.
- * On erase, transitions back to SB_FREE.
+ * NVMEV_SB_FREE:   not yet opened for writes (or just-erased)
+ * NVMEV_SB_ACTIVE: open for writes; some dies may already be filled (die_full_mask)
+ * NVMEV_SB_CLOSED: every die's portion is full; only readable until GC erases it.
+ * On erase, transitions back to NVMEV_SB_FREE.
  */
 enum slc_sb_state_e {
-	SB_FREE = 0,
-	SB_ACTIVE = 1,
-	SB_CLOSED = 2,
+	NVMEV_SB_FREE = 0,
+	NVMEV_SB_ACTIVE = 1,
+	NVMEV_SB_CLOSED = 2,
 };
 
 /* chain-triggered QLC->SLC repromotion. Per-chain host read counter; when it
@@ -3032,13 +3032,13 @@ static void superblock_collect_health(struct conv_ftl *conv_ftl,
 
 		if (conv_ftl->slc_sb_state && blk_id < spp->blks_per_pl) {
 			switch (conv_ftl->slc_sb_state[blk_id]) {
-			case SB_FREE:
+			case NVMEV_SB_FREE:
 				snap->sb_state_free++;
 				break;
-			case SB_ACTIVE:
+			case NVMEV_SB_ACTIVE:
 				snap->sb_state_active++;
 				break;
-			case SB_CLOSED:
+			case NVMEV_SB_CLOSED:
 				snap->sb_state_closed++;
 				break;
 			default:
@@ -3504,7 +3504,7 @@ static bool slc_sb_collect_summary(struct conv_ftl *conv_ftl, uint32_t blk_id,
 	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
 
 	if (conv_ftl->slc_sb_state && blk_id < spp->blks_per_pl &&
-	    conv_ftl->slc_sb_state[blk_id] == SB_ACTIVE)
+	    conv_ftl->slc_sb_state[blk_id] == NVMEV_SB_ACTIVE)
 		sum->active = true;
 
 	for (die = 0; die < die_count; die++) {
@@ -3857,7 +3857,7 @@ static inline void slc_wp_close_line_locked(struct conv_ftl *conv_ftl, struct li
 			conv_ftl->slc_sb_die_full_mask[closing_blk] &=
 				~(uint16_t)(1u << die);
 			if (conv_ftl->slc_sb_state &&
-			    conv_ftl->slc_sb_state[closing_blk] == SB_CLOSED &&
+			    conv_ftl->slc_sb_state[closing_blk] == NVMEV_SB_CLOSED &&
 			    conv_ftl->slc_sb_die_full_mask[closing_blk] == 0)
 				slc_sb_note_freed_locked(conv_ftl, closing_blk);
 		}
@@ -3928,7 +3928,7 @@ static int slc_find_free_sb_blk_locked(struct conv_ftl *conv_ftl)
 		 * lazily reset state to ACTIVE. */
 		if (conv_ftl->slc_sb_state &&
 		    blk < conv_ftl->ssd->sp.blks_per_pl &&
-		    conv_ftl->slc_sb_state[blk] == SB_ACTIVE)
+		    conv_ftl->slc_sb_state[blk] == NVMEV_SB_ACTIVE)
 			continue;
 
 		for (die = 1; die < die_count && all_free; die++) {
@@ -4000,8 +4000,8 @@ static bool slc_open_chain_active_sb_locked(struct conv_ftl *conv_ftl,
 	if (conv_ftl->slc_sb_state && blk < spp->blks_per_pl) {
 		/* If state was stale CLOSED (all dies got erased without explicit
 		 * transition), reset cleanly before going ACTIVE. */
-		if (conv_ftl->slc_sb_state[blk] != SB_ACTIVE) {
-			conv_ftl->slc_sb_state[blk] = SB_ACTIVE;
+		if (conv_ftl->slc_sb_state[blk] != NVMEV_SB_ACTIVE) {
+			conv_ftl->slc_sb_state[blk] = NVMEV_SB_ACTIVE;
 			if (conv_ftl->slc_sb_owner_chain)
 				conv_ftl->slc_sb_owner_chain[blk] = chain_id;
 			if (conv_ftl->slc_sb_die_full_mask)
@@ -4058,7 +4058,7 @@ static uint32_t slc_pick_share_target_locked(struct conv_ftl *conv_ftl,
 		uint32_t die;
 		struct write_pointer *wps;
 
-		if (conv_ftl->slc_sb_state[blk] != SB_ACTIVE)
+		if (conv_ftl->slc_sb_state[blk] != NVMEV_SB_ACTIVE)
 			continue;
 		owner = conv_ftl->slc_sb_owner_chain[blk];
 		if (owner == self_chain_id)
@@ -4083,7 +4083,7 @@ static uint32_t slc_pick_share_target_locked(struct conv_ftl *conv_ftl,
 }
 
 /* Mark SB blk's portion on `die` as full. When all dies are full, transition
- * SB_ACTIVE -> SB_CLOSED, decrement active_sb_count, and clear any chain's
+ * NVMEV_SB_ACTIVE -> NVMEV_SB_CLOSED, decrement active_sb_count, and clear any chain's
  * chain_cur_active_sb that points to this SB. Caller holds slc_lock.
  */
 static void slc_sb_note_die_full_locked(struct conv_ftl *conv_ftl,
@@ -4113,8 +4113,8 @@ static void slc_sb_note_die_full_locked(struct conv_ftl *conv_ftl,
 		return;
 
 	/* SB fully written across all dies: ACTIVE -> CLOSED */
-	if (conv_ftl->slc_sb_state[blk] == SB_ACTIVE) {
-		conv_ftl->slc_sb_state[blk] = SB_CLOSED;
+	if (conv_ftl->slc_sb_state[blk] == NVMEV_SB_ACTIVE) {
+		conv_ftl->slc_sb_state[blk] = NVMEV_SB_CLOSED;
 		if (conv_ftl->active_sb_count)
 			conv_ftl->active_sb_count--;
 		/* Clear chain_cur_active_sb for any chain whose pointer was this SB
@@ -4140,9 +4140,9 @@ static void slc_sb_note_freed_locked(struct conv_ftl *conv_ftl, uint32_t blk)
 	spp = &conv_ftl->ssd->sp;
 	if (blk >= spp->blks_per_pl)
 		return;
-	if (conv_ftl->slc_sb_state[blk] == SB_ACTIVE && conv_ftl->active_sb_count)
+	if (conv_ftl->slc_sb_state[blk] == NVMEV_SB_ACTIVE && conv_ftl->active_sb_count)
 		conv_ftl->active_sb_count--;
-	conv_ftl->slc_sb_state[blk] = SB_FREE;
+	conv_ftl->slc_sb_state[blk] = NVMEV_SB_FREE;
 	if (conv_ftl->slc_sb_owner_chain)
 		conv_ftl->slc_sb_owner_chain[blk] = INVALID_CHAIN_ID;
 	if (conv_ftl->slc_sb_die_full_mask)
@@ -4243,7 +4243,7 @@ static bool chain_ensure_slc_superblock_slot_locked(struct conv_ftl *conv_ftl,
 		cur_blk = conv_ftl->chain_cur_active_sb[chain_id];
 		if (cur_blk != U32_MAX && conv_ftl->slc_sb_state &&
 		    cur_blk < conv_ftl->ssd->sp.blks_per_pl &&
-		    conv_ftl->slc_sb_state[cur_blk] == SB_ACTIVE)
+		    conv_ftl->slc_sb_state[cur_blk] == NVMEV_SB_ACTIVE)
 			return true;
 		/* stale pointer (SB closed under us) — clear and reselect */
 		if (cur_blk != U32_MAX)
@@ -4834,32 +4834,32 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 			vfree(conv_ftl->chain_qlc_rr_pages);
 		if (conv_ftl->chain_slc_page_count)
 			vfree(conv_ftl->chain_slc_page_count);
-			if (conv_ftl->chain_last_slc_touch)
-				vfree(conv_ftl->chain_last_slc_touch);
-			if (conv_ftl->chain_host_slc_wps)
-				vfree(conv_ftl->chain_host_slc_wps);
-			if (conv_ftl->blk_owner_chain)
-				vfree(conv_ftl->blk_owner_chain);
-			if (conv_ftl->blk_owner_pages)
-				vfree(conv_ftl->blk_owner_pages);
-			if (conv_ftl->blk_valid_pages)
-				vfree(conv_ftl->blk_valid_pages);
-			if (conv_ftl->blk_mixed_pages)
-				vfree(conv_ftl->blk_mixed_pages);
-			if (conv_ftl->blk_active_wp_refs)
-				vfree(conv_ftl->blk_active_wp_refs);
-			if (conv_ftl->slc_sb_state)
-				vfree(conv_ftl->slc_sb_state);
-			if (conv_ftl->slc_sb_owner_chain)
-				vfree(conv_ftl->slc_sb_owner_chain);
-			if (conv_ftl->slc_sb_die_full_mask)
-				vfree(conv_ftl->slc_sb_die_full_mask);
-			if (conv_ftl->chain_cur_active_sb)
-				vfree(conv_ftl->chain_cur_active_sb);
-			if (conv_ftl->chain_host_read_count)
-				vfree(conv_ftl->chain_host_read_count);
-			if (conv_ftl->chain_repromote_cursor)
-				vfree(conv_ftl->chain_repromote_cursor);
+		if (conv_ftl->chain_last_slc_touch)
+			vfree(conv_ftl->chain_last_slc_touch);
+		if (conv_ftl->chain_host_slc_wps)
+			vfree(conv_ftl->chain_host_slc_wps);
+		if (conv_ftl->blk_owner_chain)
+			vfree(conv_ftl->blk_owner_chain);
+		if (conv_ftl->blk_owner_pages)
+			vfree(conv_ftl->blk_owner_pages);
+		if (conv_ftl->blk_valid_pages)
+			vfree(conv_ftl->blk_valid_pages);
+		if (conv_ftl->blk_mixed_pages)
+			vfree(conv_ftl->blk_mixed_pages);
+		if (conv_ftl->blk_active_wp_refs)
+			vfree(conv_ftl->blk_active_wp_refs);
+		if (conv_ftl->slc_sb_state)
+			vfree(conv_ftl->slc_sb_state);
+		if (conv_ftl->slc_sb_owner_chain)
+			vfree(conv_ftl->slc_sb_owner_chain);
+		if (conv_ftl->slc_sb_die_full_mask)
+			vfree(conv_ftl->slc_sb_die_full_mask);
+		if (conv_ftl->chain_cur_active_sb)
+			vfree(conv_ftl->chain_cur_active_sb);
+		if (conv_ftl->chain_host_read_count)
+			vfree(conv_ftl->chain_host_read_count);
+		if (conv_ftl->chain_repromote_cursor)
+			vfree(conv_ftl->chain_repromote_cursor);
 		conv_ftl->lpn_initial_die = NULL;
 		conv_ftl->lpn_die_changed = NULL;
 		conv_ftl->lpn_die_change_reason = NULL;
@@ -6447,6 +6447,7 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	if (old_in_slc) {
 		struct line_pool_stats slc_st;
 		uint32_t actual_die;
+		uint32_t die_index;
 		bool chain_gc_to_qlc = false;
 
 		collect_slc_stats(conv_ftl, &slc_st);
@@ -6464,8 +6465,6 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 				conv_ftl->chain_gc_to_qlc_pages++;
 			return 0;
 		}
-
-		uint32_t die_index;
 
 		die_index = internal_place_die_for_lpn(conv_ftl, lpn, old_ppa,
 						       CHAIN_TIER_SLC, false);
@@ -6655,7 +6654,7 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 			uint32_t die_idx = encode_die(spp, ppa);
 			conv_ftl->slc_sb_die_full_mask[blk_id] &= ~(uint16_t)(1u << die_idx);
 			if (conv_ftl->slc_sb_state &&
-			    conv_ftl->slc_sb_state[blk_id] == SB_CLOSED &&
+			    conv_ftl->slc_sb_state[blk_id] == NVMEV_SB_CLOSED &&
 			    conv_ftl->slc_sb_die_full_mask[blk_id] == 0)
 				slc_sb_note_freed_locked(conv_ftl, blk_id);
 		}
@@ -6692,7 +6691,7 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
  * allocator sees a fully free SB.
  *
  * Bonus: when the SB is fully erased, slc_sb_note_freed_locked transitions
- * the SB state machine SB_CLOSED -> SB_FREE. The hook is in mark_block_free.
+ * the SB state machine NVMEV_SB_CLOSED -> NVMEV_SB_FREE. The hook is in mark_block_free.
  */
 struct sb_gc_victim_no1 {
 	uint32_t blk_id;
@@ -8894,7 +8893,7 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 		cur_blk = conv_ftl->chain_cur_active_sb[chain_id];
 		if (cur_blk != U32_MAX &&
 		    cur_blk < spp->blks_per_pl &&
-		    conv_ftl->slc_sb_state[cur_blk] == SB_ACTIVE)
+		    conv_ftl->slc_sb_state[cur_blk] == NVMEV_SB_ACTIVE)
 			use_chain_alloc = true;
 		else if (conv_ftl->active_sb_count < NVMEV_SUPERBLOCK_ACTIVE_LIMIT)
 			use_chain_alloc = true;
