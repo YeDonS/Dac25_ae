@@ -32,6 +32,7 @@ SQLITE_DIE_AFFINITY_STATS_PATH=${SQLITE_DIE_AFFINITY_STATS_PATH:-/sys/kernel/deb
 SQLITE_LPN_DIE_CHANGE_STATS_PATH=${SQLITE_LPN_DIE_CHANGE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/lpn_die_change_stats}
 SQLITE_TEST_PHASE_PATH=${SQLITE_TEST_PHASE_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase}
 SQLITE_TEST_PHASE_STATS_PATH=${SQLITE_TEST_PHASE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase_stats}
+SQLITE_SUPERBLOCK_STATS_PATH=${SQLITE_SUPERBLOCK_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/superblock_stats}
 SQLITE_DIE_STATS_PATH=${SQLITE_DIE_STATS_PATH:-/sys/module/nvmev/parameters/die_stats}
 SQLITE_BG_NAND_STATS_PATH=${SQLITE_BG_NAND_STATS_PATH:-/sys/module/nvmev/parameters/bg_nand_stats}
 SQLITE_GC_NAND_TIMING=${SQLITE_GC_NAND_TIMING:-1}
@@ -339,6 +340,15 @@ run_one_test() {
         cp "$SQLITE_TEST_PHASE_STATS_PATH" \
            "${RESULT_FOLDER%/}/sqlite_test_phase_stats_${tag}.txt" 2>/dev/null || true
         cp "${RESULT_FOLDER%/}/sqlite_test_phase_stats_${tag}.txt" "${out_dir}/" 2>/dev/null || true
+    fi
+    if [[ -r "$SQLITE_SUPERBLOCK_STATS_PATH" ]]; then
+        {
+            echo "[superblock_stats]"
+            cat "$SQLITE_SUPERBLOCK_STATS_PATH"
+        } >>"$init_txt" 2>/dev/null || true
+        cp "$SQLITE_SUPERBLOCK_STATS_PATH" \
+           "${RESULT_FOLDER%/}/sqlite_superblock_stats_${tag}.txt" 2>/dev/null || true
+        cp "${RESULT_FOLDER%/}/sqlite_superblock_stats_${tag}.txt" "${out_dir}/" 2>/dev/null || true
     fi
     if [[ -r "$SQLITE_DIE_STATS_PATH" ]]; then
         {

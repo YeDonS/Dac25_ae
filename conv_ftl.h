@@ -144,10 +144,12 @@ struct nvmev_gc_victim_event {
 #define NVMEV_MAP_TPAGE_BYTES 4096U
 #define NVMEV_MAP_ENTRIES_PER_TPAGE (NVMEV_MAP_TPAGE_BYTES / NVMEV_MAP_ENTRY_BYTES)
 #define NVMEV_MAP_CMT_BYTES (8ULL << 20)
-#define NVMEV_MAP_CACHE_ENTRIES_PER_SLOT 1U
-#define NVMEV_MAP_CMT_SLOTS (NVMEV_MAP_CMT_BYTES / NVMEV_MAP_ENTRY_BYTES)
+#define NVMEV_MAP_CACHE_ENTRIES_PER_SLOT NVMEV_MAP_ENTRIES_PER_TPAGE
+#define NVMEV_MAP_CMT_SLOTS (NVMEV_MAP_CMT_BYTES / \
+	(NVMEV_MAP_ENTRY_BYTES * NVMEV_MAP_CACHE_ENTRIES_PER_SLOT))
 #define NVMEV_MAP_EVICT_SCAN 64U
 #define NVMEV_MAP_HEAT_DECAY_INTERVAL 100000ULL
+#define NVMEV_MAP_RESIDENCY_LOG_ENTRIES 4096U
 #define NVMEV_MAP_META_TIER_SLC 0U
 #define NVMEV_MAP_META_TIER_QLC 1U
 
@@ -167,6 +169,13 @@ struct nvmev_map_cache_entry {
 	struct list_head lru_node;
 };
 
+struct nvmev_map_residency_event {
+	uint64_t seq;
+	uint64_t hits;
+	uint32_t dram_bp;
+	uint32_t flash_bp;
+};
+
 struct nvmev_map_cache {
 	spinlock_t lock;
 	struct nvmev_map_cache_entry *entries;
@@ -174,15 +183,19 @@ struct nvmev_map_cache {
 	uint32_t *slot_index;
 	struct nvmev_map_gtd_entry *gtd;
 	struct ppa *flash_entries;
+	struct nvmev_map_residency_event *residency_events;
 	struct list_head lru;
 	uint32_t nr_entries;
 	uint32_t used_entries;
 	uint32_t free_cursor;
 	uint32_t gtd_entries;
+	uint32_t residency_event_head;
+	uint32_t residency_event_count;
 	uint32_t slc_log_entries_pending;
 	uint64_t cmt_budget_bytes;
 	uint64_t meta_alloc_seq;
 	uint64_t access_seq;
+	uint64_t residency_event_seq;
 	bool initialized;
 	bool hotcold;
 	atomic64_t lookups;
@@ -331,6 +344,20 @@ struct conv_ftl {
 		uint16_t *blk_valid_pages;          /* valid pages currently tracked in block */
 		uint16_t *blk_mixed_pages;          /* pages not belonging to dominant chain */
 		uint16_t *blk_active_wp_refs;       /* open host chain-private SLC writers per block */
+		/* superblock-level state machine (SLC only).
+		 * Indexed by blk_id (0..slc_blks_per_pl-1). A superblock spans the
+		 * SAME blk_id across all dies. Single state per blk_id is sufficient
+		 * because all dies of a chain SB are reserved together. */
+		uint8_t  *slc_sb_state;             /* SB_FREE / SB_ACTIVE / SB_CLOSED */
+		uint32_t *slc_sb_owner_chain;       /* first chain to write into this SB (parasitic writers don't change owner) */
+		uint16_t *slc_sb_die_full_mask;     /* bit i: die i has filled its portion of this SB */
+		uint32_t *chain_cur_active_sb;      /* chain_id -> current ACTIVE SB blk_id (U32_MAX if none) */
+		uint32_t  active_sb_count;          /* number of SBs currently in SB_ACTIVE state */
+		/* chain-triggered repromotion: per-chain host read counter; when it
+		 * crosses the threshold the bg worker scans this chain's QLC pages
+		 * for hot ones and rewrites them back to SLC in a batch. */
+		uint64_t *chain_host_read_count;
+		uint64_t *chain_repromote_cursor;   /* incremental scan cursor (LPN) per chain */
 		uint64_t lpn_initial_die_tracked;   /* LPNs that have ever been assigned an initial die */
 	uint64_t lpn_current_die_changed;   /* currently mapped LPNs whose die != initial die */
 	uint64_t lpn_changed_host_append;
@@ -345,6 +372,21 @@ struct conv_ftl {
 	uint64_t chain_block_migration_pages;
 	uint64_t chain_block_migration_skip_budget;
 	uint64_t chain_gc_to_qlc_pages;
+	uint64_t slc_sb_migration_attempts;
+	uint64_t slc_sb_migration_pages;
+	uint64_t slc_sb_gc_count;
+	uint64_t slc_sb_gc_valid_pages;
+	uint64_t slc_sb_gc_invalid_pages;
+	uint64_t slc_sb_gc_erase_ops;
+	uint64_t slc_sb_gc_erase_time_ns;
+	uint64_t slc_sb_gc_tier_empty;
+	uint64_t slc_sb_gc_tier_pure_cold;
+	uint64_t slc_sb_gc_tier_mixed;
+	uint64_t slc_sb_gc_tier_fallback;
+	uint64_t repromote_chain_alloc_pages;
+	uint64_t repromote_gc_pool_pages;
+	uint64_t repromote_skip_active_cap;
+	uint64_t chain_slc_die_reroute_count;
 	uint64_t chain_alloc_no_prev;
 	uint64_t chain_alloc_prev_chain_invalid;
 	uint64_t chain_alloc_capacity_fail;
@@ -388,9 +430,11 @@ struct conv_ftl {
 	struct dentry *debug_test_phase_stats; /* debugfs entry for test phase counters */
 	struct dentry *debug_read_repromotion; /* debugfs entry for read repromotion toggle */
 	struct dentry *debug_map_cache_stats; /* debugfs entry for CMT hit/miss counters */
+	struct dentry *debug_map_residency_csv; /* debugfs CSV entry for mapping residency snapshots */
 	struct dentry *debug_chain_alloc_events; /* debugfs entry for chain allocation events */
 	struct dentry *debug_chain_cold_events; /* debugfs entry for cold migration picks */
 	struct dentry *debug_gc_victim_events; /* debugfs entry for gc victim picks */
+	struct dentry *debug_superblock_stats; /* debugfs entry for superblock health/cost counters */
 	
 	/* 初始化状态标记 */
 	bool maptbl_initialized;     /* 映射表是否初始化成功 */
