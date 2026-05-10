@@ -800,7 +800,7 @@ static void note_chain_alloc_event(struct conv_ftl *conv_ftl, uint32_t chain_id,
 	spin_unlock_irqrestore(&conv_ftl->event_log_lock, flags);
 }
 
-static void note_chain_cold_event(struct conv_ftl *conv_ftl, uint32_t chain_id,
+static __maybe_unused void note_chain_cold_event(struct conv_ftl *conv_ftl, uint32_t chain_id,
 				  const struct ppa *ppa,
 				  const struct chain_block_heat *heat,
 				  uint32_t pages_moved, uint8_t method)
@@ -1435,7 +1435,8 @@ struct chain_heat_summary {
 	uint32_t eligible_blocks;
 };
 
-static bool chain_measure_block_heat(struct conv_ftl *conv_ftl, struct ppa *seed_ppa,
+static __maybe_unused bool chain_measure_block_heat(struct conv_ftl *conv_ftl,
+				     struct ppa *seed_ppa,
 				     uint32_t chain_id, uint64_t dyn_thresh,
 				     uint32_t min_pages,
 				     struct chain_block_heat *heat_out)
@@ -1494,7 +1495,7 @@ static bool chain_measure_block_heat(struct conv_ftl *conv_ftl, struct ppa *seed
 	return true;
 }
 
-static inline bool chain_block_heat_is_colder(const struct ppa *cand_ppa,
+static inline bool __maybe_unused chain_block_heat_is_colder(const struct ppa *cand_ppa,
 					      const struct chain_block_heat *cand,
 					      const struct ppa *best_ppa,
 					      const struct chain_block_heat *best)
@@ -1520,7 +1521,7 @@ static inline bool chain_block_heat_is_colder(const struct ppa *cand_ppa,
 	return cand_ppa->g.blk < best_ppa->g.blk;
 }
 
-static inline bool chain_summary_is_colder(const struct chain_heat_summary *cand,
+static inline bool __maybe_unused chain_summary_is_colder(const struct chain_heat_summary *cand,
 					   const struct chain_heat_summary *best)
 {
 	if (!cand || !cand->heat_pages || !cand->eligible_blocks)
@@ -1536,7 +1537,7 @@ static inline bool chain_summary_is_colder(const struct chain_heat_summary *cand
 	return cand->eligible_blocks > best->eligible_blocks;
 }
 
-static bool chain_scan_cold_blocks(struct conv_ftl *conv_ftl, uint32_t chain_id,
+static __maybe_unused bool chain_scan_cold_blocks(struct conv_ftl *conv_ftl, uint32_t chain_id,
 				   int32_t target_die, uint64_t dyn_thresh,
 				   struct chain_heat_summary *summary_out,
 				   struct ppa *best_ppa_out,
@@ -1629,7 +1630,8 @@ static bool chain_scan_cold_blocks(struct conv_ftl *conv_ftl, uint32_t chain_id,
 static uint32_t migrate_some_cold_from_slc_chain(struct conv_ftl *conv_ftl, uint32_t max_pages,
 						 int32_t target_die, uint64_t dyn_thresh,
 						 uint32_t *sampled_out,
-						 uint32_t *blocks_out)
+						 uint32_t *blocks_out,
+						 uint32_t *mixed_migrated_out)
 {
 #if !NVMEV_ENABLE_CHAIN_AGGREGATION
 	(void)conv_ftl;
@@ -1638,109 +1640,57 @@ static uint32_t migrate_some_cold_from_slc_chain(struct conv_ftl *conv_ftl, uint
 	(void)dyn_thresh;
 	(void)sampled_out;
 	(void)blocks_out;
+	(void)mixed_migrated_out;
 	return 0;
 #else
-	uint32_t min_batch;
-	uint32_t total_sampled, total_blocks;
+	uint32_t pure_sampled = 0, pure_blocks = 0;
+	uint32_t mixed_sampled = 0, mixed_blocks = 0;
+	uint32_t pure_migrated = 0;
+	uint32_t mixed_migrated = 0;
 	uint32_t migrated = 0;
 
 	if (sampled_out)
 		*sampled_out = 0;
 	if (blocks_out)
 		*blocks_out = 0;
+	if (mixed_migrated_out)
+		*mixed_migrated_out = 0;
 	if (!conv_ftl || !conv_ftl->chain_slc_page_count ||
 	    !conv_ftl->blk_owner_chain || max_pages == 0)
 		return 0;
 
-	min_batch = min_t(uint32_t, max_pages, CHAIN_COLD_MIN_BATCH_PAGES);
-	if (min_batch == 0)
-		min_batch = 1;
-	total_sampled = 0;
-	total_blocks = 0;
-	migrated = migrate_some_cold_from_slc_superblocks(conv_ftl, max_pages,
-							  dyn_thresh,
-							  &total_sampled,
-							  &total_blocks);
-
-	while (migrated < max_pages) {
-		struct ppa best_ppa = { .ppa = 0 };
-		struct chain_block_heat best_heat = { 0 };
-		struct chain_heat_summary best_summary = { 0 };
-		uint32_t best_chain = INVALID_CHAIN_ID;
-		uint32_t chain_id;
-		uint32_t chain_moved = 0;
-		uint8_t cold_method = 0;
-
-		for (chain_id = 0; chain_id < conv_ftl->next_chain_id; chain_id++) {
-			uint32_t resident_pages;
-			uint32_t blocks_checked = 0;
-			struct chain_heat_summary summary;
-			struct chain_block_heat heat;
-			struct ppa seed_ppa;
-
-			if (!chain_id_valid(conv_ftl, chain_id))
-				continue;
-			resident_pages = chain_slc_page_count_get(conv_ftl, chain_id);
-			if (resident_pages < min_batch)
-				continue;
-			if (!chain_scan_cold_blocks(conv_ftl, chain_id, target_die, dyn_thresh,
-						    &summary, &seed_ppa, &heat,
-						    &blocks_checked)) {
-				total_blocks += blocks_checked;
-				continue;
-			}
-
-			total_blocks += blocks_checked;
-			total_sampled += summary.heat_pages;
-			if (best_chain == INVALID_CHAIN_ID ||
-			    chain_summary_is_colder(&summary, &best_summary) ||
-			    (!chain_summary_is_colder(&best_summary, &summary) &&
-			     chain_block_heat_is_colder(&seed_ppa, &heat,
-							&best_ppa, &best_heat))) {
-				best_chain = chain_id;
-				best_summary = summary;
-				best_ppa = seed_ppa;
-				best_heat = heat;
-			}
-		}
-
-		if (best_chain == INVALID_CHAIN_ID)
-			break;
-
-		best_ppa.g.pg = best_heat.seed_pg;
-		if (block_meta_high_purity(conv_ftl, &best_ppa, NULL) &&
-		    best_heat.cold_pages * 100 >=
-			    best_heat.heat_pages * CHAIN_COLD_BLOCK_COLD_PCT)
-			chain_moved = migrate_chain_block_from_slc(conv_ftl, &best_ppa,
-								 max_pages - migrated,
-								 dyn_thresh);
-		if (chain_moved > 0)
-			cold_method = NVMEV_CHAIN_COLD_METHOD_BLOCK;
-		if (chain_moved == 0 &&
-		    best_heat.cold_pages * 100 >=
-			    best_heat.heat_pages * CHAIN_COLD_CHUNK_COLD_PCT)
-			chain_moved = migrate_chain_chunk_from_slc(conv_ftl, &best_ppa,
-								 max_pages - migrated,
-								 dyn_thresh);
-		if (chain_moved > 0 && cold_method == 0)
-			cold_method = NVMEV_CHAIN_COLD_METHOD_CHUNK;
-		if (chain_moved == 0)
-			break;
-
-		note_chain_cold_event(conv_ftl, best_chain, &best_ppa, &best_heat,
-				      chain_moved, cold_method);
-		migrated += chain_moved;
-	}
+	(void)target_die;
+	/* Physical-SB migration layers:
+	 *   1) pure cold SBs: strict owner/purity/coldness gate.
+	 *   2) mixed SBs: choose the mixed SB with lowest average read count.
+	 *
+	 * The old chain-first path did: for each chain -> scan every block, so
+	 * the same physical block was counted hundreds of times when many chains
+	 * existed. These layers scan physical SBs directly and never multiply by
+	 * chain count. */
+	pure_migrated = migrate_pure_cold_superblocks_from_slc(conv_ftl, max_pages,
+							       dyn_thresh,
+							       &pure_sampled,
+							       &pure_blocks);
+	if (pure_migrated < max_pages)
+		mixed_migrated =
+			migrate_coldest_mixed_superblock_from_slc(conv_ftl,
+								  max_pages - pure_migrated,
+								  &mixed_sampled,
+								  &mixed_blocks);
+	migrated = pure_migrated + mixed_migrated;
 
 	if (sampled_out)
-		*sampled_out = total_sampled;
+		*sampled_out = pure_sampled + mixed_sampled;
 	if (blocks_out)
-		*blocks_out = total_blocks;
+		*blocks_out = pure_blocks + mixed_blocks;
+	if (mixed_migrated_out)
+		*mixed_migrated_out = mixed_migrated;
 	return migrated;
 #endif
 }
 
-static uint32_t migrate_some_cold_from_slc_cursor(struct conv_ftl *conv_ftl, uint32_t max_pages,
+static __maybe_unused uint32_t migrate_some_cold_from_slc_cursor(struct conv_ftl *conv_ftl, uint32_t max_pages,
 						  int32_t target_die,
 						  uint32_t *scanned_out)
 {
@@ -1862,9 +1812,8 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 					   int32_t target_die)
 {
 	uint32_t migrated;
-	uint32_t chain_sampled, chain_blocks;
-	uint32_t chain_migrated, cursor_migrated;
-	uint32_t cursor_scanned;
+	uint32_t sb_sampled, sb_scanned;
+	uint32_t sb_migrated, sb_mixed_migrated;
 	uint64_t dyn_thresh;
 
 	NVMEV_DEBUG("[MIGRATION_DEBUG] migrate_some_cold_from_slc called: max_pages=%u target_die=%d\n",
@@ -1877,28 +1826,17 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 	if (dyn_thresh == 0)
 		dyn_thresh = 1;
 
-	chain_sampled = 0;
-	chain_blocks = 0;
-	cursor_scanned = 0;
-	/* Tier 1: per-chain pure SB integral migration. Picks chains with cold
-	 * high-purity SBs and moves the whole block (or chunk) to QLC. */
-	chain_migrated =
+	sb_sampled = 0;
+	sb_scanned = 0;
+	/* Tier 1: physical-SB scan. Each SLC superblock (same blk_id across
+	 * dies) is summarized once. Pure cold SBs move first; if budget remains,
+	 * the coldest mixed SB by avg read count is migrated next. */
+	sb_mixed_migrated = 0;
+	sb_migrated =
 		migrate_some_cold_from_slc_chain(conv_ftl, max_pages, target_die, dyn_thresh,
-						 &chain_sampled, &chain_blocks);
-	cursor_migrated = 0;
-	/* Tier 2: page-level cursor scan over SLC resident LPNs. This catches
-	 * cold pages that live in MIXED SBs where tier 1 can't migrate the
-	 * block as a unit. Always invoked when tier 1 didn't fill the budget,
-	 * not just when tier 1 returned 0 — otherwise we'd leave SLC starving
-	 * for free space when tier 1 finds 1 small pure SB but the bulk of cold
-	 * data lives in mixed SBs. */
-	if (chain_migrated < max_pages)
-		cursor_migrated =
-			migrate_some_cold_from_slc_cursor(conv_ftl,
-							  max_pages - chain_migrated,
-							  target_die,
-							  &cursor_scanned);
-	migrated = chain_migrated + cursor_migrated;
+						 &sb_sampled, &sb_scanned,
+						 &sb_mixed_migrated);
+	migrated = sb_migrated;
 
 	NVMEV_DEBUG("[MIGRATION_DEBUG] Migration attempt complete: migrated=%u\n", migrated);
 	if (migrated > 0)
@@ -1907,33 +1845,30 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 	{
 		static uint64_t mig_last_ns = 0;
 		static uint32_t mig_total_calls = 0;
-		static uint32_t mig_total_chain_blocks = 0;
-		static uint32_t mig_total_chain_sampled = 0;
-		static uint32_t mig_total_chain_migrated = 0;
-		static uint32_t mig_total_cursor_scanned = 0;
-		static uint32_t mig_total_cursor_migrated = 0;
+		static uint32_t mig_total_sb_scanned = 0;
+		static uint32_t mig_total_sb_sampled = 0;
+		static uint32_t mig_total_sb_migrated = 0;
+		static uint32_t mig_total_sb_mixed_migrated = 0;
 		uint64_t now_ns = ktime_get_ns();
 
 		mig_total_calls++;
-		mig_total_chain_blocks += chain_blocks;
-		mig_total_chain_sampled += chain_sampled;
-		mig_total_chain_migrated += chain_migrated;
-		mig_total_cursor_scanned += cursor_scanned;
-		mig_total_cursor_migrated += cursor_migrated;
+		mig_total_sb_scanned += sb_scanned;
+		mig_total_sb_sampled += sb_sampled;
+		mig_total_sb_migrated += sb_migrated;
+		mig_total_sb_mixed_migrated += sb_mixed_migrated;
 
 		if (mig_last_ns == 0)
 			mig_last_ns = now_ns;
 		if (now_ns - mig_last_ns >= 5000000000ULL) {
-			NVMEV_ERROR("[MIG-MONITOR] SLC->QLC cold migration: calls=%u chain_blocks=%u chain_sampled=%u chain_migrated=%u cursor_scanned=%u cursor_migrated=%u (thresh=%llu)\n",
-				    mig_total_calls, mig_total_chain_blocks, mig_total_chain_sampled,
-				    mig_total_chain_migrated, mig_total_cursor_scanned,
-				    mig_total_cursor_migrated, dyn_thresh);
+			NVMEV_ERROR("[MIG-MONITOR] SLC->QLC cold migration: calls=%u sb_scanned=%u sb_sampled=%u sb_migrated=%u sb_mixed_migrated=%u (thresh=%llu)\n",
+				    mig_total_calls, mig_total_sb_scanned, mig_total_sb_sampled,
+				    mig_total_sb_migrated, mig_total_sb_mixed_migrated,
+				    dyn_thresh);
 			mig_total_calls = 0;
-			mig_total_chain_blocks = 0;
-			mig_total_chain_sampled = 0;
-			mig_total_chain_migrated = 0;
-			mig_total_cursor_scanned = 0;
-			mig_total_cursor_migrated = 0;
+			mig_total_sb_scanned = 0;
+			mig_total_sb_sampled = 0;
+			mig_total_sb_migrated = 0;
+			mig_total_sb_mixed_migrated = 0;
 			mig_last_ns = now_ns;
 		}
 	}
@@ -3736,7 +3671,89 @@ static uint32_t migrate_chain_superblock_from_slc(struct conv_ftl *conv_ftl,
 	return moved;
 }
 
-static uint32_t migrate_some_cold_from_slc_superblocks(struct conv_ftl *conv_ftl,
+static uint32_t migrate_superblock_valid_pages_from_slc(struct conv_ftl *conv_ftl,
+							uint32_t blk_id,
+							uint32_t budget)
+{
+	struct ssdparams *spp;
+	uint32_t die_count;
+	uint32_t die;
+	uint32_t moved = 0;
+
+	if (!conv_ftl || !conv_ftl->ssd || !budget)
+		return 0;
+	spp = &conv_ftl->ssd->sp;
+	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	conv_ftl->slc_sb_migration_attempts++;
+
+	for (die = 0; die < die_count && moved < budget; die++) {
+		struct ppa ppa = { .ppa = 0 };
+		struct nand_block *blk;
+		uint32_t ch, lun, pg;
+
+		decode_die(spp, die, &ch, &lun);
+		ppa.g.ch = ch;
+		ppa.g.lun = lun;
+		ppa.g.pl = 0;
+		ppa.g.blk = blk_id;
+		blk = get_blk(conv_ftl->ssd, &ppa);
+		if (!blk)
+			continue;
+
+		for (pg = 0; pg < (uint32_t)blk->npgs && moved < budget; pg++) {
+			uint64_t lpn;
+
+			ppa.g.pg = pg;
+			if (blk->pg[pg].status != PG_VALID)
+				continue;
+			lpn = get_rmap_ent(conv_ftl, &ppa);
+			if (lpn == INVALID_LPN || lpn >= spp->tt_pgs)
+				continue;
+			if (!conv_ftl->page_in_slc || !conv_ftl->page_in_slc[lpn])
+				continue;
+			if (recent_write_guard(conv_ftl, lpn))
+				continue;
+			if (migrate_page_to_qlc(conv_ftl, lpn, &ppa) == 0)
+				moved++;
+		}
+	}
+
+	if (moved)
+		conv_ftl->slc_sb_migration_pages += moved;
+	return moved;
+}
+
+static bool slc_sb_summary_is_mixed(struct conv_ftl *conv_ftl,
+				    const struct slc_sb_summary_no1 *sum)
+{
+	uint32_t owner_ratio = 0;
+
+	if (!sum || !sum->total_vpc)
+		return false;
+	if (!chain_id_valid(conv_ftl, sum->owner_chain))
+		return true;
+	owner_ratio = sum->owner_pages * 100U / sum->total_vpc;
+	return owner_ratio < 90U;
+}
+
+static bool slc_mixed_sb_summary_better(const struct slc_sb_summary_no1 *cand,
+					const struct slc_sb_summary_no1 *best,
+					bool have_best)
+{
+	if (!cand)
+		return false;
+	if (!have_best || !best)
+		return true;
+	if (cand->avg_heat != best->avg_heat)
+		return cand->avg_heat < best->avg_heat;
+	if (cand->heat_count != best->heat_count)
+		return cand->heat_count > best->heat_count;
+	if (cand->total_vpc != best->total_vpc)
+		return cand->total_vpc > best->total_vpc;
+	return cand->blk_id < best->blk_id;
+}
+
+static uint32_t migrate_pure_cold_superblocks_from_slc(struct conv_ftl *conv_ftl,
 						       uint32_t max_pages,
 						       uint64_t dyn_thresh,
 						       uint32_t *sampled_out,
@@ -3758,10 +3775,10 @@ static uint32_t migrate_some_cold_from_slc_superblocks(struct conv_ftl *conv_ftl
 		struct slc_sb_summary_no1 sum;
 		uint32_t moved;
 
-		if (!slc_sb_collect_summary(conv_ftl, blk_id, &sum))
-			continue;
 		if (blocks_out)
 			(*blocks_out)++;
+		if (!slc_sb_collect_summary(conv_ftl, blk_id, &sum))
+			continue;
 		if (sampled_out)
 			*sampled_out += sum.heat_count;
 		if (sum.active || sum.open_writer || sum.total_vpc == 0)
@@ -3780,6 +3797,47 @@ static uint32_t migrate_some_cold_from_slc_superblocks(struct conv_ftl *conv_ftl
 	}
 
 	return migrated;
+}
+
+static uint32_t migrate_coldest_mixed_superblock_from_slc(struct conv_ftl *conv_ftl,
+							  uint32_t max_pages,
+							  uint32_t *sampled_out,
+							  uint32_t *blocks_out)
+{
+	struct slc_sb_summary_no1 best;
+	bool have_best = false;
+	uint32_t blk_id;
+
+	if (sampled_out)
+		*sampled_out = 0;
+	if (blocks_out)
+		*blocks_out = 0;
+	if (!conv_ftl || !conv_ftl->ssd || !max_pages)
+		return 0;
+
+	memset(&best, 0, sizeof(best));
+	for (blk_id = 0; blk_id < conv_ftl->slc_blks_per_pl; blk_id++) {
+		struct slc_sb_summary_no1 sum;
+
+		if (blocks_out)
+			(*blocks_out)++;
+		if (!slc_sb_collect_summary(conv_ftl, blk_id, &sum))
+			continue;
+		if (sampled_out)
+			*sampled_out += sum.heat_count;
+		if (sum.active || sum.open_writer || sum.total_vpc == 0)
+			continue;
+		if (!slc_sb_summary_is_mixed(conv_ftl, &sum))
+			continue;
+		if (slc_mixed_sb_summary_better(&sum, &best, have_best)) {
+			best = sum;
+			have_best = true;
+		}
+	}
+
+	if (!have_best)
+		return 0;
+	return migrate_superblock_valid_pages_from_slc(conv_ftl, best.blk_id, max_pages);
 }
 
 static struct write_pointer *get_chain_host_slc_wp(struct conv_ftl *conv_ftl, uint32_t chain_id,
@@ -4363,9 +4421,9 @@ static bool chain_ensure_slc_superblock_slot_locked(struct conv_ftl *conv_ftl,
 		return true;
 	}
 
-	/* Last-resort: cap not reached but no free SB blk and no shareable SB.
-	 * Fall back to legacy per-die first-free open so writes don't fail
-	 * outright; this preserves correctness while sacrificing strict alignment. */
+	/* Last-resort: no dedicated SB and no shareable ACTIVE SB. Refuse the
+	 * allocation so the caller can migrate/GC and retry; do not open a
+	 * drifting per-die SLC block here. */
 	return false;
 }
 
