@@ -244,6 +244,9 @@ struct conv_ftl {
 	struct line_mgmt *slc_lunlm;          /* per-die SLC line pools */
 	struct write_pointer *slc_lunwp;
 	struct write_pointer *gc_slc_lunwp;
+	struct write_pointer *baseline_slc_active_wps; /* baseline host SB slots: [slot][die] */
+	uint32_t *baseline_active_sb_blk;     /* baseline slot -> active SLC SB blk_id, U32_MAX if free */
+	uint32_t baseline_active_sb_cursor;   /* baseline RR/fill cursor over host-active SB slots */
 	struct write_pointer slc_wp;
 	struct write_pointer gc_wp;
 	
@@ -348,11 +351,11 @@ struct conv_ftl {
 		 * Indexed by blk_id (0..slc_blks_per_pl-1). A superblock spans the
 		 * SAME blk_id across all dies. Single state per blk_id is sufficient
 		 * because all dies of a chain SB are reserved together. */
-		uint8_t  *slc_sb_state;             /* SB_FREE / SB_ACTIVE / SB_CLOSED */
+		uint8_t  *slc_sb_state;             /* NVMEV_SB_FREE / NVMEV_SB_ACTIVE / NVMEV_SB_CLOSED */
 		uint32_t *slc_sb_owner_chain;       /* first chain to write into this SB (parasitic writers don't change owner) */
 		uint16_t *slc_sb_die_full_mask;     /* bit i: die i has filled its portion of this SB */
 		uint32_t *chain_cur_active_sb;      /* chain_id -> current ACTIVE SB blk_id (U32_MAX if none) */
-		uint32_t  active_sb_count;          /* number of SBs currently in SB_ACTIVE state */
+		uint32_t  active_sb_count;          /* number of SBs currently in NVMEV_SB_ACTIVE state */
 		/* chain-triggered repromotion: per-chain host read counter; when it
 		 * crosses the threshold the bg worker scans this chain's QLC pages
 		 * for hot ones and rewrites them back to SLC in a batch. */

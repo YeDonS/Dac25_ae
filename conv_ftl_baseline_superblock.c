@@ -97,6 +97,12 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define BASELINE_REPROMOTE_RATIO_NUM 2U
 #define BASELINE_REPROMOTE_RATIO_DEN 1U
 
+enum baseline_slc_sb_state_e {
+	NVMEV_SB_FREE = 0,
+	NVMEV_SB_ACTIVE = 1,
+	NVMEV_SB_CLOSED = 2,
+};
+
 struct nvmev_cmd_debug {
 	bool valid;
 	u8 opcode;
@@ -214,6 +220,9 @@ static void baseline_superblock_stats_log_summary(struct conv_ftl *conv_ftl,
 						  const char *phase);
 static void slc_resident_track_page(struct conv_ftl *conv_ftl, uint64_t lpn, uint32_t die);
 static void slc_resident_untrack_page(struct conv_ftl *conv_ftl, uint64_t lpn);
+static bool baseline_line_is_host_open_locked(struct conv_ftl *conv_ftl,
+					      struct line *line,
+					      uint32_t die);
 static bool slc_has_any_victim(struct conv_ftl *conv_ftl);
 static bool qlc_has_any_victim(struct conv_ftl *conv_ftl);
 
@@ -727,12 +736,10 @@ static void collect_pool_stats(struct conv_ftl *conv_ftl, bool slc,
 			if (line->pos || line->ipc > 0)
 				any_victim = true;
 			if (slc) {
-				struct write_pointer *host_wp = conv_ftl->slc_lunwp ?
-					&conv_ftl->slc_lunwp[die] : NULL;
 				struct write_pointer *gc_wp = conv_ftl->gc_slc_lunwp ?
 					&conv_ftl->gc_slc_lunwp[die] : NULL;
 
-				if ((host_wp && host_wp->curline == line) ||
+				if (baseline_line_is_host_open_locked(conv_ftl, line, die) ||
 				    (gc_wp && gc_wp->curline == line))
 					any_open = true;
 			} else if (line->pos == 0 && list_empty(&line->entry) &&
@@ -891,8 +898,8 @@ static int qlc_get_new_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zo
 			    struct ppa *ppa_out);
 static int qlc_get_new_gc_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zone_hint,
 			       struct ppa *ppa_out);
-static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
-static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl);
+static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, const struct ppa *ppa);
+static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl, uint32_t preferred_blk);
 /* 新增：GC 专用 SLC 写指针函数声明（仅在本文件使用） */
 static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
@@ -2103,10 +2110,11 @@ static void baseline_superblock_stats_log_summary(struct conv_ftl *conv_ftl,
 	gc_total = conv_ftl->slc_sb_gc_invalid_pages +
 		   conv_ftl->slc_sb_gc_valid_pages;
 	gc_eff = baseline_pct_u64(conv_ftl->slc_sb_gc_invalid_pages, gc_total);
-	NVMEV_INFO("[SB_STATS] %s slc_free=%u/%u qlc_free=%u/%u gc=%llu "
+	NVMEV_INFO("[SB_STATS] %s slc_free=%u/%u qlc_free=%u/%u host_active=%u/%u gc=%llu "
 		   "gc_eff=%llu erase_ops=%llu erase_ns=%llu qlc_fast=%llu qlc_slow=%llu\n",
 		   phase ? phase : "summary",
 		   slc.free, slc.total, qlc.free, qlc.total,
+		   conv_ftl->active_sb_count, NVMEV_SUPERBLOCK_ACTIVE_LIMIT,
 		   (unsigned long long)conv_ftl->slc_sb_gc_count,
 		   (unsigned long long)gc_eff,
 		   (unsigned long long)conv_ftl->slc_sb_gc_erase_ops,
@@ -2142,6 +2150,8 @@ static int baseline_superblock_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "qlc_pages_per_superblock %u\n", qlc_pages_per_superblock(conv_ftl));
 	seq_printf(m, "slc_pages_per_block %u\n", conv_ftl->slc_pgs_per_blk);
 	seq_printf(m, "qlc_pages_per_block %u\n", conv_ftl->qlc_pgs_per_blk);
+	seq_printf(m, "slc_host_active_superblocks %u\n", conv_ftl->active_sb_count);
+	seq_printf(m, "slc_host_active_limit %u\n", NVMEV_SUPERBLOCK_ACTIVE_LIMIT);
 	seq_printf(m, "slc_total_lines %u\n", slc.total);
 	seq_printf(m, "slc_free_lines %u\n", slc.free);
 	seq_printf(m, "slc_victim_lines %u\n", slc.victim);
@@ -2515,6 +2525,70 @@ static void slc_resident_track_page(struct conv_ftl *conv_ftl, uint64_t lpn, uin
 	spin_unlock(&conv_ftl->slc_lock);
 }
 
+static inline struct write_pointer *baseline_active_wp(struct conv_ftl *conv_ftl,
+						       uint32_t slot,
+						       uint32_t die)
+{
+	uint32_t die_count;
+
+	if (!conv_ftl || !conv_ftl->baseline_slc_active_wps)
+		return NULL;
+	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	if (slot >= NVMEV_SUPERBLOCK_ACTIVE_LIMIT || die >= die_count)
+		return NULL;
+	return &conv_ftl->baseline_slc_active_wps[slot * die_count + die];
+}
+
+static bool baseline_line_is_host_open_locked(struct conv_ftl *conv_ftl,
+					      struct line *line,
+					      uint32_t die)
+{
+	uint32_t slot;
+
+	if (!conv_ftl || !line)
+		return false;
+
+	for (slot = 0; slot < NVMEV_SUPERBLOCK_ACTIVE_LIMIT; slot++) {
+		struct write_pointer *wp = baseline_active_wp(conv_ftl, slot, die);
+
+		if (wp && wp->curline == line)
+			return true;
+	}
+
+	if (conv_ftl->slc_lunwp && conv_ftl->slc_lunwp[die].curline == line)
+		return true;
+
+	return false;
+}
+
+static void baseline_note_sb_free_if_all_free_locked(struct conv_ftl *conv_ftl,
+						     uint32_t blk_id)
+{
+	uint32_t die_count;
+	uint32_t die;
+
+	if (!conv_ftl || !conv_ftl->slc_sb_state || !conv_ftl->slc_sb_die_full_mask ||
+	    !conv_ftl->ssd || blk_id >= conv_ftl->ssd->sp.blks_per_pl)
+		return;
+
+	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	for (die = 0; die < die_count; die++) {
+		struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
+		struct line *line;
+
+		if (!lm || !lm->lines || blk_id >= lm->tt_lines)
+			return;
+		line = &lm->lines[blk_id];
+		if (line->vpc || line->ipc || line->pos || list_empty(&line->entry))
+			return;
+	}
+
+	conv_ftl->slc_sb_state[blk_id] = NVMEV_SB_FREE;
+	conv_ftl->slc_sb_die_full_mask[blk_id] = 0;
+	if (conv_ftl->slc_sb_owner_chain)
+		conv_ftl->slc_sb_owner_chain[blk_id] = INVALID_CHAIN_ID;
+}
+
 static bool slc_has_any_victim(struct conv_ftl *conv_ftl)
 {
 	uint32_t blk;
@@ -2533,8 +2607,6 @@ static bool slc_has_any_victim(struct conv_ftl *conv_ftl)
 
 		for (die = 0; die < conv_ftl->die_count; die++) {
 			struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
-			struct write_pointer *host_wp = conv_ftl->slc_lunwp ?
-				&conv_ftl->slc_lunwp[die] : NULL;
 			struct write_pointer *gc_wp = conv_ftl->gc_slc_lunwp ?
 				&conv_ftl->gc_slc_lunwp[die] : NULL;
 			struct line *line;
@@ -2542,7 +2614,7 @@ static bool slc_has_any_victim(struct conv_ftl *conv_ftl)
 			if (!lm || !lm->lines || blk >= lm->tt_lines)
 				continue;
 			line = &lm->lines[blk];
-			if ((host_wp && host_wp->curline == line) ||
+			if (baseline_line_is_host_open_locked(conv_ftl, line, die) ||
 			    (gc_wp && gc_wp->curline == line)) {
 				open_writer = true;
 				break;
@@ -2863,8 +2935,8 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->blk_owner_pages = vzalloc(sizeof(*conv_ftl->blk_owner_pages) * spp->tt_blks);
 	conv_ftl->blk_valid_pages = vzalloc(sizeof(*conv_ftl->blk_valid_pages) * spp->tt_blks);
 	conv_ftl->blk_mixed_pages = vzalloc(sizeof(*conv_ftl->blk_mixed_pages) * spp->tt_blks);
-	/* baseline does not use the SB state machine / chain repromotion fields;
-	 * leave them NULL so any defensive null-checks hold. */
+	/* Baseline does not use chain-private SB fields; the generic SB state
+	 * arrays are allocated below for the 14-slot host-active pool. */
 	conv_ftl->blk_active_wp_refs = NULL;
 	conv_ftl->slc_sb_state = NULL;
 	conv_ftl->slc_sb_owner_chain = NULL;
@@ -2892,6 +2964,16 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->chain_repromote_cursor = NULL;
 	conv_ftl->active_sb_count = 0;
 #endif
+	/* Baseline also has a host-active SB state machine, but it is not
+	 * chain-owned. It tracks at most 14 open host SBs and lets partial SBs
+	 * keep accepting later host pages until every die portion is full. */
+	conv_ftl->slc_sb_state =
+		vzalloc(sizeof(*conv_ftl->slc_sb_state) * spp->blks_per_pl);
+	conv_ftl->slc_sb_owner_chain =
+		vmalloc(sizeof(*conv_ftl->slc_sb_owner_chain) * spp->blks_per_pl);
+	conv_ftl->slc_sb_die_full_mask =
+		vzalloc(sizeof(*conv_ftl->slc_sb_die_full_mask) * spp->blks_per_pl);
+	conv_ftl->active_sb_count = 0;
 	if (!conv_ftl->lpn_initial_die || !conv_ftl->lpn_die_changed ||
 	    !conv_ftl->lpn_die_change_reason
 #if NVMEV_ENABLE_CHAIN_AGGREGATION
@@ -2901,6 +2983,8 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	    !conv_ftl->blk_owner_pages || !conv_ftl->blk_valid_pages ||
 	    !conv_ftl->blk_mixed_pages
 #endif
+	    || !conv_ftl->slc_sb_state || !conv_ftl->slc_sb_owner_chain ||
+	    !conv_ftl->slc_sb_die_full_mask
 	    ) {
 		NVMEV_ERROR("Failed to allocate LPN die-change tracking memory\n");
 		vfree(conv_ftl->maptbl);
@@ -2929,6 +3013,12 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 			vfree(conv_ftl->blk_valid_pages);
 		if (conv_ftl->blk_mixed_pages)
 			vfree(conv_ftl->blk_mixed_pages);
+		if (conv_ftl->slc_sb_state)
+			vfree(conv_ftl->slc_sb_state);
+		if (conv_ftl->slc_sb_owner_chain)
+			vfree(conv_ftl->slc_sb_owner_chain);
+		if (conv_ftl->slc_sb_die_full_mask)
+			vfree(conv_ftl->slc_sb_die_full_mask);
 		conv_ftl->lpn_initial_die = NULL;
 		conv_ftl->lpn_die_changed = NULL;
 		conv_ftl->lpn_die_change_reason = NULL;
@@ -2941,6 +3031,9 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 		conv_ftl->blk_owner_pages = NULL;
 		conv_ftl->blk_valid_pages = NULL;
 		conv_ftl->blk_mixed_pages = NULL;
+		conv_ftl->slc_sb_state = NULL;
+		conv_ftl->slc_sb_owner_chain = NULL;
+		conv_ftl->slc_sb_die_full_mask = NULL;
 		conv_ftl->maptbl_initialized = false;
 		return;
 	}
@@ -2958,6 +3051,10 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	if (conv_ftl->blk_owner_chain) {
 		for (i = 0; i < spp->tt_blks; i++)
 			conv_ftl->blk_owner_chain[i] = INVALID_CHAIN_ID;
+	}
+	if (conv_ftl->slc_sb_owner_chain) {
+		for (i = 0; i < spp->blks_per_pl; i++)
+			conv_ftl->slc_sb_owner_chain[i] = INVALID_CHAIN_ID;
 	}
 	conv_ftl->lpn_initial_die_tracked = 0;
 	conv_ftl->lpn_current_die_changed = 0;
@@ -3013,6 +3110,9 @@ static void remove_maptbl(struct conv_ftl *conv_ftl)
 	vfree(conv_ftl->blk_owner_pages);
 	vfree(conv_ftl->blk_valid_pages);
 	vfree(conv_ftl->blk_mixed_pages);
+	vfree(conv_ftl->slc_sb_state);
+	vfree(conv_ftl->slc_sb_owner_chain);
+	vfree(conv_ftl->slc_sb_die_full_mask);
 	conv_ftl->maptbl = NULL;
 	conv_ftl->lpn_initial_die = NULL;
 	conv_ftl->lpn_die_changed = NULL;
@@ -3026,6 +3126,9 @@ static void remove_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->blk_owner_pages = NULL;
 	conv_ftl->blk_valid_pages = NULL;
 	conv_ftl->blk_mixed_pages = NULL;
+	conv_ftl->slc_sb_state = NULL;
+	conv_ftl->slc_sb_owner_chain = NULL;
+	conv_ftl->slc_sb_die_full_mask = NULL;
 	conv_ftl->chain_capacity = 0;
 	conv_ftl->next_chain_id = 0;
 }
@@ -3509,16 +3612,28 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 				      sizeof(*conv_ftl->slc_lunwp), GFP_KERNEL);
 	conv_ftl->gc_slc_lunwp = kcalloc(conv_ftl->die_count,
 					 sizeof(*conv_ftl->gc_slc_lunwp), GFP_KERNEL);
+	conv_ftl->baseline_slc_active_wps =
+		kcalloc(NVMEV_SUPERBLOCK_ACTIVE_LIMIT * conv_ftl->die_count,
+			sizeof(*conv_ftl->baseline_slc_active_wps), GFP_KERNEL);
+	conv_ftl->baseline_active_sb_blk =
+		kmalloc_array(NVMEV_SUPERBLOCK_ACTIVE_LIMIT,
+			      sizeof(*conv_ftl->baseline_active_sb_blk), GFP_KERNEL);
 	conv_ftl->qlc_lunwp = kcalloc(conv_ftl->die_count,
 				      sizeof(*conv_ftl->qlc_lunwp), GFP_KERNEL);
 	conv_ftl->gc_qlc_lunwp = kcalloc(conv_ftl->die_count,
 					 sizeof(*conv_ftl->gc_qlc_lunwp), GFP_KERNEL);
-	if (!conv_ftl->slc_lunwp || !conv_ftl->gc_slc_lunwp) {
+	if (!conv_ftl->slc_lunwp || !conv_ftl->gc_slc_lunwp ||
+	    !conv_ftl->baseline_slc_active_wps ||
+	    !conv_ftl->baseline_active_sb_blk) {
 		NVMEV_ERROR("Failed to allocate per-die SLC write pointer arrays\n");
 		kfree(conv_ftl->slc_lunwp);
 		kfree(conv_ftl->gc_slc_lunwp);
+		kfree(conv_ftl->baseline_slc_active_wps);
+		kfree(conv_ftl->baseline_active_sb_blk);
 		conv_ftl->slc_lunwp = NULL;
 		conv_ftl->gc_slc_lunwp = NULL;
+		conv_ftl->baseline_slc_active_wps = NULL;
+		conv_ftl->baseline_active_sb_blk = NULL;
 		kfree(conv_ftl->qlc_lunwp);
 		kfree(conv_ftl->gc_qlc_lunwp);
 		conv_ftl->qlc_lunwp = NULL;
@@ -3529,13 +3644,24 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		NVMEV_ERROR("Failed to allocate per-die QLC write pointer arrays\n");
 		kfree(conv_ftl->slc_lunwp);
 		kfree(conv_ftl->gc_slc_lunwp);
+		kfree(conv_ftl->baseline_slc_active_wps);
+		kfree(conv_ftl->baseline_active_sb_blk);
 		kfree(conv_ftl->qlc_lunwp);
 		kfree(conv_ftl->gc_qlc_lunwp);
 		conv_ftl->slc_lunwp = NULL;
 		conv_ftl->gc_slc_lunwp = NULL;
+		conv_ftl->baseline_slc_active_wps = NULL;
+		conv_ftl->baseline_active_sb_blk = NULL;
 		conv_ftl->qlc_lunwp = NULL;
 		conv_ftl->gc_qlc_lunwp = NULL;
 		return;
+	}
+	{
+		uint32_t slot;
+
+		for (slot = 0; slot < NVMEV_SUPERBLOCK_ACTIVE_LIMIT; slot++)
+			conv_ftl->baseline_active_sb_blk[slot] = U32_MAX;
+		conv_ftl->baseline_active_sb_cursor = 0;
 	}
 
 	/* initialize maptbl */
@@ -3793,10 +3919,15 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 	}
 	kfree(conv_ftl->slc_lunwp);
 	kfree(conv_ftl->gc_slc_lunwp);
+	kfree(conv_ftl->baseline_slc_active_wps);
+	kfree(conv_ftl->baseline_active_sb_blk);
 	kfree(conv_ftl->qlc_lunwp);
 	kfree(conv_ftl->gc_qlc_lunwp);
 	conv_ftl->slc_lunwp = NULL;
 	conv_ftl->gc_slc_lunwp = NULL;
+	conv_ftl->baseline_slc_active_wps = NULL;
+	conv_ftl->baseline_active_sb_blk = NULL;
+	conv_ftl->baseline_active_sb_cursor = 0;
 	conv_ftl->qlc_lunwp = NULL;
 	conv_ftl->gc_qlc_lunwp = NULL;
 
@@ -4558,6 +4689,7 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		line->pos = 0;
 		list_add_tail(&line->entry, &lm->free_line_list);
 		lm->free_line_cnt++;
+		baseline_note_sb_free_if_all_free_locked(conv_ftl, line_id);
 		spin_unlock(&conv_ftl->slc_lock);
 	} else {
 		start_blk = conv_ftl->slc_blks_per_pl;
@@ -4635,8 +4767,6 @@ static bool select_sb_victim_slc_locked(struct conv_ftl *conv_ftl,
 
 		for (die = 0; die < die_count; die++) {
 			struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
-			struct write_pointer *wp = conv_ftl->slc_lunwp ?
-				&conv_ftl->slc_lunwp[die] : NULL;
 			struct write_pointer *gc_wp = conv_ftl->gc_slc_lunwp ?
 				&conv_ftl->gc_slc_lunwp[die] : NULL;
 			struct line *line;
@@ -4645,7 +4775,7 @@ static bool select_sb_victim_slc_locked(struct conv_ftl *conv_ftl,
 				continue;
 			line = &lm->lines[i];
 
-			if ((wp && wp->curline == line) ||
+			if (baseline_line_is_host_open_locked(conv_ftl, line, die) ||
 			    (gc_wp && gc_wp->curline == line)) {
 				curline_seen = true;
 				break;
@@ -5256,113 +5386,388 @@ static bool baseline_try_open_aligned_sb_wps_locked(struct conv_ftl *conv_ftl,
 	return false;
 }
 
-static bool baseline_try_open_aligned_sb_locked(struct conv_ftl *conv_ftl)
+static bool baseline_wp_has_space(struct conv_ftl *conv_ftl,
+				  struct write_pointer *wp)
 {
-	return baseline_try_open_aligned_sb_wps_locked(conv_ftl,
-						      conv_ftl->slc_lunwp);
+	if (!conv_ftl || !conv_ftl->ssd || !wp || !wp->curline)
+		return false;
+	return wp->pg < conv_ftl->ssd->sp.pgs_per_blk;
 }
 
-static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
+static bool baseline_slot_is_active_locked(struct conv_ftl *conv_ftl,
+					   uint32_t slot)
+{
+	if (!conv_ftl || !conv_ftl->baseline_active_sb_blk ||
+	    slot >= NVMEV_SUPERBLOCK_ACTIVE_LIMIT)
+		return false;
+	return conv_ftl->baseline_active_sb_blk[slot] != U32_MAX;
+}
+
+static uint32_t baseline_find_slot_for_blk_locked(struct conv_ftl *conv_ftl,
+						  uint32_t blk)
+{
+	uint32_t slot;
+
+	if (!conv_ftl || !conv_ftl->baseline_active_sb_blk)
+		return U32_MAX;
+	for (slot = 0; slot < NVMEV_SUPERBLOCK_ACTIVE_LIMIT; slot++) {
+		if (conv_ftl->baseline_active_sb_blk[slot] == blk)
+			return slot;
+	}
+	return U32_MAX;
+}
+
+static uint32_t baseline_slot_fill_pages_locked(struct conv_ftl *conv_ftl,
+						uint32_t slot)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	uint32_t fill = 0;
+	uint32_t die;
+
+	if (!baseline_slot_is_active_locked(conv_ftl, slot))
+		return 0;
+	for (die = 0; die < die_count; die++) {
+		struct write_pointer *wp = baseline_active_wp(conv_ftl, slot, die);
+
+		if (!wp || !wp->curline)
+			fill += spp->pgs_per_blk;
+		else if (wp->pg >= spp->pgs_per_blk)
+			fill += spp->pgs_per_blk;
+		else
+			fill += wp->pg;
+	}
+	return fill;
+}
+
+static bool baseline_slot_select_die_locked(struct conv_ftl *conv_ftl,
+					    uint32_t slot,
+					    uint32_t preferred_die,
+					    uint32_t *die_out)
+{
+	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	uint32_t tried;
+
+	if (!baseline_slot_is_active_locked(conv_ftl, slot))
+		return false;
+	for (tried = 0; tried < die_count; tried++) {
+		uint32_t die = (preferred_die + tried) % die_count;
+		struct write_pointer *wp = baseline_active_wp(conv_ftl, slot, die);
+
+		if (baseline_wp_has_space(conv_ftl, wp)) {
+			if (die_out)
+				*die_out = die;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void baseline_complete_active_slot_if_done_locked(struct conv_ftl *conv_ftl,
+							uint32_t slot)
+{
+	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	uint32_t blk;
+	uint32_t die;
+
+	if (!baseline_slot_is_active_locked(conv_ftl, slot))
+		return;
+
+	for (die = 0; die < die_count; die++) {
+		struct write_pointer *wp = baseline_active_wp(conv_ftl, slot, die);
+
+		if (wp && wp->curline)
+			return;
+	}
+
+	blk = conv_ftl->baseline_active_sb_blk[slot];
+	conv_ftl->baseline_active_sb_blk[slot] = U32_MAX;
+	if (conv_ftl->active_sb_count)
+		conv_ftl->active_sb_count--;
+	if (conv_ftl->slc_sb_state && blk < conv_ftl->ssd->sp.blks_per_pl)
+		conv_ftl->slc_sb_state[blk] = NVMEV_SB_CLOSED;
+	conv_ftl->baseline_active_sb_cursor = slot;
+}
+
+static bool baseline_open_active_slot_locked(struct conv_ftl *conv_ftl,
+					     uint32_t slot)
+{
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	uint32_t die;
+	struct line_mgmt *lm0;
+	struct line *line0;
+
+	if (!conv_ftl->baseline_active_sb_blk ||
+	    !conv_ftl->baseline_slc_active_wps ||
+	    slot >= NVMEV_SUPERBLOCK_ACTIVE_LIMIT ||
+	    conv_ftl->active_sb_count >= NVMEV_SUPERBLOCK_ACTIVE_LIMIT ||
+	    baseline_slot_is_active_locked(conv_ftl, slot))
+		return false;
+
+	lm0 = get_slc_die_lm(conv_ftl, 0);
+	if (!lm0)
+		return false;
+
+	list_for_each_entry(line0, &lm0->free_line_list, entry) {
+		uint32_t blk = line0->id;
+		bool all_free = true;
+
+		if (conv_ftl->is_slc_block && !conv_ftl->is_slc_block[blk])
+			continue;
+
+		for (die = 1; die < die_count && all_free; die++) {
+			struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
+			struct line *l;
+			bool found = false;
+
+			if (!lm) {
+				all_free = false;
+				break;
+			}
+			list_for_each_entry(l, &lm->free_line_list, entry) {
+				if (l->id == blk) {
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				all_free = false;
+		}
+		if (!all_free)
+			continue;
+
+		for (die = 0; die < die_count; die++) {
+			struct write_pointer *wp = baseline_active_wp(conv_ftl, slot, die);
+			struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
+			struct line *line = NULL;
+			struct line *l;
+
+			if (!lm || !wp)
+				continue;
+			list_for_each_entry(l, &lm->free_line_list, entry) {
+				if (l->id == blk) {
+					line = l;
+					break;
+				}
+			}
+			if (!line)
+				continue;
+			list_del_init(&line->entry);
+			lm->free_line_cnt--;
+			decode_die(spp, die, &wp->ch, &wp->lun);
+			wp->curline = line;
+			wp->blk = blk;
+			wp->pg = 0;
+			wp->pl = 0;
+		}
+
+		conv_ftl->baseline_active_sb_blk[slot] = blk;
+		conv_ftl->active_sb_count++;
+		conv_ftl->baseline_active_sb_cursor =
+			(slot + 1) % NVMEV_SUPERBLOCK_ACTIVE_LIMIT;
+		if (conv_ftl->slc_sb_state && blk < spp->blks_per_pl)
+			conv_ftl->slc_sb_state[blk] = NVMEV_SB_ACTIVE;
+		if (conv_ftl->slc_sb_owner_chain && blk < spp->blks_per_pl)
+			conv_ftl->slc_sb_owner_chain[blk] = INVALID_CHAIN_ID;
+		if (conv_ftl->slc_sb_die_full_mask && blk < spp->blks_per_pl)
+			conv_ftl->slc_sb_die_full_mask[blk] = 0;
+		return true;
+	}
+
+	return false;
+}
+
+static bool baseline_open_new_active_slot_locked(struct conv_ftl *conv_ftl,
+						 uint32_t *slot_out)
+{
+	uint32_t start;
+	uint32_t tried;
+
+	if (!conv_ftl || !conv_ftl->baseline_active_sb_blk ||
+	    conv_ftl->active_sb_count >= NVMEV_SUPERBLOCK_ACTIVE_LIMIT)
+		return false;
+
+	start = conv_ftl->baseline_active_sb_cursor % NVMEV_SUPERBLOCK_ACTIVE_LIMIT;
+	for (tried = 0; tried < NVMEV_SUPERBLOCK_ACTIVE_LIMIT; tried++) {
+		uint32_t slot = (start + tried) % NVMEV_SUPERBLOCK_ACTIVE_LIMIT;
+
+		if (baseline_slot_is_active_locked(conv_ftl, slot))
+			continue;
+		if (baseline_open_active_slot_locked(conv_ftl, slot)) {
+			if (slot_out)
+				*slot_out = slot;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool baseline_select_active_slot_locked(struct conv_ftl *conv_ftl,
+					       uint32_t preferred_blk,
+					       uint32_t preferred_die,
+					       uint32_t *slot_out,
+					       uint32_t *die_out)
+{
+	uint32_t best_slot = U32_MAX;
+	uint32_t best_die = 0;
+	uint32_t best_fill = 0;
+	uint32_t slot;
+
+	if (!conv_ftl || !conv_ftl->baseline_active_sb_blk)
+		return false;
+
+	for (slot = 0; slot < NVMEV_SUPERBLOCK_ACTIVE_LIMIT; slot++)
+		baseline_complete_active_slot_if_done_locked(conv_ftl, slot);
+
+	if (preferred_blk != U32_MAX) {
+		slot = baseline_find_slot_for_blk_locked(conv_ftl, preferred_blk);
+		if (slot != U32_MAX &&
+		    baseline_slot_select_die_locked(conv_ftl, slot, preferred_die, die_out)) {
+			if (slot_out)
+				*slot_out = slot;
+			return true;
+		}
+	}
+
+	for (slot = 0; slot < NVMEV_SUPERBLOCK_ACTIVE_LIMIT; slot++) {
+		uint32_t fill;
+		uint32_t die;
+
+		if (!baseline_slot_select_die_locked(conv_ftl, slot, preferred_die, &die))
+			continue;
+		fill = baseline_slot_fill_pages_locked(conv_ftl, slot);
+		if (best_slot == U32_MAX || fill > best_fill) {
+			best_slot = slot;
+			best_die = die;
+			best_fill = fill;
+		}
+	}
+	if (best_slot != U32_MAX) {
+		if (slot_out)
+			*slot_out = best_slot;
+		if (die_out)
+			*die_out = best_die;
+		return true;
+	}
+
+	if (baseline_open_new_active_slot_locked(conv_ftl, &slot) &&
+	    baseline_slot_select_die_locked(conv_ftl, slot, preferred_die, die_out)) {
+		if (slot_out)
+			*slot_out = slot;
+		return true;
+	}
+
+	return false;
+}
+
+static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl, uint32_t preferred_blk)
+{
+	struct ssdparams *spp;
 	struct ppa ppa;
 	struct nand_page *pg;
-	uint32_t die, tried;
-	uint32_t die_count;
 	struct write_pointer *wp;
-	struct line_mgmt *lm;
+	uint32_t attempt;
+	uint32_t die_count;
+	uint32_t max_attempts;
+	uint32_t slot;
+	uint32_t die;
 
-	if (!conv_ftl || !conv_ftl->slc_lunwp) {
-		NVMEV_ERROR("SLC lines or write pointers not initialized\n");
+	if (!conv_ftl || !conv_ftl->baseline_slc_active_wps ||
+	    !conv_ftl->baseline_active_sb_blk) {
+		NVMEV_ERROR("baseline host-active SLC SB pool not initialized\n");
 		return (struct ppa){ .ppa = UNMAPPED_PPA };
 	}
 
+	spp = &conv_ftl->ssd->sp;
 	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	max_attempts = (NVMEV_SUPERBLOCK_ACTIVE_LIMIT * die_count * 2) + die_count;
 
-	for (tried = 0; tried < die_count; tried++) {
-		die = (conv_ftl->lunpointer + tried) % die_count;
-		wp = &conv_ftl->slc_lunwp[die];
-		lm = get_slc_die_lm(conv_ftl, die);
-		if (!lm || !lm->lines)
-			continue;
-
-		if (!wp->curline) {
-			spin_lock(&conv_ftl->slc_lock);
-			/* SB-aligned attempt first: open all currently-null
-			 * per-die wps with the same blk_id. */
-			(void)baseline_try_open_aligned_sb_locked(conv_ftl);
-			if (wp->curline) {
-				spin_unlock(&conv_ftl->slc_lock);
-				goto have_curline;
-			}
-			/* Strict SB mode: do not open a per-die fallback line here.
-			 * If not all dies are idle or no fully aligned free blk exists,
-			 * let callers trigger migration/GC until an aligned SB is available. */
+	for (attempt = 0; attempt < max_attempts; attempt++) {
+		spin_lock(&conv_ftl->slc_lock);
+		if (!baseline_select_active_slot_locked(conv_ftl, preferred_blk,
+							conv_ftl->lunpointer % die_count,
+							&slot, &die)) {
 			spin_unlock(&conv_ftl->slc_lock);
+			break;
+		}
+
+		wp = baseline_active_wp(conv_ftl, slot, die);
+		if (!baseline_wp_has_space(conv_ftl, wp)) {
+			spin_unlock(&conv_ftl->slc_lock);
+			preferred_blk = U32_MAX;
 			continue;
 		}
-have_curline:
 
-		if (tried > 0)
-			conv_ftl->lunpointer = die;
-
-retry_get_page:
 		ppa.ppa = 0;
 		ppa.g.ch = wp->ch;
 		ppa.g.lun = wp->lun;
 		ppa.g.pg = wp->pg;
 		ppa.g.blk = wp->blk;
 		ppa.g.pl = wp->pl;
+		conv_ftl->lunpointer = die;
+		spin_unlock(&conv_ftl->slc_lock);
 
 		pg = get_pg(conv_ftl->ssd, &ppa);
-		if (!pg)
+		if (!pg) {
+			preferred_blk = U32_MAX;
 			continue;
+		}
 
 		if (pg->status != PG_FREE) {
-			advance_slc_write_pointer(conv_ftl, die);
-			if (!wp->curline)
-				continue;
-			goto retry_get_page;
+			advance_slc_write_pointer(conv_ftl, &ppa);
+			preferred_blk = U32_MAX;
+			continue;
 		}
 
 		return ppa;
 	}
 
-	NVMEV_ERROR("No free SLC line on any die!\n");
+	NVMEV_ERROR("No free SLC page in baseline host-active SB pool!\n");
 	return (struct ppa){ .ppa = UNMAPPED_PPA };
 }
 
-/* 推进 SLC 写指针 - 使用 Die Affinity */
-static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die)
+/* 推进 baseline host-active SLC 写指针 */
+static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, const struct ppa *ppa)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct ssdparams *spp;
 	struct write_pointer *wp;
 	struct line_mgmt *lm;
+	uint32_t die;
+	uint32_t slot;
+	uint32_t new_pg;
 
-	if (!conv_ftl->slc_lunwp) {
-		NVMEV_ERROR("advance_slc_write_pointer called before SLC write pointers were initialized\n");
+	if (!conv_ftl || !conv_ftl->ssd || !ppa || !conv_ftl->baseline_active_sb_blk)
 		return;
-	}
 
+	spp = &conv_ftl->ssd->sp;
 	if (conv_ftl->die_count == 0)
 		return;
 
-	die %= conv_ftl->die_count;
-	wp = &conv_ftl->slc_lunwp[die];
+	die = encode_die(spp, ppa) % conv_ftl->die_count;
+	spin_lock(&conv_ftl->slc_lock);
+	slot = baseline_find_slot_for_blk_locked(conv_ftl, ppa->g.blk);
+	if (slot == U32_MAX) {
+		spin_unlock(&conv_ftl->slc_lock);
+		NVMEV_ERROR("advance_slc_write_pointer: active SB blk %u not found\n",
+			    ppa->g.blk);
+		return;
+	}
+
+	wp = baseline_active_wp(conv_ftl, slot, die);
 	lm = get_slc_die_lm(conv_ftl, die);
-	if (!wp->curline) {
-		NVMEV_ERROR("advance_slc_write_pointer: SLC WP for die %u not initialized\n", die);
-		return;
-	}
-	if (!lm || !lm->lines) {
-		NVMEV_ERROR("advance_slc_write_pointer: missing line manager for die %u\n", die);
+	if (!wp || !wp->curline || !lm || !lm->lines) {
+		spin_unlock(&conv_ftl->slc_lock);
+		NVMEV_ERROR("advance_slc_write_pointer: missing WP/line for slot %u die %u\n",
+			    slot, die);
 		return;
 	}
 
-	wp->pg++;
+	new_pg = wp->pg + 1;
+	wp->pg = new_pg;
 
-	if (wp->pg >= spp->pgs_per_blk) {
-		spin_lock(&conv_ftl->slc_lock);
+	if (new_pg >= spp->pgs_per_blk) {
 		if (wp->curline->vpc == spp->pgs_per_lun_line) {
 			list_add_tail(&wp->curline->entry, &lm->full_line_list);
 			lm->full_line_cnt++;
@@ -5370,15 +5775,21 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die)
 			wp->curline->pos = 0;
 		}
 
+		if (conv_ftl->slc_sb_die_full_mask &&
+		    ppa->g.blk < spp->blks_per_pl)
+			conv_ftl->slc_sb_die_full_mask[ppa->g.blk] |=
+				(uint16_t)(1u << die);
 		wp->curline = NULL;
 		wp->blk = 0;
 		wp->pg = 0;
 		wp->pl = 0;
-		spin_unlock(&conv_ftl->slc_lock);
+		baseline_complete_active_slot_if_done_locked(conv_ftl, slot);
 	}
 
-	if ((wp->pg % spp->pgs_per_oneshotpg) == 0)
+	if (spp->pgs_per_oneshotpg &&
+	    (new_pg % spp->pgs_per_oneshotpg) == 0)
 		conv_ftl->lunpointer = (die + 1) % conv_ftl->die_count;
+	spin_unlock(&conv_ftl->slc_lock);
 }
 
 /* GC 专用 SLC 页面获取, 支持 die fallback */
@@ -7037,8 +7448,20 @@ retry_wb_alloc:
         {
             int slc_retry = 0;
             const int SLC_MAX_RETRIES = 8;
+            uint32_t preferred_slc_blk = U32_MAX;
 
-            ppa = get_new_slc_page(conv_ftl);
+            if (prev_link_lpn != INVALID_LPN &&
+                prev_link_lpn < conv_ftl->ssd->sp.tt_pgs) {
+                struct ppa prev_ppa;
+
+                nvmev_set_maptbl_site("conv_write.prev_prefer", prev_link_lpn);
+                prev_ppa = get_maptbl_ent(conv_ftl, prev_link_lpn);
+                if (mapped_ppa(&prev_ppa) &&
+                    prev_ppa.g.blk < conv_ftl->slc_blks_per_pl)
+                    preferred_slc_blk = prev_ppa.g.blk;
+            }
+
+            ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
             while (!mapped_ppa(&ppa) && slc_retry < SLC_MAX_RETRIES) {
                 uint32_t starved_die;
                 int32_t target_die = conv_ftl->die_count ?
@@ -7052,7 +7475,7 @@ retry_wb_alloc:
                     do_gc_for_die(conv_ftl, starved_die, true);
 
                 forground_gc(conv_ftl, FGC_MODE_HARD);
-                ppa = get_new_slc_page(conv_ftl);
+                ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
             }
         }
 
@@ -7101,7 +7524,7 @@ retry_wb_alloc:
 		//need branch
 //66f1
         /* 使用 SLC 的 Die Affinity 推进写指针 */
-        advance_slc_write_pointer(conv_ftl, encode_die(spp, &ppa));
+        advance_slc_write_pointer(conv_ftl, &ppa);
 		chain_place_note_write(conv_ftl, chain_id, CHAIN_TIER_SLC,
 				       encode_die(spp, &ppa));
 
