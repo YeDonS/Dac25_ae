@@ -1020,9 +1020,22 @@ static void collect_pool_stats(struct conv_ftl *conv_ftl, bool slc,
 				all_full = false;
 			if (line->pos || line->ipc > 0)
 				any_victim = true;
-			if (line->pos == 0 && list_empty(&line->entry) &&
-			    line->vpc < pages_per_line)
+			if (slc) {
+				struct write_pointer *host_wp = conv_ftl->slc_lunwp ?
+					&conv_ftl->slc_lunwp[die] : NULL;
+				struct write_pointer *gc_wp = conv_ftl->gc_slc_lunwp ?
+					&conv_ftl->gc_slc_lunwp[die] : NULL;
+
+				if ((host_wp && host_wp->curline == line) ||
+				    (gc_wp && gc_wp->curline == line) ||
+				    (conv_ftl->slc_sb_state &&
+				     blk < conv_ftl->ssd->sp.blks_per_pl &&
+				     conv_ftl->slc_sb_state[blk] == NVMEV_SB_ACTIVE))
+					any_open = true;
+			} else if (line->pos == 0 && list_empty(&line->entry) &&
+				   line->vpc < pages_per_line) {
 				any_open = true;
+			}
 		}
 
 		if (all_free) {
@@ -3626,10 +3639,12 @@ static bool slc_sb_summary_better(const struct slc_sb_summary_no1 *cand,
 {
 	if (!best)
 		return true;
-	if (cand_tier != best_tier)
-		return cand_tier < best_tier;
 	if (cand->total_ipc != best->total_ipc)
 		return cand->total_ipc > best->total_ipc;
+	if (cand->total_vpc != best->total_vpc)
+		return cand->total_vpc < best->total_vpc;
+	if (cand_tier != best_tier)
+		return cand_tier < best_tier;
 	if (cand->avg_heat != best->avg_heat)
 		return cand->avg_heat < best->avg_heat;
 	return hweight16(cand->eligible_mask) > hweight16(best->eligible_mask);
@@ -3865,8 +3880,7 @@ static inline void slc_wp_close_line_locked(struct conv_ftl *conv_ftl, struct li
 		list_add_tail(&wp->curline->entry, &lm->full_line_list);
 		lm->full_line_cnt++;
 	} else {
-		pqueue_insert(lm->victim_line_pq, wp->curline);
-		lm->victim_line_cnt++;
+		wp->curline->pos = 0;
 	}
 
 	wp->curline = NULL;
@@ -3947,6 +3961,85 @@ static int slc_find_free_sb_blk_locked(struct conv_ftl *conv_ftl)
 			return (int)blk;
 	}
 	return -1;
+}
+
+static bool slc_open_aligned_wps_locked(struct conv_ftl *conv_ftl,
+					struct write_pointer *wps,
+					bool count_active)
+{
+	struct ssdparams *spp;
+	uint32_t die_count;
+	uint32_t die;
+	int free_blk;
+	uint32_t blk;
+
+	if (!conv_ftl || !conv_ftl->ssd || !wps || !conv_ftl->slc_lunlm)
+		return false;
+	spp = &conv_ftl->ssd->sp;
+	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+
+	for (die = 0; die < die_count; die++) {
+		if (wps[die].curline)
+			return false;
+	}
+	if (count_active &&
+	    conv_ftl->active_sb_count >= NVMEV_SUPERBLOCK_ACTIVE_LIMIT)
+		return false;
+
+	free_blk = slc_find_free_sb_blk_locked(conv_ftl);
+	if (free_blk < 0)
+		return false;
+	blk = (uint32_t)free_blk;
+
+	for (die = 0; die < die_count; die++) {
+		struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
+		struct line *line;
+		bool found = false;
+
+		if (!lm)
+			goto rollback;
+		list_for_each_entry(line, &lm->free_line_list, entry) {
+			if (line->id == blk) {
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			goto rollback;
+
+		list_del_init(&line->entry);
+		lm->free_line_cnt--;
+		decode_die(spp, die, &wps[die].ch, &wps[die].lun);
+		wps[die].curline = line;
+		wps[die].blk = blk;
+		wps[die].pg = 0;
+		wps[die].pl = 0;
+	}
+
+	if (count_active && conv_ftl->slc_sb_state && blk < spp->blks_per_pl) {
+		conv_ftl->slc_sb_state[blk] = NVMEV_SB_ACTIVE;
+		if (conv_ftl->slc_sb_owner_chain)
+			conv_ftl->slc_sb_owner_chain[blk] = INVALID_CHAIN_ID;
+		if (conv_ftl->slc_sb_die_full_mask)
+			conv_ftl->slc_sb_die_full_mask[blk] = 0;
+		conv_ftl->active_sb_count++;
+	}
+	return true;
+
+rollback:
+	while (die--) {
+		struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
+
+		if (!lm || !wps[die].curline)
+			continue;
+		list_add_tail(&wps[die].curline->entry, &lm->free_line_list);
+		lm->free_line_cnt++;
+		wps[die].curline = NULL;
+		wps[die].blk = 0;
+		wps[die].pg = 0;
+		wps[die].pl = 0;
+	}
+	return false;
 }
 
 /* Reserve line[blk] from each die's free_line_list and install it as the
@@ -4438,15 +4531,19 @@ static void slc_resident_track_page(struct conv_ftl *conv_ftl, uint64_t lpn, uin
 
 static bool slc_has_any_victim(struct conv_ftl *conv_ftl)
 {
-	uint32_t die;
+	uint32_t blk;
 	bool found = false;
 
-	if (!conv_ftl || !conv_ftl->slc_lunlm)
+	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->slc_lunlm)
 		return false;
 
 	spin_lock(&conv_ftl->slc_lock);
-	for (die = 0; die < conv_ftl->die_count; die++) {
-		if (conv_ftl->slc_lunlm[die].victim_line_cnt) {
+	for (blk = 0; blk < conv_ftl->slc_blks_per_pl; blk++) {
+		struct slc_sb_summary_no1 sum;
+
+		if (!slc_sb_collect_summary(conv_ftl, blk, &sum))
+			continue;
+		if (!sum.active && !sum.open_writer && sum.total_ipc) {
 			found = true;
 			break;
 		}
@@ -4650,19 +4747,15 @@ static void slc_apply_line_invalid(struct line_mgmt *lm, uint32_t blk, struct ss
 	bool was_full_line = (line->vpc == spp->pgs_per_lun_line);
 
 	line->ipc++;
-	if (line->pos) {
-		pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
-	} else {
-		if (line->vpc > 0)
-			line->vpc--;
-	}
+	if (line->vpc > 0)
+		line->vpc--;
 
 	if (was_full_line) {
 		list_del_init(&line->entry);
-		lm->full_line_cnt--;
-		pqueue_insert(lm->victim_line_pq, line);
-		lm->victim_line_cnt++;
+		if (lm->full_line_cnt)
+			lm->full_line_cnt--;
 	}
+	line->pos = 0;
 }
 
 static void set_page_prev_link(struct conv_ftl *conv_ftl, uint64_t lpn,
@@ -6375,16 +6468,6 @@ static bool qlc_gc_try_repromote(struct conv_ftl *conv_ftl, uint64_t lpn,
 	if (slc_st.total && (slc_st.free * 100u <= slc_st.total * 20u))
 		return false;
 
-	/* Don't fight for an active SB slot if we're at cap and the chain
-	 * has no SB to land on; let it stay on QLC this round. */
-	if (conv_ftl->active_sb_count >= NVMEV_SUPERBLOCK_ACTIVE_LIMIT &&
-	    conv_ftl->chain_cur_active_sb && conv_ftl->lpn_chain_id) {
-		uint32_t ch = conv_ftl->lpn_chain_id[lpn];
-		if (chain_id_valid(conv_ftl, ch) &&
-		    conv_ftl->chain_cur_active_sb[ch] == U32_MAX)
-			return false;
-	}
-
 	migrate_page_to_slc(conv_ftl, lpn, qlc_ppa, NULL);
 	/* migrate_page_to_slc returns void. Detect success via page_in_slc. */
 	return (conv_ftl->page_in_slc && conv_ftl->page_in_slc[lpn]);
@@ -6644,6 +6727,7 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		line = &lm->lines[line_id];
 		line->ipc = 0;
 		line->vpc = 0;
+		line->pos = 0;
 		list_add_tail(&line->entry, &lm->free_line_list);
 		lm->free_line_cnt++;
 		/* SB state: clear this die's bit; if the SB was CLOSED and now no
@@ -6674,6 +6758,7 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		line = &lm->lines[idx];
 		line->ipc = 0;
 		line->vpc = 0;
+		line->pos = 0;
 		list_add_tail(&line->entry, &lm->free_line_list);
 		lm->free_line_cnt++;
 		spin_unlock(&conv_ftl->qlc_lock);
@@ -6787,9 +6872,10 @@ static int do_gc_superblock_slc(struct conv_ftl *conv_ftl, bool force)
 			if (lm->full_line_cnt)
 				lm->full_line_cnt--;
 		} else {
-			pqueue_remove(lm->victim_line_pq, line);
-			if (lm->victim_line_cnt)
+			if (line->pos && pqueue_remove(lm->victim_line_pq, line) == 0 &&
+			    lm->victim_line_cnt)
 				lm->victim_line_cnt--;
+			line->pos = 0;
 		}
 	}
 	spin_unlock(&conv_ftl->slc_lock);
@@ -6841,8 +6927,7 @@ static int do_gc_superblock_slc(struct conv_ftl *conv_ftl, bool force)
 					list_add_tail(&line->entry, &lm->full_line_list);
 					lm->full_line_cnt++;
 				} else {
-					pqueue_insert(lm->victim_line_pq, line);
-					lm->victim_line_cnt++;
+					line->pos = 0;
 				}
 				spin_unlock(&conv_ftl->slc_lock);
 			}
@@ -6903,14 +6988,14 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 	struct convparams *cpp;
 	uint32_t ch = 0, lun = 0;
 
-	/* SLC pool: prefer SB-level GC so freed blocks land in every die's
-	 * free pool simultaneously. ACTIVE SBs (still being written by some
-	 * chain) are skipped automatically by the selector. */
+	/* SLC pool: use SB-level GC only. ACTIVE SBs (still being written by
+	 * a chain, fallback writer, or GC writer) are skipped by the selector. */
 	if (target_pool == 1 || target_pool == 0) {
 		if (do_gc_superblock_slc(conv_ftl, force) == 0)
 			return 0;
 		if (target_pool == 1)
 			return -1;
+		target_pool = 2; /* ANY fallback must not run legacy per-die SLC GC. */
 	}
 
 	if (!select_victim_line(conv_ftl, force, target_pool, &victim)) {
@@ -6984,8 +7069,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 				struct line_mgmt *lm = get_slc_die_lm(conv_ftl, victim.die);
 				if (lm) {
 					spin_lock(&conv_ftl->slc_lock);
-					pqueue_insert(lm->victim_line_pq, victim.line);
-					lm->victim_line_cnt++;
+					victim.line->pos = 0;
 					spin_unlock(&conv_ftl->slc_lock);
 				}
 			} else {
@@ -7122,8 +7206,12 @@ static int do_gc_for_die(struct conv_ftl *conv_ftl, uint32_t target_die, bool is
 		if (gc_failed && victim_line->vpc > 0) {
 			spinlock_t *lock = is_slc ? &conv_ftl->slc_lock : &conv_ftl->qlc_lock;
 			spin_lock(lock);
-			pqueue_insert(lm->victim_line_pq, victim_line);
-			lm->victim_line_cnt++;
+			if (is_slc) {
+				victim_line->pos = 0;
+			} else {
+				pqueue_insert(lm->victim_line_pq, victim_line);
+				lm->victim_line_cnt++;
+			}
 			spin_unlock(lock);
 			return -1;
 		}
@@ -7398,7 +7486,6 @@ retry_get_page:
 
 static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	struct nand_page *pg;
 	uint32_t die, tried;
@@ -7421,23 +7508,13 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
 			continue;
 
 		if (!wp->curline) {
-			struct line *curline;
-
 			spin_lock(&conv_ftl->slc_lock);
-			curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-			if (!curline) {
-				spin_unlock(&conv_ftl->slc_lock);
-				continue;
-			}
-
-			list_del_init(&curline->entry);
-			lm->free_line_cnt--;
-			decode_die(spp, die, &wp->ch, &wp->lun);
-			wp->curline = curline;
-			wp->blk = curline->id;
-			wp->pg = 0;
-			wp->pl = 0;
+			(void)slc_open_aligned_wps_locked(conv_ftl,
+							  conv_ftl->slc_lunwp,
+							  true);
 			spin_unlock(&conv_ftl->slc_lock);
+			if (!wp->curline)
+				continue;
 		}
 
 		if (tried > 0)
@@ -7475,6 +7552,8 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct write_pointer *wp;
 	struct line_mgmt *lm;
+	uint32_t blk_filled = 0;
+	bool die_filled = false;
 
 	if (!conv_ftl->slc_lunwp) {
 		NVMEV_ERROR("advance_slc_write_pointer called before SLC write pointers were initialized\n");
@@ -7499,31 +7578,22 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die)
 	wp->pg++;
 
 	if (wp->pg >= spp->pgs_per_blk) {
+		blk_filled = wp->blk;
+		die_filled = true;
 		spin_lock(&conv_ftl->slc_lock);
 		if (wp->curline->vpc == spp->pgs_per_lun_line) {
 			list_add_tail(&wp->curline->entry, &lm->full_line_list);
 			lm->full_line_cnt++;
 		} else {
-			pqueue_insert(lm->victim_line_pq, wp->curline);
-			lm->victim_line_cnt++;
+			wp->curline->pos = 0;
 		}
 
-		wp->curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-		if (!wp->curline) {
-			NVMEV_ERROR("No free SLC line available when advancing WP (die=%u)!\n", die);
-			wp->curline = NULL;
-			spin_unlock(&conv_ftl->slc_lock);
-			return;
-		}
-
-		NVMEV_DEBUG("advance_slc_write_pointer: Allocated new SLC line with ID %u for die %u\n",
-			    wp->curline->id, die);
-		list_del_init(&wp->curline->entry);
-		lm->free_line_cnt--;
-
-		wp->blk = wp->curline->id;
+		wp->curline = NULL;
+		wp->blk = 0;
 		wp->pg = 0;
 		wp->pl = 0;
+		if (die_filled)
+			slc_sb_note_die_full_locked(conv_ftl, blk_filled, die);
 		spin_unlock(&conv_ftl->slc_lock);
 	}
 
@@ -7534,7 +7604,6 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die)
 /* GC 专用 SLC 页面获取, 支持 die fallback */
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	struct write_pointer *wp;
 	struct line_mgmt *lm;
@@ -7556,23 +7625,13 @@ static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die)
 			continue;
 
 		if (!wp->curline) {
-			struct line *curline;
-
 			spin_lock(&conv_ftl->slc_lock);
-			curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-			if (!curline) {
-				spin_unlock(&conv_ftl->slc_lock);
-				continue;
-			}
-
-			list_del_init(&curline->entry);
-			lm->free_line_cnt--;
-			decode_die(spp, candidate, &wp->ch, &wp->lun);
-			wp->curline = curline;
-			wp->blk = curline->id;
-			wp->pg = 0;
-			wp->pl = 0;
+			(void)slc_open_aligned_wps_locked(conv_ftl,
+							  conv_ftl->gc_slc_lunwp,
+							  false);
 			spin_unlock(&conv_ftl->slc_lock);
+			if (!wp->curline)
+				continue;
 		}
 
 retry_gc_get_page:
@@ -7606,6 +7665,8 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct write_pointer *wp;
 	struct line_mgmt *lm;
+	uint32_t blk_filled = 0;
+	bool die_filled = false;
 
 	if (!conv_ftl->gc_slc_lunwp)
 		return;
@@ -7626,28 +7687,22 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 
 	wp->pg++;
 	if (wp->pg >= spp->pgs_per_blk) {
+		blk_filled = wp->blk;
+		die_filled = true;
 		spin_lock(&conv_ftl->slc_lock);
 		if (wp->curline->vpc == spp->pgs_per_lun_line) {
 			list_add_tail(&wp->curline->entry, &lm->full_line_list);
 			lm->full_line_cnt++;
 		} else {
-			pqueue_insert(lm->victim_line_pq, wp->curline);
-			lm->victim_line_cnt++;
+			wp->curline->pos = 0;
 		}
 
-		wp->curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-		if (!wp->curline) {
-			NVMEV_ERROR("No free SLC line available for GC during advance (die=%u)!\n", die);
-			wp->curline = NULL;
-			spin_unlock(&conv_ftl->slc_lock);
-			return;
-		}
-
-		list_del_init(&wp->curline->entry);
-		lm->free_line_cnt--;
-		wp->blk = wp->curline->id;
+		wp->curline = NULL;
+		wp->blk = 0;
 		wp->pg = 0;
 		wp->pl = 0;
+		if (die_filled)
+			slc_sb_note_die_full_locked(conv_ftl, blk_filled, die);
 		spin_unlock(&conv_ftl->slc_lock);
 	}
 
@@ -8848,8 +8903,6 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 	struct line_pool_stats slc_stats;
 	bool test_phase_bg_tracked = false;
 	bool was_in_slc = false;
-	bool chain_valid;
-	bool use_chain_alloc = false;
 
 	if (!conv_ftl || !qlc_ppa)
 		return;
@@ -8885,44 +8938,17 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 					       CHAIN_TIER_SLC, false);
 	decode_die(spp, die_index, &target_ch, &target_lun);
 
-	chain_valid = chain_id_valid(conv_ftl, chain_id);
-	if (chain_valid && conv_ftl->chain_cur_active_sb && conv_ftl->slc_sb_state) {
-		uint32_t cur_blk;
-
-		spin_lock(&conv_ftl->slc_lock);
-		cur_blk = conv_ftl->chain_cur_active_sb[chain_id];
-		if (cur_blk != U32_MAX &&
-		    cur_blk < spp->blks_per_pl &&
-		    conv_ftl->slc_sb_state[cur_blk] == NVMEV_SB_ACTIVE)
-			use_chain_alloc = true;
-		else if (conv_ftl->active_sb_count < NVMEV_SUPERBLOCK_ACTIVE_LIMIT)
-			use_chain_alloc = true;
-		spin_unlock(&conv_ftl->slc_lock);
-
-		if (!use_chain_alloc) {
-			NVMEV_DEBUG("migrate_page_to_slc: skip chain=%u because active SB cap is full\n",
-				    chain_id);
-			conv_ftl->repromote_skip_active_cap++;
-			test_phase_note_bg_end(conv_ftl, test_phase_bg_tracked);
-			return;
+	/* Repromotion is an internal hot-page migration, not host append.
+	 * Put it into the internal SLC GC/repromotion SB so it does not consume
+	 * the 14 host-active-SB budget. */
+	if (conv_ftl->gc_slc_lunwp) {
+		struct write_pointer *gc_wp = &conv_ftl->gc_slc_lunwp[die_index];
+		if (!gc_wp->curline || gc_wp->pg == 0) {
+			gc_wp->ch = target_ch;
+			gc_wp->lun = target_lun;
 		}
 	}
-
-	if (use_chain_alloc) {
-		new_ppa = get_new_chain_slc_page(conv_ftl, chain_id, die_index);
-	} else {
-		/* Initialize GC WP if needed. Non-chain repromotion keeps the legacy
-		 * GC pool; chain-owned pages must not fall back here because that would
-		 * bypass the 14-active-SB state machine. */
-		if (conv_ftl->gc_slc_lunwp) {
-			struct write_pointer *gc_wp = &conv_ftl->gc_slc_lunwp[die_index];
-			if (!gc_wp->curline || gc_wp->pg == 0) {
-				gc_wp->ch = target_ch;
-				gc_wp->lun = target_lun;
-			}
-		}
-		new_ppa = get_new_gc_slc_page(conv_ftl, die_index);
-	}
+	new_ppa = get_new_gc_slc_page(conv_ftl, die_index);
 	if (!mapped_ppa(&new_ppa)) {
 		NVMEV_ERROR("migrate_page_to_slc: Failed to allocate SLC page for back-migration\n");
 		test_phase_note_bg_end(conv_ftl, test_phase_bg_tracked);
@@ -8987,14 +9013,8 @@ static void migrate_page_to_slc(struct conv_ftl *conv_ftl, uint64_t lpn, struct 
 		slc_resident_track_page(conv_ftl, lpn, encode_die(spp, &new_ppa));
 
 	/* Advance the allocator that produced the destination page. */
-	if (use_chain_alloc)
-		advance_chain_slc_write_pointer(conv_ftl, chain_id, encode_die(spp, &new_ppa));
-	else
-		advance_gc_slc_write_pointer(conv_ftl, encode_die(spp, &new_ppa));
-	if (use_chain_alloc)
-		conv_ftl->repromote_chain_alloc_pages++;
-	else
-		conv_ftl->repromote_gc_pool_pages++;
+	advance_gc_slc_write_pointer(conv_ftl, encode_die(spp, &new_ppa));
+	conv_ftl->repromote_gc_pool_pages++;
 	internal_place_note_lpn_write(conv_ftl, lpn, CHAIN_TIER_SLC,
 				      false, encode_die(spp, &new_ppa));
 

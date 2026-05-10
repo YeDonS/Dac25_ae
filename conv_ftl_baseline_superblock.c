@@ -726,9 +726,19 @@ static void collect_pool_stats(struct conv_ftl *conv_ftl, bool slc,
 				all_full = false;
 			if (line->pos || line->ipc > 0)
 				any_victim = true;
-			if (line->pos == 0 && list_empty(&line->entry) &&
-			    line->vpc < pages_per_line)
+			if (slc) {
+				struct write_pointer *host_wp = conv_ftl->slc_lunwp ?
+					&conv_ftl->slc_lunwp[die] : NULL;
+				struct write_pointer *gc_wp = conv_ftl->gc_slc_lunwp ?
+					&conv_ftl->gc_slc_lunwp[die] : NULL;
+
+				if ((host_wp && host_wp->curline == line) ||
+				    (gc_wp && gc_wp->curline == line))
+					any_open = true;
+			} else if (line->pos == 0 && list_empty(&line->entry) &&
+				   line->vpc < pages_per_line) {
 				any_open = true;
+			}
 		}
 
 		if (all_free) {
@@ -2507,15 +2517,40 @@ static void slc_resident_track_page(struct conv_ftl *conv_ftl, uint64_t lpn, uin
 
 static bool slc_has_any_victim(struct conv_ftl *conv_ftl)
 {
+	uint32_t blk;
 	uint32_t die;
+	uint32_t line_cnt;
 	bool found = false;
 
-	if (!conv_ftl || !conv_ftl->slc_lunlm)
+	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->slc_lunlm)
 		return false;
 
+	line_cnt = conv_ftl->slc_blks_per_pl;
 	spin_lock(&conv_ftl->slc_lock);
-	for (die = 0; die < conv_ftl->die_count; die++) {
-		if (conv_ftl->slc_lunlm[die].victim_line_cnt) {
+	for (blk = 0; blk < line_cnt && !found; blk++) {
+		uint32_t total_ipc = 0;
+		bool open_writer = false;
+
+		for (die = 0; die < conv_ftl->die_count; die++) {
+			struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
+			struct write_pointer *host_wp = conv_ftl->slc_lunwp ?
+				&conv_ftl->slc_lunwp[die] : NULL;
+			struct write_pointer *gc_wp = conv_ftl->gc_slc_lunwp ?
+				&conv_ftl->gc_slc_lunwp[die] : NULL;
+			struct line *line;
+
+			if (!lm || !lm->lines || blk >= lm->tt_lines)
+				continue;
+			line = &lm->lines[blk];
+			if ((host_wp && host_wp->curline == line) ||
+			    (gc_wp && gc_wp->curline == line)) {
+				open_writer = true;
+				break;
+			}
+			total_ipc += line->ipc;
+		}
+
+		if (!open_writer && total_ipc) {
 			found = true;
 			break;
 		}
@@ -2719,19 +2754,15 @@ static void slc_apply_line_invalid(struct line_mgmt *lm, uint32_t blk, struct ss
 	bool was_full_line = (line->vpc == spp->pgs_per_lun_line);
 
 	line->ipc++;
-	if (line->pos) {
-		pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
-	} else {
-		if (line->vpc > 0)
-			line->vpc--;
-	}
+	if (line->vpc > 0)
+		line->vpc--;
 
 	if (was_full_line) {
 		list_del_init(&line->entry);
-		lm->full_line_cnt--;
-		pqueue_insert(lm->victim_line_pq, line);
-		lm->victim_line_cnt++;
+		if (lm->full_line_cnt)
+			lm->full_line_cnt--;
 	}
+	line->pos = 0;
 }
 
 static void set_page_prev_link(struct conv_ftl *conv_ftl, uint64_t lpn,
@@ -4524,6 +4555,7 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		line = &lm->lines[line_id];
 		line->ipc = 0;
 		line->vpc = 0;
+		line->pos = 0;
 		list_add_tail(&line->entry, &lm->free_line_list);
 		lm->free_line_cnt++;
 		spin_unlock(&conv_ftl->slc_lock);
@@ -4542,6 +4574,7 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 		line = &lm->lines[idx];
 		line->ipc = 0;
 		line->vpc = 0;
+		line->pos = 0;
 		list_add_tail(&line->entry, &lm->free_line_list);
 		lm->free_line_cnt++;
 		spin_unlock(&conv_ftl->qlc_lock);
@@ -4696,9 +4729,10 @@ static int do_gc_superblock_slc(struct conv_ftl *conv_ftl, bool force)
 			if (lm->full_line_cnt)
 				lm->full_line_cnt--;
 		} else {
-			pqueue_remove(lm->victim_line_pq, line);
-			if (lm->victim_line_cnt)
+			if (line->pos && pqueue_remove(lm->victim_line_pq, line) == 0 &&
+			    lm->victim_line_cnt)
 				lm->victim_line_cnt--;
+			line->pos = 0;
 		}
 	}
 	spin_unlock(&conv_ftl->slc_lock);
@@ -4754,8 +4788,7 @@ static int do_gc_superblock_slc(struct conv_ftl *conv_ftl, bool force)
 					list_add_tail(&line->entry, &lm->full_line_list);
 					lm->full_line_cnt++;
 				} else {
-					pqueue_insert(lm->victim_line_pq, line);
-					lm->victim_line_cnt++;
+					line->pos = 0;
 				}
 				spin_unlock(&conv_ftl->slc_lock);
 			}
@@ -4808,13 +4841,13 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 
 	/* If caller asks for SLC (target_pool == 1) or ANY pool (== 0),
 	 * try SB-level SLC GC first. On success we're done. On failure we
-	 * fall through to legacy per-die selection (covers the QLC pool and
-	 * the rare case where no eligible SB exists yet). */
+	 * only fall through to legacy QLC selection; SLC must remain SB-level. */
 	if (target_pool == 1 || target_pool == 0) {
 		if (do_gc_superblock_slc(conv_ftl, force) == 0)
 			return 0;
 		if (target_pool == 1)
 			return -1;  /* SLC-only request and SB GC found nothing */
+		target_pool = 2; /* ANY fallback must not run legacy per-die SLC GC. */
 	}
 
 	if (!select_victim_line(conv_ftl, force, target_pool, &victim)) {
@@ -4875,8 +4908,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 				struct line_mgmt *lm = get_slc_die_lm(conv_ftl, victim.die);
 				if (lm) {
 					spin_lock(&conv_ftl->slc_lock);
-					pqueue_insert(lm->victim_line_pq, victim.line);
-					lm->victim_line_cnt++;
+					victim.line->pos = 0;
 					spin_unlock(&conv_ftl->slc_lock);
 				}
 			} else {
@@ -5014,8 +5046,12 @@ static int do_gc_for_die(struct conv_ftl *conv_ftl, uint32_t target_die, bool is
 		if (gc_failed && victim_line->vpc > 0) {
 			spinlock_t *lock = is_slc ? &conv_ftl->slc_lock : &conv_ftl->qlc_lock;
 			spin_lock(lock);
-			pqueue_insert(lm->victim_line_pq, victim_line);
-			lm->victim_line_cnt++;
+			if (is_slc) {
+				victim_line->pos = 0;
+			} else {
+				pqueue_insert(lm->victim_line_pq, victim_line);
+				lm->victim_line_cnt++;
+			}
 			spin_unlock(lock);
 			return -1;
 		}
@@ -5155,7 +5191,8 @@ static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id)
  *
  * Caller holds slc_lock.
  */
-static bool baseline_try_open_aligned_sb_locked(struct conv_ftl *conv_ftl)
+static bool baseline_try_open_aligned_sb_wps_locked(struct conv_ftl *conv_ftl,
+						    struct write_pointer *wps)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	uint32_t die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
@@ -5164,7 +5201,7 @@ static bool baseline_try_open_aligned_sb_locked(struct conv_ftl *conv_ftl)
 	struct line *line0;
 
 	for (die = 0; die < die_count; die++) {
-		if (!conv_ftl->slc_lunwp || conv_ftl->slc_lunwp[die].curline)
+		if (!wps || wps[die].curline)
 			return false;
 	}
 
@@ -5194,7 +5231,7 @@ static bool baseline_try_open_aligned_sb_locked(struct conv_ftl *conv_ftl)
 
 		/* reserve line[blk] across all dies */
 		for (die = 0; die < die_count; die++) {
-			struct write_pointer *wp = &conv_ftl->slc_lunwp[die];
+			struct write_pointer *wp = &wps[die];
 			struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
 			struct line *line = NULL;
 			struct line *l;
@@ -5217,6 +5254,12 @@ static bool baseline_try_open_aligned_sb_locked(struct conv_ftl *conv_ftl)
 		return true;
 	}
 	return false;
+}
+
+static bool baseline_try_open_aligned_sb_locked(struct conv_ftl *conv_ftl)
+{
+	return baseline_try_open_aligned_sb_wps_locked(conv_ftl,
+						      conv_ftl->slc_lunwp);
 }
 
 static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl)
@@ -5324,8 +5367,7 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die)
 			list_add_tail(&wp->curline->entry, &lm->full_line_list);
 			lm->full_line_cnt++;
 		} else {
-			pqueue_insert(lm->victim_line_pq, wp->curline);
-			lm->victim_line_cnt++;
+			wp->curline->pos = 0;
 		}
 
 		wp->curline = NULL;
@@ -5342,7 +5384,6 @@ static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die)
 /* GC 专用 SLC 页面获取, 支持 die fallback */
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	struct write_pointer *wp;
 	struct line_mgmt *lm;
@@ -5364,23 +5405,12 @@ static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die)
 			continue;
 
 		if (!wp->curline) {
-			struct line *curline;
-
 			spin_lock(&conv_ftl->slc_lock);
-			curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-			if (!curline) {
-				spin_unlock(&conv_ftl->slc_lock);
-				continue;
-			}
-
-			list_del_init(&curline->entry);
-			lm->free_line_cnt--;
-			decode_die(spp, candidate, &wp->ch, &wp->lun);
-			wp->curline = curline;
-			wp->blk = curline->id;
-			wp->pg = 0;
-			wp->pl = 0;
+			(void)baseline_try_open_aligned_sb_wps_locked(conv_ftl,
+								      conv_ftl->gc_slc_lunwp);
 			spin_unlock(&conv_ftl->slc_lock);
+			if (!wp->curline)
+				continue;
 		}
 
 retry_gc_get_page:
@@ -5439,21 +5469,11 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 			list_add_tail(&wp->curline->entry, &lm->full_line_list);
 			lm->full_line_cnt++;
 		} else {
-			pqueue_insert(lm->victim_line_pq, wp->curline);
-			lm->victim_line_cnt++;
+			wp->curline->pos = 0;
 		}
 
-		wp->curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
-		if (!wp->curline) {
-			NVMEV_ERROR("No free SLC line available for GC during advance (die=%u)!\n", die);
-			wp->curline = NULL;
-			spin_unlock(&conv_ftl->slc_lock);
-			return;
-		}
-
-		list_del_init(&wp->curline->entry);
-		lm->free_line_cnt--;
-		wp->blk = wp->curline->id;
+		wp->curline = NULL;
+		wp->blk = 0;
 		wp->pg = 0;
 		wp->pl = 0;
 		spin_unlock(&conv_ftl->slc_lock);
