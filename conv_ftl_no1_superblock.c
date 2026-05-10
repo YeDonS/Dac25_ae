@@ -1420,11 +1420,15 @@ static uint32_t migrate_chain_superblock_from_slc(struct conv_ftl *conv_ftl,
 						  uint32_t blk_id,
 						  uint32_t budget,
 						  uint64_t dyn_thresh);
-static uint32_t migrate_some_cold_from_slc_superblocks(struct conv_ftl *conv_ftl,
+static uint32_t migrate_pure_cold_superblocks_from_slc(struct conv_ftl *conv_ftl,
 						       uint32_t max_pages,
 						       uint64_t dyn_thresh,
 						       uint32_t *sampled_out,
 						       uint32_t *blocks_out);
+static uint32_t migrate_coldest_mixed_superblock_from_slc(struct conv_ftl *conv_ftl,
+							  uint32_t max_pages,
+							  uint32_t *sampled_out,
+							  uint32_t *blocks_out);
 static void superblock_stats_log_summary(struct conv_ftl *conv_ftl, const char *phase);
 
 struct chain_heat_summary {
