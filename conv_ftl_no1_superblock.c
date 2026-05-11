@@ -1429,6 +1429,10 @@ static uint32_t migrate_coldest_mixed_superblock_from_slc(struct conv_ftl *conv_
 							  uint32_t max_pages,
 							  uint32_t *sampled_out,
 							  uint32_t *blocks_out);
+static uint32_t migrate_coldest_superblock_to_victim_queue_from_slc(struct conv_ftl *conv_ftl,
+								    uint32_t max_pages,
+								    uint32_t *sampled_out,
+								    uint32_t *blocks_out);
 static void superblock_stats_log_summary(struct conv_ftl *conv_ftl, const char *phase);
 
 struct chain_heat_summary {
@@ -1647,10 +1651,7 @@ static uint32_t migrate_some_cold_from_slc_chain(struct conv_ftl *conv_ftl, uint
 	(void)mixed_migrated_out;
 	return 0;
 #else
-	uint32_t pure_sampled = 0, pure_blocks = 0;
-	uint32_t mixed_sampled = 0, mixed_blocks = 0;
-	uint32_t pure_migrated = 0;
-	uint32_t mixed_migrated = 0;
+	uint32_t sampled = 0, blocks = 0;
 	uint32_t migrated = 0;
 
 	if (sampled_out)
@@ -1664,32 +1665,22 @@ static uint32_t migrate_some_cold_from_slc_chain(struct conv_ftl *conv_ftl, uint
 		return 0;
 
 	(void)target_die;
-	/* Physical-SB migration layers:
-	 *   1) pure cold SBs: strict owner/purity/coldness gate.
-	 *   2) mixed SBs: choose the mixed SB with lowest average read count.
-	 *
-	 * The old chain-first path did: for each chain -> scan every block, so
-	 * the same physical block was counted hundreds of times when many chains
-	 * existed. These layers scan physical SBs directly and never multiply by
-	 * chain count. */
-	pure_migrated = migrate_pure_cold_superblocks_from_slc(conv_ftl, max_pages,
-							       dyn_thresh,
-							       &pure_sampled,
-							       &pure_blocks);
-	if (pure_migrated < max_pages)
-		mixed_migrated =
-			migrate_coldest_mixed_superblock_from_slc(conv_ftl,
-								  max_pages - pure_migrated,
-								  &mixed_sampled,
-								  &mixed_blocks);
-	migrated = pure_migrated + mixed_migrated;
+	(void)dyn_thresh;
+	/* Single-layer physical-SB migration: choose the coldest processed SB by
+	 * average heat, migrate what can be demoted to QLC, then mark that SB as
+	 * the only eligible source for later SLC GC. GC will rank this migrated
+	 * set by invalid pages instead of scanning unrelated mixed SBs. */
+	migrated = migrate_coldest_superblock_to_victim_queue_from_slc(conv_ftl,
+								       max_pages,
+								       &sampled,
+								       &blocks);
 
 	if (sampled_out)
-		*sampled_out = pure_sampled + mixed_sampled;
+		*sampled_out = sampled;
 	if (blocks_out)
-		*blocks_out = pure_blocks + mixed_blocks;
+		*blocks_out = blocks;
 	if (mixed_migrated_out)
-		*mixed_migrated_out = mixed_migrated;
+		*mixed_migrated_out = migrated;
 	return migrated;
 #endif
 }
@@ -2941,6 +2932,7 @@ struct superblock_health_snapshot {
 	uint32_t sb_state_active;
 	uint32_t sb_state_closed;
 	uint32_t sb_state_unknown;
+	uint32_t sb_state_active_counted;
 	uint32_t sb_used;
 	uint32_t sb_open_writer;
 	uint32_t sb_pure90;
@@ -3000,6 +2992,10 @@ static void superblock_collect_health(struct conv_ftl *conv_ftl,
 		} else {
 			snap->sb_state_unknown++;
 		}
+		if (conv_ftl->slc_sb_active_counted &&
+		    blk_id < spp->blks_per_pl &&
+		    conv_ftl->slc_sb_active_counted[blk_id])
+			snap->sb_state_active_counted++;
 
 		if (!slc_sb_collect_summary(conv_ftl, blk_id, &sum))
 			continue;
@@ -3078,6 +3074,7 @@ static void superblock_stats_print(struct seq_file *m, struct conv_ftl *conv_ftl
 	seq_printf(m, "sb_state_active %u\n", snap->sb_state_active);
 	seq_printf(m, "sb_state_closed %u\n", snap->sb_state_closed);
 	seq_printf(m, "sb_state_unknown %u\n", snap->sb_state_unknown);
+	seq_printf(m, "sb_state_active_counted %u\n", snap->sb_state_active_counted);
 	seq_printf(m, "sb_used %u\n", snap->sb_used);
 	seq_printf(m, "sb_open_writer %u\n", snap->sb_open_writer);
 	seq_printf(m, "sb_pure_ge90 %u\n", snap->sb_pure90);
@@ -3096,6 +3093,14 @@ static void superblock_stats_print(struct seq_file *m, struct conv_ftl *conv_ftl
 		   (unsigned long long)conv_ftl->slc_sb_migration_attempts);
 	seq_printf(m, "slc_sb_migration_pages %llu\n",
 		   (unsigned long long)conv_ftl->slc_sb_migration_pages);
+	seq_printf(m, "slc_sb_migrated_victim_queued %u\n",
+		   conv_ftl->slc_sb_migrated_victim_count);
+	seq_printf(m, "slc_sb_migrated_victim_enqueues %llu\n",
+		   (unsigned long long)conv_ftl->slc_sb_migration_victim_enqueues);
+	seq_printf(m, "slc_sb_migrated_victim_dequeues %llu\n",
+		   (unsigned long long)conv_ftl->slc_sb_migration_victim_dequeues);
+	seq_printf(m, "slc_sb_migrated_victim_stale %llu\n",
+		   (unsigned long long)conv_ftl->slc_sb_migration_victim_stale);
 	seq_printf(m, "chain_block_migration_attempts %llu\n",
 		   (unsigned long long)conv_ftl->chain_block_migration_attempts);
 	seq_printf(m, "chain_block_migration_pages %llu\n",
@@ -3571,10 +3576,10 @@ static uint8_t slc_sb_summary_tier(const struct slc_sb_summary_no1 *sum,
 	return 3;
 }
 
-static bool slc_sb_summary_better(const struct slc_sb_summary_no1 *cand,
-				  uint8_t cand_tier,
-				  const struct slc_sb_summary_no1 *best,
-				  uint8_t best_tier)
+static bool __maybe_unused slc_sb_summary_better(const struct slc_sb_summary_no1 *cand,
+						 uint8_t cand_tier,
+						 const struct slc_sb_summary_no1 *best,
+						 uint8_t best_tier)
 {
 	if (!best)
 		return true;
@@ -3750,14 +3755,66 @@ static bool slc_mixed_sb_summary_better(const struct slc_sb_summary_no1 *cand,
 		return true;
 	if (cand->avg_heat != best->avg_heat)
 		return cand->avg_heat < best->avg_heat;
-	if (cand->heat_count != best->heat_count)
-		return cand->heat_count > best->heat_count;
-	if (cand->total_vpc != best->total_vpc)
-		return cand->total_vpc > best->total_vpc;
 	return cand->blk_id < best->blk_id;
 }
 
-static uint32_t migrate_pure_cold_superblocks_from_slc(struct conv_ftl *conv_ftl,
+static void slc_migrated_victim_remove_locked(struct conv_ftl *conv_ftl, uint32_t blk_id)
+{
+	if (!conv_ftl || !conv_ftl->slc_sb_migrated_victim ||
+	    blk_id >= conv_ftl->slc_blks_per_pl)
+		return;
+	if (!conv_ftl->slc_sb_migrated_victim[blk_id])
+		return;
+	conv_ftl->slc_sb_migrated_victim[blk_id] = 0;
+	if (conv_ftl->slc_sb_migrated_victim_count)
+		conv_ftl->slc_sb_migrated_victim_count--;
+}
+
+static bool slc_migrated_victim_enqueue_locked(struct conv_ftl *conv_ftl,
+					       uint32_t blk_id)
+{
+	if (!conv_ftl || !conv_ftl->slc_sb_migrated_victim ||
+	    blk_id >= conv_ftl->slc_blks_per_pl)
+		return false;
+	if (conv_ftl->slc_sb_migrated_victim[blk_id])
+		return true;
+	conv_ftl->slc_sb_migrated_victim[blk_id] = 1;
+	conv_ftl->slc_sb_migrated_victim_count++;
+	conv_ftl->slc_sb_migration_victim_enqueues++;
+	return true;
+}
+
+static bool slc_migrated_victim_enqueue(struct conv_ftl *conv_ftl,
+					uint32_t blk_id)
+{
+	bool queued;
+
+	if (!conv_ftl)
+		return false;
+	spin_lock(&conv_ftl->slc_lock);
+	queued = slc_migrated_victim_enqueue_locked(conv_ftl, blk_id);
+	spin_unlock(&conv_ftl->slc_lock);
+	return queued;
+}
+
+static bool slc_migration_sb_better(const struct slc_sb_summary_no1 *cand,
+				    const struct slc_sb_summary_no1 *best,
+				    bool have_best)
+{
+	if (!cand)
+		return false;
+	if (!have_best || !best)
+		return true;
+	if (cand->total_vpc == 0 && best->total_vpc != 0)
+		return true;
+	if (cand->total_vpc != 0 && best->total_vpc == 0)
+		return false;
+	if (cand->avg_heat != best->avg_heat)
+		return cand->avg_heat < best->avg_heat;
+	return cand->blk_id < best->blk_id;
+}
+
+static uint32_t __maybe_unused migrate_pure_cold_superblocks_from_slc(struct conv_ftl *conv_ftl,
 						       uint32_t max_pages,
 						       uint64_t dyn_thresh,
 						       uint32_t *sampled_out,
@@ -3803,7 +3860,7 @@ static uint32_t migrate_pure_cold_superblocks_from_slc(struct conv_ftl *conv_ftl
 	return migrated;
 }
 
-static uint32_t migrate_coldest_mixed_superblock_from_slc(struct conv_ftl *conv_ftl,
+static uint32_t __maybe_unused migrate_coldest_mixed_superblock_from_slc(struct conv_ftl *conv_ftl,
 							  uint32_t max_pages,
 							  uint32_t *sampled_out,
 							  uint32_t *blocks_out)
@@ -3842,6 +3899,55 @@ static uint32_t migrate_coldest_mixed_superblock_from_slc(struct conv_ftl *conv_
 	if (!have_best)
 		return 0;
 	return migrate_superblock_valid_pages_from_slc(conv_ftl, best.blk_id, max_pages);
+}
+
+static uint32_t migrate_coldest_superblock_to_victim_queue_from_slc(struct conv_ftl *conv_ftl,
+								    uint32_t max_pages,
+								    uint32_t *sampled_out,
+								    uint32_t *blocks_out)
+{
+	struct slc_sb_summary_no1 best;
+	bool have_best = false;
+	uint32_t blk_id;
+	uint32_t moved = 0;
+
+	if (sampled_out)
+		*sampled_out = 0;
+	if (blocks_out)
+		*blocks_out = 0;
+	if (!conv_ftl || !conv_ftl->ssd || !max_pages)
+		return 0;
+
+	memset(&best, 0, sizeof(best));
+	for (blk_id = 0; blk_id < conv_ftl->slc_blks_per_pl; blk_id++) {
+		struct slc_sb_summary_no1 sum;
+
+		if (blocks_out)
+			(*blocks_out)++;
+		if (conv_ftl->slc_sb_migrated_victim &&
+		    conv_ftl->slc_sb_migrated_victim[blk_id])
+			continue;
+		if (!slc_sb_collect_summary(conv_ftl, blk_id, &sum))
+			continue;
+		if (sampled_out)
+			*sampled_out += sum.heat_count;
+		if (sum.active || sum.open_writer)
+			continue;
+		if (sum.total_vpc == 0 && sum.total_ipc == 0)
+			continue;
+		if (slc_migration_sb_better(&sum, &best, have_best)) {
+			best = sum;
+			have_best = true;
+		}
+	}
+
+	if (!have_best)
+		return 0;
+	if (best.total_vpc)
+		moved = migrate_superblock_valid_pages_from_slc(conv_ftl, best.blk_id, max_pages);
+	if (!slc_migrated_victim_enqueue(conv_ftl, best.blk_id))
+		return moved;
+	return moved;
 }
 
 static struct write_pointer *get_chain_host_slc_wp(struct conv_ftl *conv_ftl, uint32_t chain_id,
@@ -4078,13 +4184,20 @@ static bool slc_open_aligned_wps_locked(struct conv_ftl *conv_ftl,
 		wps[die].pl = 0;
 	}
 
-	if (count_active && conv_ftl->slc_sb_state && blk < spp->blks_per_pl) {
+	if (conv_ftl->slc_sb_state && blk < spp->blks_per_pl) {
+		slc_migrated_victim_remove_locked(conv_ftl, blk);
 		conv_ftl->slc_sb_state[blk] = NVMEV_SB_ACTIVE;
 		if (conv_ftl->slc_sb_owner_chain)
 			conv_ftl->slc_sb_owner_chain[blk] = INVALID_CHAIN_ID;
 		if (conv_ftl->slc_sb_die_full_mask)
 			conv_ftl->slc_sb_die_full_mask[blk] = 0;
-		conv_ftl->active_sb_count++;
+		if (conv_ftl->slc_sb_active_counted) {
+			conv_ftl->slc_sb_active_counted[blk] = count_active ? 1 : 0;
+			if (count_active)
+				conv_ftl->active_sb_count++;
+		} else if (count_active) {
+			conv_ftl->active_sb_count++;
+		}
 	}
 	return true;
 
@@ -4153,14 +4266,23 @@ static bool slc_open_chain_active_sb_locked(struct conv_ftl *conv_ftl,
 	}
 
 	if (conv_ftl->slc_sb_state && blk < spp->blks_per_pl) {
+		bool was_active = conv_ftl->slc_sb_state[blk] == NVMEV_SB_ACTIVE;
+
 		/* If state was stale CLOSED (all dies got erased without explicit
 		 * transition), reset cleanly before going ACTIVE. */
-		if (conv_ftl->slc_sb_state[blk] != NVMEV_SB_ACTIVE) {
+		if (!was_active) {
+			slc_migrated_victim_remove_locked(conv_ftl, blk);
 			conv_ftl->slc_sb_state[blk] = NVMEV_SB_ACTIVE;
 			if (conv_ftl->slc_sb_owner_chain)
 				conv_ftl->slc_sb_owner_chain[blk] = chain_id;
 			if (conv_ftl->slc_sb_die_full_mask)
 				conv_ftl->slc_sb_die_full_mask[blk] = 0;
+		}
+		if (conv_ftl->slc_sb_active_counted &&
+		    !conv_ftl->slc_sb_active_counted[blk]) {
+			conv_ftl->slc_sb_active_counted[blk] = 1;
+			conv_ftl->active_sb_count++;
+		} else if (!conv_ftl->slc_sb_active_counted && !was_active) {
 			conv_ftl->active_sb_count++;
 		}
 	}
@@ -4238,8 +4360,9 @@ static uint32_t slc_pick_share_target_locked(struct conv_ftl *conv_ftl,
 }
 
 /* Mark SB blk's portion on `die` as full. When all dies are full, transition
- * NVMEV_SB_ACTIVE -> NVMEV_SB_CLOSED, decrement active_sb_count, and clear any chain's
- * chain_cur_active_sb that points to this SB. Caller holds slc_lock.
+ * NVMEV_SB_ACTIVE -> NVMEV_SB_CLOSED, drop any counted active-cap reference,
+ * and clear any chain's chain_cur_active_sb that points to this SB. Caller
+ * holds slc_lock.
  */
 static void slc_sb_note_die_full_locked(struct conv_ftl *conv_ftl,
 					uint32_t blk, uint32_t die)
@@ -4270,8 +4393,15 @@ static void slc_sb_note_die_full_locked(struct conv_ftl *conv_ftl,
 	/* SB fully written across all dies: ACTIVE -> CLOSED */
 	if (conv_ftl->slc_sb_state[blk] == NVMEV_SB_ACTIVE) {
 		conv_ftl->slc_sb_state[blk] = NVMEV_SB_CLOSED;
-		if (conv_ftl->active_sb_count)
+		if (conv_ftl->slc_sb_active_counted &&
+		    conv_ftl->slc_sb_active_counted[blk]) {
+			conv_ftl->slc_sb_active_counted[blk] = 0;
+			if (conv_ftl->active_sb_count)
+				conv_ftl->active_sb_count--;
+		} else if (!conv_ftl->slc_sb_active_counted &&
+			   conv_ftl->active_sb_count) {
 			conv_ftl->active_sb_count--;
+		}
 		/* Clear chain_cur_active_sb for any chain whose pointer was this SB
 		 * (owner + parasitic writers). Bounded by next_chain_id. */
 		if (conv_ftl->chain_cur_active_sb) {
@@ -4295,8 +4425,16 @@ static void slc_sb_note_freed_locked(struct conv_ftl *conv_ftl, uint32_t blk)
 	spp = &conv_ftl->ssd->sp;
 	if (blk >= spp->blks_per_pl)
 		return;
-	if (conv_ftl->slc_sb_state[blk] == NVMEV_SB_ACTIVE && conv_ftl->active_sb_count)
+	if (conv_ftl->slc_sb_active_counted && conv_ftl->slc_sb_active_counted[blk]) {
+		conv_ftl->slc_sb_active_counted[blk] = 0;
+		if (conv_ftl->active_sb_count)
+			conv_ftl->active_sb_count--;
+	} else if (!conv_ftl->slc_sb_active_counted &&
+		   conv_ftl->slc_sb_state[blk] == NVMEV_SB_ACTIVE &&
+		   conv_ftl->active_sb_count) {
 		conv_ftl->active_sb_count--;
+	}
+	slc_migrated_victim_remove_locked(conv_ftl, blk);
 	conv_ftl->slc_sb_state[blk] = NVMEV_SB_FREE;
 	if (conv_ftl->slc_sb_owner_chain)
 		conv_ftl->slc_sb_owner_chain[blk] = INVALID_CHAIN_ID;
@@ -4596,16 +4734,25 @@ static bool slc_has_any_victim(struct conv_ftl *conv_ftl)
 	uint32_t blk;
 	bool found = false;
 
-	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->slc_lunlm)
+	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->slc_lunlm ||
+	    !conv_ftl->slc_sb_migrated_victim)
 		return false;
 
 	spin_lock(&conv_ftl->slc_lock);
 	for (blk = 0; blk < conv_ftl->slc_blks_per_pl; blk++) {
 		struct slc_sb_summary_no1 sum;
 
+		if (!conv_ftl->slc_sb_migrated_victim[blk])
+			continue;
 		if (!slc_sb_collect_summary(conv_ftl, blk, &sum))
 			continue;
-		if (!sum.active && !sum.open_writer && sum.total_ipc) {
+		if (sum.active || sum.open_writer ||
+		    (sum.total_vpc == 0 && sum.total_ipc == 0)) {
+			slc_migrated_victim_remove_locked(conv_ftl, blk);
+			conv_ftl->slc_sb_migration_victim_stale++;
+			continue;
+		}
+		if (sum.total_ipc || sum.total_vpc) {
 			found = true;
 			break;
 		}
@@ -4925,12 +5072,15 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	/* superblock state machine: indexed by blk_id (0..blks_per_pl-1).
 	 * SB == same blk_id across all dies, so we only need one entry per blk_id. */
 	conv_ftl->slc_sb_state = vzalloc(sizeof(*conv_ftl->slc_sb_state) * spp->blks_per_pl);
+	conv_ftl->slc_sb_active_counted = vzalloc(sizeof(*conv_ftl->slc_sb_active_counted) * spp->blks_per_pl);
 	conv_ftl->slc_sb_owner_chain = vmalloc(sizeof(*conv_ftl->slc_sb_owner_chain) * spp->blks_per_pl);
 	conv_ftl->slc_sb_die_full_mask = vzalloc(sizeof(*conv_ftl->slc_sb_die_full_mask) * spp->blks_per_pl);
+	conv_ftl->slc_sb_migrated_victim = vzalloc(sizeof(*conv_ftl->slc_sb_migrated_victim) * spp->blks_per_pl);
 	conv_ftl->chain_cur_active_sb = vmalloc(sizeof(*conv_ftl->chain_cur_active_sb) * spp->tt_pgs);
 	conv_ftl->chain_host_read_count = vzalloc(sizeof(*conv_ftl->chain_host_read_count) * spp->tt_pgs);
 	conv_ftl->chain_repromote_cursor = vzalloc(sizeof(*conv_ftl->chain_repromote_cursor) * spp->tt_pgs);
 	conv_ftl->active_sb_count = 0;
+	conv_ftl->slc_sb_migrated_victim_count = 0;
 #else
 	conv_ftl->lpn_chain_id = NULL;
 	conv_ftl->chain_slc_next_die = NULL;
@@ -4946,12 +5096,15 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->blk_mixed_pages = NULL;
 	conv_ftl->blk_active_wp_refs = NULL;
 	conv_ftl->slc_sb_state = NULL;
+	conv_ftl->slc_sb_active_counted = NULL;
 	conv_ftl->slc_sb_owner_chain = NULL;
 	conv_ftl->slc_sb_die_full_mask = NULL;
+	conv_ftl->slc_sb_migrated_victim = NULL;
 	conv_ftl->chain_cur_active_sb = NULL;
 	conv_ftl->chain_host_read_count = NULL;
 	conv_ftl->chain_repromote_cursor = NULL;
 	conv_ftl->active_sb_count = 0;
+	conv_ftl->slc_sb_migrated_victim_count = 0;
 #endif
 	if (!conv_ftl->lpn_initial_die || !conv_ftl->lpn_die_changed ||
 	    !conv_ftl->lpn_die_change_reason
@@ -4963,8 +5116,10 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	    !conv_ftl->blk_owner_chain ||
 	    !conv_ftl->blk_owner_pages || !conv_ftl->blk_valid_pages ||
 	    !conv_ftl->blk_mixed_pages || !conv_ftl->blk_active_wp_refs ||
-	    !conv_ftl->slc_sb_state || !conv_ftl->slc_sb_owner_chain ||
-	    !conv_ftl->slc_sb_die_full_mask || !conv_ftl->chain_cur_active_sb ||
+	    !conv_ftl->slc_sb_state || !conv_ftl->slc_sb_active_counted ||
+	    !conv_ftl->slc_sb_owner_chain ||
+	    !conv_ftl->slc_sb_die_full_mask || !conv_ftl->slc_sb_migrated_victim ||
+	    !conv_ftl->chain_cur_active_sb ||
 	    !conv_ftl->chain_host_read_count || !conv_ftl->chain_repromote_cursor
 #endif
 	    ) {
@@ -5005,10 +5160,14 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 			vfree(conv_ftl->blk_active_wp_refs);
 		if (conv_ftl->slc_sb_state)
 			vfree(conv_ftl->slc_sb_state);
+		if (conv_ftl->slc_sb_active_counted)
+			vfree(conv_ftl->slc_sb_active_counted);
 		if (conv_ftl->slc_sb_owner_chain)
 			vfree(conv_ftl->slc_sb_owner_chain);
 		if (conv_ftl->slc_sb_die_full_mask)
 			vfree(conv_ftl->slc_sb_die_full_mask);
+		if (conv_ftl->slc_sb_migrated_victim)
+			vfree(conv_ftl->slc_sb_migrated_victim);
 		if (conv_ftl->chain_cur_active_sb)
 			vfree(conv_ftl->chain_cur_active_sb);
 		if (conv_ftl->chain_host_read_count)
@@ -5032,8 +5191,10 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 			conv_ftl->blk_mixed_pages = NULL;
 			conv_ftl->blk_active_wp_refs = NULL;
 			conv_ftl->slc_sb_state = NULL;
+			conv_ftl->slc_sb_active_counted = NULL;
 			conv_ftl->slc_sb_owner_chain = NULL;
 			conv_ftl->slc_sb_die_full_mask = NULL;
+			conv_ftl->slc_sb_migrated_victim = NULL;
 			conv_ftl->chain_cur_active_sb = NULL;
 			conv_ftl->chain_host_read_count = NULL;
 			conv_ftl->chain_repromote_cursor = NULL;
@@ -5079,6 +5240,9 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->chain_gc_to_qlc_pages = 0;
 	conv_ftl->slc_sb_migration_attempts = 0;
 	conv_ftl->slc_sb_migration_pages = 0;
+	conv_ftl->slc_sb_migration_victim_enqueues = 0;
+	conv_ftl->slc_sb_migration_victim_dequeues = 0;
+	conv_ftl->slc_sb_migration_victim_stale = 0;
 	conv_ftl->slc_sb_gc_count = 0;
 	conv_ftl->slc_sb_gc_valid_pages = 0;
 	conv_ftl->slc_sb_gc_invalid_pages = 0;
@@ -5151,8 +5315,10 @@ static void remove_maptbl(struct conv_ftl *conv_ftl)
 	vfree(conv_ftl->blk_mixed_pages);
 	vfree(conv_ftl->blk_active_wp_refs);
 	vfree(conv_ftl->slc_sb_state);
+	vfree(conv_ftl->slc_sb_active_counted);
 	vfree(conv_ftl->slc_sb_owner_chain);
 	vfree(conv_ftl->slc_sb_die_full_mask);
+	vfree(conv_ftl->slc_sb_migrated_victim);
 	vfree(conv_ftl->chain_cur_active_sb);
 	vfree(conv_ftl->chain_host_read_count);
 	vfree(conv_ftl->chain_repromote_cursor);
@@ -5179,8 +5345,15 @@ static void remove_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->blk_valid_pages = NULL;
 	conv_ftl->blk_mixed_pages = NULL;
 	conv_ftl->blk_active_wp_refs = NULL;
+	conv_ftl->slc_sb_state = NULL;
+	conv_ftl->slc_sb_active_counted = NULL;
+	conv_ftl->slc_sb_owner_chain = NULL;
+	conv_ftl->slc_sb_die_full_mask = NULL;
+	conv_ftl->slc_sb_migrated_victim = NULL;
+	conv_ftl->chain_cur_active_sb = NULL;
 	conv_ftl->chain_capacity = 0;
 	conv_ftl->next_chain_id = 0;
+	conv_ftl->slc_sb_migrated_victim_count = 0;
 }
 
 static void init_rmap(struct conv_ftl *conv_ftl)
@@ -6858,8 +7031,10 @@ static bool select_sb_victim_slc_locked_no1(struct conv_ftl *conv_ftl,
 	uint8_t best_tier = 3;
 	uint64_t global_avg = 0;
 
-	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->slc_lunlm)
+	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->slc_lunlm ||
+	    !conv_ftl->slc_sb_migrated_victim)
 		return false;
+	(void)force;
 	line_cnt = conv_ftl->slc_blks_per_pl;
 	if (!line_cnt)
 		return false;
@@ -6867,20 +7042,25 @@ static bool select_sb_victim_slc_locked_no1(struct conv_ftl *conv_ftl,
 
 	for (i = 0; i < line_cnt; i++) {
 		struct slc_sb_summary_no1 cand;
-		uint8_t cand_tier;
 
+		if (!conv_ftl->slc_sb_migrated_victim[i])
+			continue;
 		if (!slc_sb_collect_summary(conv_ftl, i, &cand))
 			continue;
-		if (cand.active || cand.open_writer)
+		if (cand.active || cand.open_writer ||
+		    (cand.total_vpc == 0 && cand.total_ipc == 0)) {
+			slc_migrated_victim_remove_locked(conv_ftl, i);
+			conv_ftl->slc_sb_migration_victim_stale++;
 			continue;
-		if (!force && cand.total_ipc == 0)
-			continue;
-
-		cand_tier = slc_sb_summary_tier(&cand, global_avg);
-		if (slc_sb_summary_better(&cand, cand_tier,
-					  have_best ? &best : NULL, best_tier)) {
+		}
+		if (!have_best ||
+		    cand.total_ipc > best.total_ipc ||
+		    (cand.total_ipc == best.total_ipc &&
+		     hweight16(cand.eligible_mask) > hweight16(best.eligible_mask)) ||
+		    (cand.total_ipc == best.total_ipc &&
+		     hweight16(cand.eligible_mask) == hweight16(best.eligible_mask) &&
+		     cand.blk_id < best.blk_id)) {
 			best = cand;
-			best_tier = cand_tier;
 			have_best = true;
 		}
 	}
@@ -6888,6 +7068,9 @@ static bool select_sb_victim_slc_locked_no1(struct conv_ftl *conv_ftl,
 	if (!have_best)
 		return false;
 
+	slc_migrated_victim_remove_locked(conv_ftl, best.blk_id);
+	conv_ftl->slc_sb_migration_victim_dequeues++;
+	best_tier = slc_sb_summary_tier(&best, global_avg);
 	out->blk_id = best.blk_id;
 	out->total_ipc = best.total_ipc;
 	out->total_vpc = best.total_vpc;
@@ -6982,17 +7165,18 @@ static int do_gc_superblock_slc(struct conv_ftl *conv_ftl, bool force)
 
 		if (gc_failed) {
 			struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
+			spin_lock(&conv_ftl->slc_lock);
 			if (lm) {
 				struct line *line = &lm->lines[sv.blk_id];
-				spin_lock(&conv_ftl->slc_lock);
 				if (sv.die_full_mask & (1u << die)) {
 					list_add_tail(&line->entry, &lm->full_line_list);
 					lm->full_line_cnt++;
 				} else {
 					line->pos = 0;
 				}
-				spin_unlock(&conv_ftl->slc_lock);
 			}
+			slc_migrated_victim_enqueue_locked(conv_ftl, sv.blk_id);
+			spin_unlock(&conv_ftl->slc_lock);
 			return -1;
 		}
 
@@ -7000,14 +7184,18 @@ static int do_gc_superblock_slc(struct conv_ftl *conv_ftl, bool force)
 		mark_block_free(conv_ftl, &ppa);
 		erase_ops++;
 		if (cpp->enable_gc_delay) {
+			uint64_t erase_start_ns = __get_ioclock(conv_ftl->ssd);
+			uint64_t erase_completed_ns;
 			struct nand_cmd gce = {
 				.type = GC_IO,
 				.cmd = NAND_ERASE,
-				.stime = 0,
+				.stime = erase_start_ns,
 				.interleave_pci_dma = false,
 				.ppa = &ppa,
 			};
-			erase_time_ns += ssd_advance_nand(conv_ftl->ssd, &gce);
+			erase_completed_ns = ssd_advance_nand(conv_ftl->ssd, &gce);
+			if (erase_completed_ns > erase_start_ns)
+				erase_time_ns += erase_completed_ns - erase_start_ns;
 		}
 		mark_line_free(conv_ftl, &ppa);
 	}

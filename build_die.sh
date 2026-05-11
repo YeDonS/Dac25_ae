@@ -10,6 +10,7 @@ set -e
 #   ./build_die.sh die_no3       # legacy no3: QLC hot/cold + repromotion, no chain/rebalance
 #   ./build_die.sh die_base      # legacy baseline
 #   ./build_die.sh die_base_sb   # baseline with superblock free-line accounting
+#   ./build_die.sh die_latency_sb # baseline_sb + idle-aware preemptible SLC maintenance scheduler
 #   ./build_die.sh die_no1_sb    # chain-only with superblock accounting and 14 active superblocks
 #   ./build_die.sh die_base_lru  # baseline + 8MiB demand-loaded mapping CMT + LRU
 #   ./build_die.sh die_no4       # structured GTD + SLC-metadata-log + QLC flash mappings
@@ -52,6 +53,7 @@ ftl_source_for() {
         die_no3)  echo "conv_ftl_no3.c"      ;;
         die_base) echo "conv_ftl_baseline.c"  ;;
         die_base_sb) echo "conv_ftl_baseline_superblock.c" ;;
+        die_latency_sb) echo "conv_ftl_latency_superblock.c" ;;
         die_base_lru) echo "conv_ftl_baseline_lru.c" ;;
         die_no4) echo "conv_ftl_no4.c"       ;;
         die_base2) echo "conv_ftl_base2.c"   ;;
@@ -158,7 +160,7 @@ build_one() {
 ABLATION_VARIANTS="die_i_base die_i_all die_i_no_chain die_i_no_hotcold die_i_no_repromote die_i_no_rebalance die_i_chain_only die_i_no2_only die_i_no3_only"
 
 if [[ "${1:-}" == "all" ]]; then
-    for v in die_base die_base_sb die_base_lru die_no4 die_base2 die_base3 die_no1 die_no1_sb die_no2 die_no3 die_all $ABLATION_VARIANTS; do
+    for v in die_base die_base_sb die_latency_sb die_base_lru die_no4 die_base2 die_base3 die_no1 die_no1_sb die_no2 die_no3 die_all $ABLATION_VARIANTS; do
         build_one "$v"
     done
     echo ""
@@ -177,7 +179,7 @@ elif [[ "$#" -gt 1 ]]; then
         build_one "$v"
     done
 else
-    VARIANT="${1:?Usage: $0 die_all|die_no1|die_no1_sb|die_no2|die_no3|die_no4|die_base|die_base_sb|die_base_lru|die_base2|die_base3|die_i_base|die_i_all|die_i_no_chain|die_i_no_hotcold|die_i_no_repromote|die_i_no_rebalance|die_i_chain_only|die_i_no2_only|die_i_no3_only|all|ablations [more variants...]}"
+    VARIANT="${1:?Usage: $0 die_all|die_no1|die_no1_sb|die_no2|die_no3|die_no4|die_base|die_base_sb|die_latency_sb|die_base_lru|die_base2|die_base3|die_i_base|die_i_all|die_i_no_chain|die_i_no_hotcold|die_i_no_repromote|die_i_no_rebalance|die_i_chain_only|die_i_no2_only|die_i_no3_only|all|ablations [more variants...]}"
     ftl_source_for "$VARIANT" >/dev/null || { echo "Unknown variant '$VARIANT'" >&2; exit 1; }
     build_one "$VARIANT"
 fi

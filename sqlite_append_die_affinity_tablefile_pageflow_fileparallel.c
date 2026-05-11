@@ -2139,8 +2139,10 @@ static void *append_tables_round_robin_worker(void *arg)
 	opts = ctx->opts;
 	tables = ctx->tables;
 	dummy = ctx->dummy;
-	page_budget = opts->window_pages_per_table ? opts->window_pages_per_table :
-		DEFAULT_WINDOW_PAGES_PER_TABLE;
+	/* Row-by-row interleave: each call inserts one row, outer loop rotates
+	 * across all active tables. window_pages_per_table is ignored here. */
+	page_budget = ROW_EST_PAGES;
+	(void)DEFAULT_WINDOW_PAGES_PER_TABLE;
 	active = calloc(opts->table_count ? opts->table_count : 1U, sizeof(*active));
 	if (!active) {
 		stats->rc = -ENOMEM;
@@ -2305,8 +2307,12 @@ static int run_cold_mixed_append_random_read(const struct dataset_layout *layout
 		return -EINVAL;
 
 	memset(stats, 0, sizeof(*stats));
-	page_budget = opts->window_pages_per_table ? opts->window_pages_per_table :
-		DEFAULT_WINDOW_PAGES_PER_TABLE;
+	/* Row-by-row interleave: each insert_table_window_by_pages call grows
+	 * page count by ~ROW_EST_PAGES (one row), so the outer loop rotates
+	 * across tables one row at a time. window_pages_per_table no longer
+	 * gates per-table burst size; interleave_pages still drives reads. */
+	page_budget = ROW_EST_PAGES;
+	(void)DEFAULT_WINDOW_PAGES_PER_TABLE;
 	rng_state = (opts->seed ? opts->seed : 42U) ^ 0xc01d5eedU;
 
 	active = calloc(layout->table_count ? layout->table_count : 1U, sizeof(*active));
@@ -2332,76 +2338,94 @@ static int run_cold_mixed_append_random_read(const struct dataset_layout *layout
 	       opts->cold_extra_append_bytes, opts->cold_extra_read_ratio,
 	       opts->cold_extra_row_reads_per_batch);
 
-	start = monotonic_sec();
-	while (active_count > 0) {
-		unsigned int next_active = 0;
+	{
+		unsigned long long round_pages_threshold = opts->interleave_pages ?
+			opts->interleave_pages : DEFAULT_INTERLEAVE_PAGES;
+		unsigned long long pages_since_last_read = 0;
+		unsigned int round_rows = 0;
+		unsigned long long round_bytes = 0;
 
-		for (unsigned int i = 0; i < active_count; ++i) {
-			unsigned int table_id = active[i];
-			struct table_file_state *table = &tables[table_id];
-			unsigned int rows_step = 0;
-			unsigned int pages_step = 0;
-			double t0;
+		start = monotonic_sec();
+		while (active_count > 0) {
+			unsigned int next_active = 0;
 
-			if (table->rows_inserted >= table->total_rows)
+			/* One cycle = each active table gets +1 row.
+			 * Multiple cycles run row-by-row interleaved until the
+			 * accumulated page growth crosses interleave_pages,
+			 * which terminates the round and triggers a read burst. */
+			for (unsigned int i = 0; i < active_count; ++i) {
+				unsigned int table_id = active[i];
+				struct table_file_state *table = &tables[table_id];
+				unsigned int rows_step = 0;
+				unsigned int pages_step = 0;
+				double t0;
+
+				if (table->rows_inserted >= table->total_rows)
+					continue;
+
+				t0 = monotonic_sec();
+				rc = insert_table_window_by_pages(table, page_budget, opts, dummy,
+								  &rows_step, &pages_step);
+				stats->append_sec += monotonic_sec() - t0;
+				if (rc != 0)
+					goto out;
+
+				table->rows_inserted += rows_step;
+				stats->rows_written += rows_step;
+				stats->payload_bytes_written +=
+					(unsigned long long)rows_step * ROW_PAYLOAD_BYTES;
+				stats->page_growth += pages_step;
+				round_rows += rows_step;
+				round_bytes += (unsigned long long)rows_step * ROW_PAYLOAD_BYTES;
+				pages_since_last_read += pages_step;
+
+				if (table->rows_inserted < table->total_rows)
+					active[next_active++] = table_id;
+			}
+			active_count = next_active;
+
+			if (pages_since_last_read < round_pages_threshold && active_count > 0)
 				continue;
 
-			t0 = monotonic_sec();
-			rc = insert_table_window_by_pages(table, page_budget, opts, dummy,
-							  &rows_step, &pages_step);
-			stats->append_sec += monotonic_sec() - t0;
-			if (rc != 0)
-				goto out;
+			{
+				unsigned long long reads_due = 0;
+				unsigned long long reads_before = stats->row_reads;
+				double read_elapsed = 0.0;
 
-			table->rows_inserted += rows_step;
-			stats->rows_written += rows_step;
-			stats->payload_bytes_written +=
-				(unsigned long long)rows_step * ROW_PAYLOAD_BYTES;
-			stats->page_growth += pages_step;
+				if (opts->cold_extra_row_reads_per_batch > 0) {
+					reads_due = opts->cold_extra_row_reads_per_batch;
+				} else {
+					unsigned long long target_reads =
+						cold_mixed_target_reads(stats->rows_written,
+									opts->cold_extra_read_ratio);
 
-			printf("[sqlite_cold_mixed] round=%u table=%u wrote_rows=%u wrote_bytes=%llu "
-			       "total_write_bytes=%llu\n",
-			       round_id,
-			       table_id, rows_step,
-			       (unsigned long long)rows_step * ROW_PAYLOAD_BYTES,
-			       stats->payload_bytes_written);
+					if (target_reads > stats->row_reads)
+						reads_due = target_reads - stats->row_reads;
+				}
 
-			if (table->rows_inserted < table->total_rows)
-				active[next_active++] = table_id;
-		}
+				rc = run_random_row_read_burst(layout, tables, opts, stmts, reads_due,
+							       &rng_state, cold_per_table,
+							       table_latency, table_read_ops,
+							       &stats->row_reads, &read_elapsed);
+				stats->read_sec += read_elapsed;
+				if (rc != 0)
+					goto out;
 
-		{
-			unsigned long long reads_due = 0;
-			unsigned long long reads_before = stats->row_reads;
-			double read_elapsed = 0.0;
-
-			if (opts->cold_extra_row_reads_per_batch > 0) {
-				reads_due = opts->cold_extra_row_reads_per_batch;
-			} else {
-				unsigned long long target_reads =
-					cold_mixed_target_reads(stats->rows_written,
-								opts->cold_extra_read_ratio);
-
-				if (target_reads > stats->row_reads)
-					reads_due = target_reads - stats->row_reads;
+				printf("[sqlite_cold_mixed] round=%u active_tables=%u "
+				       "round_rows=%u round_bytes=%llu round_pages=%llu read_rows=%llu "
+				       "total_write_bytes=%llu total_read_bytes=%llu\n",
+				       round_id, active_count, round_rows, round_bytes,
+				       pages_since_last_read,
+				       stats->row_reads - reads_before,
+				       stats->payload_bytes_written,
+				       stats->row_reads * ROW_PAYLOAD_BYTES);
 			}
 
-			rc = run_random_row_read_burst(layout, tables, opts, stmts, reads_due,
-						       &rng_state, cold_per_table,
-						       table_latency, table_read_ops,
-						       &stats->row_reads, &read_elapsed);
-			stats->read_sec += read_elapsed;
-			if (rc != 0)
-				goto out;
-
-			printf("[sqlite_cold_mixed] round=%u completed active_tables=%u "
-			       "read_rows=%llu total_write_bytes=%llu total_read_bytes=%llu\n",
-			       round_id, active_count, stats->row_reads - reads_before,
-			       stats->payload_bytes_written, stats->row_reads * ROW_PAYLOAD_BYTES);
+			round_id++;
+			round_rows = 0;
+			round_bytes = 0;
+			pages_since_last_read = 0;
 		}
-
-		active_count = next_active;
-		round_id++;
 	}
 
 	stats->payload_bytes_read = stats->row_reads * ROW_PAYLOAD_BYTES;
@@ -4066,18 +4090,15 @@ static int run_init_mode(const struct workload_options *opts)
 	estimated_pages_per_table =
 		(double)layout.rows_per_table[0] * (double)effective_pages_per_row;
 	{
-		if (opts->refstyle_dummy_bytes > 0) {
-			estimated_rounds = (double)layout.rows_per_table[0];
-		} else {
-			unsigned int pages_per_pass = opts->window_pages_per_table ?
-				opts->window_pages_per_table : DEFAULT_WINDOW_PAGES_PER_TABLE;
-			unsigned int passes_per_round = opts->window_passes_per_round ?
-				opts->window_passes_per_round : DEFAULT_WINDOW_PASSES_PER_ROUND;
-			double macro_pages_per_table = (double)pages_per_pass * (double)passes_per_round;
+		/* Row-by-row interleave: writes cycle table1row1, table2row1, ...,
+		 * tableNrow1, table1row2, ...; a read event fires every
+		 * interleave_pages of accumulated page growth. */
+		unsigned int interleave_pages_eff = opts->interleave_pages ?
+			opts->interleave_pages : DEFAULT_INTERLEAVE_PAGES;
+		double total_pages = (double)layout.table_count * estimated_pages_per_table;
 
-			estimated_rounds = macro_pages_per_table > 0.0 ?
-				(estimated_pages_per_table / macro_pages_per_table) : 0.0;
-		}
+		estimated_rounds = interleave_pages_eff > 0U ?
+			(total_pages / (double)interleave_pages_eff) : 0.0;
 	}
 
 	printf("[sqlite_init] config tables=%u total_rows=%llu logical_row_bytes=%llu est_row_pages=%u interleave_pages=%u "
@@ -4108,14 +4129,12 @@ static int run_init_mode(const struct workload_options *opts)
 		       effective_pages_per_row - ROW_EST_PAGES : 0U);
 	} else {
 		printf("[sqlite_init] estimated_pages_per_table=%.0f estimated_rounds=%.2f "
-		       "(one macro round = each active table grows by ~%u SQLite pages via %u passes x %u pages)\n",
+		       "(row-by-row: table1row1, table2row1, ..., table%urow1, table1row2, ...; "
+		       "one round = interleave_pages=%u accumulated, then read event; "
+		       "window_pages_per_table=%u is ignored)\n",
 		       estimated_pages_per_table, estimated_rounds,
-		       (opts->window_pages_per_table ? opts->window_pages_per_table :
-			DEFAULT_WINDOW_PAGES_PER_TABLE) *
-		       (opts->window_passes_per_round ? opts->window_passes_per_round :
-			DEFAULT_WINDOW_PASSES_PER_ROUND),
-		       opts->window_passes_per_round ? opts->window_passes_per_round :
-		       DEFAULT_WINDOW_PASSES_PER_ROUND,
+		       layout.table_count,
+		       opts->interleave_pages ? opts->interleave_pages : DEFAULT_INTERLEAVE_PAGES,
 		       opts->window_pages_per_table ? opts->window_pages_per_table :
 		       DEFAULT_WINDOW_PAGES_PER_TABLE);
 	}
@@ -4157,9 +4176,11 @@ static int run_init_mode(const struct workload_options *opts)
 		if (table->rows_inserted >= table->total_rows)
 			continue;
 
+		/* Row-by-row interleave across tables: budget = ROW_EST_PAGES
+		 * forces one row per call, so round_order cycles tables one row
+		 * at a time. window_pages_per_table is intentionally ignored. */
 		rc = insert_table_window_by_pages(table,
-						  opts->window_pages_per_table ? opts->window_pages_per_table :
-						  DEFAULT_WINDOW_PAGES_PER_TABLE,
+						  ROW_EST_PAGES,
 						  opts, &ref_dummy,
 						  &rows_step, &pages_step);
 		if (rc != 0)

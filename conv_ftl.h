@@ -307,6 +307,21 @@ struct conv_ftl {
 	struct workqueue_struct *bg_migration_wq;
 	struct work_struct repromotion_work;
 	struct work_struct qlc_rebalance_work;
+	/* [LATENCY v1] idle-aware preemptible maintenance.
+	 * 仅 conv_ftl_latency_superblock.c 变体使用; 其他变体不 INIT_WORK 也不 queue,
+	 * 这里只占 ~24B struct 空间且为 0 初始化, baseline 不受影响。
+	 *
+	 * 设计动机: 旧 baseline 在 conv_write() control_tick 内同步调用
+	 * migrate_some_cold_from_slc() / forground_gc(), 把 SLC->QLC 迁移和 SLC GC
+	 * 压在 host write entry 的关键路径上 (图 scenario A)。Latency 变体改成:
+	 *  - 低/中水位 (>5% SLC free): conv_write 只 enqueue + kick slc_maint_work,
+	 *    实际工作在 bg_migration_wq 上跑, 不延长 host nsecs_target;
+	 *  - 高水位 (2%-5%): conv_write 做 1 个 page 的 inline-bounded sync 保证 forward
+	 *    progress, 大头仍 enqueue;
+	 *  - 紧急 (<2%): 保留原同步路径, host write 被阻塞至 SLC free 回升。 */
+	struct work_struct slc_maint_work;
+	uint64_t slc_maint_runs;
+	uint64_t slc_maint_pages;
 	atomic64_t total_host_reads;
 	uint32_t repromote_period_reads;       /* 每多少次主机读触发一次回迁 worker */
 	uint32_t repromote_budget_per_run;     /* 每轮回迁最多处理多少页 */
@@ -352,10 +367,13 @@ struct conv_ftl {
 		 * SAME blk_id across all dies. Single state per blk_id is sufficient
 		 * because all dies of a chain SB are reserved together. */
 		uint8_t  *slc_sb_state;             /* NVMEV_SB_FREE / NVMEV_SB_ACTIVE / NVMEV_SB_CLOSED */
+		uint8_t  *slc_sb_active_counted;    /* ACTIVE SBs that consume the host/chain active cap */
 		uint32_t *slc_sb_owner_chain;       /* first chain to write into this SB (parasitic writers don't change owner) */
 		uint16_t *slc_sb_die_full_mask;     /* bit i: die i has filled its portion of this SB */
+		uint8_t  *slc_sb_migrated_victim;   /* SBs processed by SLC->QLC migration and eligible for SLC GC */
 		uint32_t *chain_cur_active_sb;      /* chain_id -> current ACTIVE SB blk_id (U32_MAX if none) */
-		uint32_t  active_sb_count;          /* number of SBs currently in NVMEV_SB_ACTIVE state */
+		uint32_t  active_sb_count;          /* number of ACTIVE SBs counted against the host/chain cap */
+		uint32_t  slc_sb_migrated_victim_count;
 		/* chain-triggered repromotion: per-chain host read counter; when it
 		 * crosses the threshold the bg worker scans this chain's QLC pages
 		 * for hot ones and rewrites them back to SLC in a batch. */
@@ -377,6 +395,9 @@ struct conv_ftl {
 	uint64_t chain_gc_to_qlc_pages;
 	uint64_t slc_sb_migration_attempts;
 	uint64_t slc_sb_migration_pages;
+	uint64_t slc_sb_migration_victim_enqueues;
+	uint64_t slc_sb_migration_victim_dequeues;
+	uint64_t slc_sb_migration_victim_stale;
 	uint64_t slc_sb_gc_count;
 	uint64_t slc_sb_gc_valid_pages;
 	uint64_t slc_sb_gc_invalid_pages;

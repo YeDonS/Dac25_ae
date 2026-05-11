@@ -55,6 +55,7 @@ SQLITE_COLD_EXTRA_MODE=${SQLITE_COLD_EXTRA_MODE:-off}
 SQLITE_COLD_EXTRA_READ_RATIO=${SQLITE_COLD_EXTRA_READ_RATIO:-10}
 SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH=${SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH:-0}
 SQLITE_ACCESS_DIST=${SQLITE_ACCESS_DIST:-zipf}
+SQLITE_ACCESS_DIST_LIST=${SQLITE_ACCESS_DIST_LIST:-$SQLITE_ACCESS_DIST}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
 NORMAL_STDDEV=${NORMAL_STDDEV:-400}
 NORMAL_SEED=${NORMAL_SEED:-314159}
@@ -220,12 +221,14 @@ run_one_test() {
     local window_pages="$6"
     local mode_tag
     local cmt_tag
+    local dist_tag
     mode_tag="$(printf '%s' "$cold_mode" | tr -c 'A-Za-z0-9' '_')"
     cmt_tag="$(size_tag "$cmt_label")"
+    dist_tag="$(printf '%s' "$SQLITE_ACCESS_DIST" | tr -c 'A-Za-z0-9' '_')"
     local wp_tag="wp${window_pages}"
-    local tag="die_tablefile_pageflow_fileparallel_fullscan_${variant}_${mode_tag}_${wp_tag}_cmt_${cmt_tag}_t${threads}"
-    local init_txt="${RESULT_FOLDER%/}/sqlite_die_tablefile_pageflow_fileparallel_fullscan_init_${variant}_${mode_tag}_${wp_tag}_cmt_${cmt_tag}_t${threads}.txt"
-    local out_dir="${DIE_RESULT_BASE}/${variant}/${mode_tag}/${wp_tag}/cmt_${cmt_tag}/t${threads}"
+    local tag="die_tablefile_pageflow_fileparallel_fullscan_${variant}_${mode_tag}_${dist_tag}_${wp_tag}_cmt_${cmt_tag}_t${threads}"
+    local init_txt="${RESULT_FOLDER%/}/sqlite_die_tablefile_pageflow_fileparallel_fullscan_init_${variant}_${mode_tag}_${dist_tag}_${wp_tag}_cmt_${cmt_tag}_t${threads}.txt"
+    local out_dir="${DIE_RESULT_BASE}/${variant}/${mode_tag}/${dist_tag}/${wp_tag}/cmt_${cmt_tag}/t${threads}"
 
     mkdir -p "$out_dir"
 
@@ -233,7 +236,7 @@ run_one_test() {
     echo "================================================================"
     echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  cold_mode=$cold_mode  window_pages=$window_pages  cmt=$cmt_label($cmt_bytes bytes)  tag=$tag"
     echo "  per-table-db=ON  logical_row_bytes~32KB  est_row_pages~8  tables=$SQLITE_TABLE_COUNT  rows/tbl_override=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$window_pages  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  cold_mode=$cold_mode  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  cold_extra_read_ratio=$SQLITE_COLD_EXTRA_READ_RATIO  cold_extra_row_reads_per_batch=$SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
+    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$window_pages  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  normal_mean=$NORMAL_MEAN  normal_stddev=$NORMAL_STDDEV  cold_mode=$cold_mode  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  cold_extra_read_ratio=$SQLITE_COLD_EXTRA_READ_RATIO  cold_extra_row_reads_per_batch=$SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
     echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH"
     echo "  note: default run uses no dummy; cold scan uses one thread per table file within each batch"
     echo "================================================================"
@@ -388,11 +391,14 @@ mkdir -p "$DIE_RESULT_BASE"
 
 for threads in $THREAD_COUNTS; do
     for variant in $VARIANTS; do
-        for cmt_label in $SQLITE_MAP_CMT_BYTES_LIST; do
-            cmt_bytes="$(size_to_bytes "$cmt_label")" || exit 1
-            for cold_mode in $SQLITE_COLD_FULL_READ_MODE; do
-                for window_pages in $SQLITE_WINDOW_PAGES_PER_TABLE_LIST; do
-                    run_one_test "$variant" "$threads" "$cold_mode" "$cmt_label" "$cmt_bytes" "$window_pages" || exit 1
+        for access_dist in $SQLITE_ACCESS_DIST_LIST; do
+            SQLITE_ACCESS_DIST="$access_dist"
+            for cmt_label in $SQLITE_MAP_CMT_BYTES_LIST; do
+                cmt_bytes="$(size_to_bytes "$cmt_label")" || exit 1
+                for cold_mode in $SQLITE_COLD_FULL_READ_MODE; do
+                    for window_pages in $SQLITE_WINDOW_PAGES_PER_TABLE_LIST; do
+                        run_one_test "$variant" "$threads" "$cold_mode" "$cmt_label" "$cmt_bytes" "$window_pages" || exit 1
+                    done
                 done
             done
         done
