@@ -225,6 +225,10 @@ static bool baseline_line_is_host_open_locked(struct conv_ftl *conv_ftl,
 					      uint32_t die);
 static bool slc_has_any_victim(struct conv_ftl *conv_ftl);
 static bool qlc_has_any_victim(struct conv_ftl *conv_ftl);
+static inline void decode_die(struct ssdparams *spp, uint32_t die,
+			      uint32_t *ch, uint32_t *lun);
+static inline struct line_mgmt *get_slc_die_lm(struct conv_ftl *conv_ftl,
+					       uint32_t die);
 
 static inline void compute_line_distribution(uint32_t total_lines,
 					     uint32_t *slc_lines,
