@@ -253,6 +253,9 @@ struct conv_ftl {
 	struct line_mgmt *qlc_lunlm;          /* per-die QLC line pools */
 	struct write_pointer *qlc_lunwp;      /* per-die QLC write pointers */
 	struct write_pointer *gc_qlc_lunwp;   /* per-die QLC GC write pointers */
+	struct write_pointer *baseline_qlc_active_wps; /* baseline QLC SB slots: [slot][die] */
+	uint32_t *baseline_qlc_active_sb_blk; /* baseline slot -> active QLC SB blk_id */
+	uint32_t baseline_qlc_active_sb_cursor;
 	uint32_t qlc_zone_offsets[QLC_ZONE_COUNT];/* 每个zone在block中的起始页 */
 	uint32_t qlc_zone_limits[QLC_ZONE_COUNT]; /* 每个zone允许写入的页数 */
 	uint32_t qlc_zone_rr_cursor;             /* 无机制版本：线性填充所用的轮询游标 */
@@ -381,10 +384,17 @@ struct conv_ftl {
 		uint8_t  *slc_sb_migrated_victim;   /* SBs processed by SLC->QLC migration and eligible for SLC GC */
 		uint8_t  *slc_sb_recent_guard;      /* recently closed SBs protected from cold migration */
 		uint32_t *slc_sb_generation;        /* increments when an SB starts a new lifecycle */
+		uint8_t  *qlc_sb_state;             /* QLC SB state, indexed by qlc blk idx */
+		uint8_t  *qlc_sb_active_counted;    /* QLC ACTIVE SBs that consume the active cap */
+		uint32_t *qlc_sb_owner_chain;       /* owner chain for QLC active SBs */
+		uint16_t *qlc_sb_die_closed_mask;   /* bit i: die i closed its QLC portion */
 		uint32_t *slc_recent_guard_ring_blk;
 		uint32_t *slc_recent_guard_ring_gen;
 		uint32_t *chain_cur_active_sb;      /* chain_id -> current ACTIVE SB blk_id (U32_MAX if none) */
+		uint32_t *chain_cur_active_qlc_sb;  /* chain_id -> current ACTIVE QLC SB blk_id */
+		struct write_pointer **chain_host_qlc_wps; /* lazily allocated per-chain/per-die host QLC WPs */
 		uint32_t  active_sb_count;          /* number of ACTIVE SBs counted against the host/chain cap */
+		uint32_t  qlc_active_sb_count;      /* number of ACTIVE QLC SBs counted against the cap */
 		uint32_t  slc_sb_migrated_victim_count;
 		uint32_t  slc_recent_guard_ring_size;
 		uint32_t  slc_recent_guard_ring_head;
@@ -502,6 +512,33 @@ struct conv_ftl {
 	
 	/* 水位线控制 - 基于剩余空间数量 */
 	uint32_t slc_high_watermark;             /* SLC 迁移阈值: 剩余行数低于此值时触发迁移 */
+
+	/* [LATENCY v2] per-die maintenance task FIFO + idle-die dispatcher.
+	 *
+	 * 仅 conv_ftl_latency_superblock.c 在 V2 模式下初始化和使用; 其他变体不分配
+	 * (字段保持 NULL/0)。每 die 有独立任务队列, worker 按当前 idle slack 排序
+	 * 选择 die, 跳过当前有 host I/O 排队或 channel 满的 die。
+	 *
+	 * 任务粒度: per-die SB portion (一条 SB 在某个 die 上的部分), 远小于
+	 * V1 的"整 SB 一次跑完", 因此单个 task 占 die 的仿真时间 ~200µs 而不是
+	 * 整 SB 的几 ms。host I/O 可以在 task 之间见缝插针。 */
+	struct list_head *maint_die_q;          /* size = die_count */
+	spinlock_t       *maint_die_locks;
+	uint32_t         *maint_die_qlen;
+	uint8_t          *maint_sb_phase;       /* size = slc_blks_per_pl */
+	#define MAINT_SB_PHASE_IDLE    0
+	#define MAINT_SB_PHASE_MIG     1        /* 正在 split-migrate */
+	#define MAINT_SB_PHASE_GC_RDY  2        /* 等 GC pop */
+	#define MAINT_SB_PHASE_GC      3        /* 正在 split-GC */
+	uint16_t         *maint_sb_pending_dies;/* 当前 phase 还剩多少 die 没做 */
+	atomic_t         *die_host_demand;      /* per-die: host I/O in flight count */
+	uint64_t maint_v2_runs;
+	uint64_t maint_v2_idle_picks;            /* 选中 die 时已空闲 ns */
+	uint64_t maint_v2_no_slack_skips;        /* 没找到任何空闲 die 跳过 */
+	uint64_t maint_v2_ch_busy_skips;
+	uint64_t maint_v2_demand_skips;
+	uint64_t maint_v2_emergency_overrides;
+	uint64_t maint_v2_tasks_done;
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
