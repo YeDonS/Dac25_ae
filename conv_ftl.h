@@ -334,6 +334,14 @@ struct conv_ftl {
 	uint32_t repromote_head;
 	uint32_t repromote_tail;
 	uint32_t repromote_die_cursor;    /* batched repromotion cursor (chain-first when enabled) */
+	uint32_t *qlc_closed_repromote_blk; /* closed QLC SB queue: physical blk id */
+	uint32_t *qlc_closed_sb_die_mask;   /* qlc blk_idx -> dies closed for this QLC SB */
+	uint8_t *qlc_closed_repromote_queued; /* qlc blk_idx already queued */
+	uint32_t qlc_closed_repromote_head;
+	uint32_t qlc_closed_repromote_tail;
+	uint32_t qlc_closed_repromote_count;
+	uint32_t qlc_closed_repromote_size;
+	uint32_t qlc_closed_repromote_since_scan;
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
@@ -371,9 +379,15 @@ struct conv_ftl {
 		uint32_t *slc_sb_owner_chain;       /* first chain to write into this SB (parasitic writers don't change owner) */
 		uint16_t *slc_sb_die_full_mask;     /* bit i: die i has filled its portion of this SB */
 		uint8_t  *slc_sb_migrated_victim;   /* SBs processed by SLC->QLC migration and eligible for SLC GC */
+		uint8_t  *slc_sb_recent_guard;      /* recently closed SBs protected from cold migration */
+		uint32_t *slc_sb_generation;        /* increments when an SB starts a new lifecycle */
+		uint32_t *slc_recent_guard_ring_blk;
+		uint32_t *slc_recent_guard_ring_gen;
 		uint32_t *chain_cur_active_sb;      /* chain_id -> current ACTIVE SB blk_id (U32_MAX if none) */
 		uint32_t  active_sb_count;          /* number of ACTIVE SBs counted against the host/chain cap */
 		uint32_t  slc_sb_migrated_victim_count;
+		uint32_t  slc_recent_guard_ring_size;
+		uint32_t  slc_recent_guard_ring_head;
 		/* chain-triggered repromotion: per-chain host read counter; when it
 		 * crosses the threshold the bg worker scans this chain's QLC pages
 		 * for hot ones and rewrites them back to SLC in a batch. */
@@ -398,6 +412,8 @@ struct conv_ftl {
 	uint64_t slc_sb_migration_victim_enqueues;
 	uint64_t slc_sb_migration_victim_dequeues;
 	uint64_t slc_sb_migration_victim_stale;
+	uint64_t slc_sb_recent_guard_skips;
+	uint64_t slc_sb_recent_guard_forced;
 	uint64_t slc_sb_gc_count;
 	uint64_t slc_sb_gc_valid_pages;
 	uint64_t slc_sb_gc_invalid_pages;
@@ -410,6 +426,11 @@ struct conv_ftl {
 	uint64_t repromote_chain_alloc_pages;
 	uint64_t repromote_gc_pool_pages;
 	uint64_t repromote_skip_active_cap;
+	uint64_t qlc_closed_repromote_enqueues;
+	uint64_t qlc_closed_repromote_dequeues;
+	uint64_t qlc_closed_repromote_drops;
+	uint64_t qlc_closed_repromote_scans;
+	uint64_t qlc_closed_repromote_pages;
 	uint64_t chain_slc_die_reroute_count;
 	uint64_t chain_alloc_no_prev;
 	uint64_t chain_alloc_prev_chain_invalid;
