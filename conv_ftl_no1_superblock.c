@@ -1377,7 +1377,7 @@ static bool slc_chain_gc_should_migrate_to_qlc(struct conv_ftl *conv_ftl,
 					       uint64_t lpn)
 {
 	uint32_t owner_chain = INVALID_CHAIN_ID;
-	uint64_t dyn_thresh;
+	uint64_t dyn_thresh = 0;
 
 	if (!conv_ftl || !old_ppa || lpn >= conv_ftl->ssd->sp.tt_pgs ||
 	    !conv_ftl->lpn_chain_id)
@@ -1692,7 +1692,7 @@ static __maybe_unused uint32_t migrate_some_cold_from_slc_cursor(struct conv_ftl
 	struct heat_tracking *ht = &conv_ftl->heat_track;
 	uint32_t migrated = 0;
 	uint32_t scanned = 0;
-	uint64_t dyn_thresh;
+	uint64_t dyn_thresh = 0;
 	uint32_t die_count, die_start, die_span, die_step;
 
 	if (scanned_out)
@@ -1809,7 +1809,7 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 	uint32_t migrated;
 	uint32_t sb_sampled, sb_scanned;
 	uint32_t sb_migrated, sb_mixed_migrated;
-	uint64_t dyn_thresh;
+	uint64_t dyn_thresh = 0;
 
 	NVMEV_DEBUG("[MIGRATION_DEBUG] migrate_some_cold_from_slc called: max_pages=%u target_die=%d\n",
 		    max_pages, target_die);
@@ -1817,15 +1817,11 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 	if (!conv_ftl || max_pages == 0)
 		return 0;
 
-	dyn_thresh = get_dynamic_cold_threshold(conv_ftl);
-	if (dyn_thresh == 0)
-		dyn_thresh = 1;
-
 	sb_sampled = 0;
 	sb_scanned = 0;
-	/* Tier 1: physical-SB scan. Each SLC superblock (same blk_id across
-	 * dies) is summarized once. Pure cold SBs move first; if budget remains,
-	 * the coldest mixed SB by avg read count is migrated next. */
+	/* Physical-SB scan: choose the coldest closed SLC SB by avg read count
+	 * and migrate its valid pages as one demotion unit. dyn_thresh is kept
+	 * only for legacy helpers and is not used by this active path. */
 	sb_mixed_migrated = 0;
 	sb_migrated =
 		migrate_some_cold_from_slc_chain(conv_ftl, max_pages, target_die, dyn_thresh,
@@ -1855,10 +1851,10 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 		if (mig_last_ns == 0)
 			mig_last_ns = now_ns;
 		if (now_ns - mig_last_ns >= 5000000000ULL) {
-			NVMEV_ERROR("[MIG-MONITOR] SLC->QLC cold migration: calls=%u sb_scanned=%u sb_sampled=%u sb_migrated=%u sb_mixed_migrated=%u (thresh=%llu)\n",
+			NVMEV_ERROR("[MIG-MONITOR] SLC->QLC cold migration: calls=%u sb_scanned=%u sb_sampled=%u sb_migrated=%u sb_mixed_migrated=%u victim_q=%u (mode=coldest_sb)\n",
 				    mig_total_calls, mig_total_sb_scanned, mig_total_sb_sampled,
 				    mig_total_sb_migrated, mig_total_sb_mixed_migrated,
-				    dyn_thresh);
+				    conv_ftl->slc_sb_migrated_victim_count);
 			mig_total_calls = 0;
 			mig_total_sb_scanned = 0;
 			mig_total_sb_sampled = 0;
@@ -3720,8 +3716,6 @@ static uint32_t migrate_superblock_valid_pages_from_slc(struct conv_ftl *conv_ft
 				continue;
 			if (!conv_ftl->page_in_slc || !conv_ftl->page_in_slc[lpn])
 				continue;
-			if (recent_write_guard(conv_ftl, lpn))
-				continue;
 			if (migrate_page_to_qlc(conv_ftl, lpn, &ppa) == 0)
 				moved++;
 		}
@@ -3805,10 +3799,6 @@ static bool slc_migration_sb_better(const struct slc_sb_summary_no1 *cand,
 		return false;
 	if (!have_best || !best)
 		return true;
-	if (cand->total_vpc == 0 && best->total_vpc != 0)
-		return true;
-	if (cand->total_vpc != 0 && best->total_vpc == 0)
-		return false;
 	if (cand->avg_heat != best->avg_heat)
 		return cand->avg_heat < best->avg_heat;
 	return cand->blk_id < best->blk_id;
@@ -3931,9 +3921,7 @@ static uint32_t migrate_coldest_superblock_to_victim_queue_from_slc(struct conv_
 			continue;
 		if (sampled_out)
 			*sampled_out += sum.heat_count;
-		if (sum.active || sum.open_writer)
-			continue;
-		if (sum.total_vpc == 0 && sum.total_ipc == 0)
+		if (sum.active || sum.open_writer || sum.total_vpc == 0)
 			continue;
 		if (slc_migration_sb_better(&sum, &best, have_best)) {
 			best = sum;
@@ -9848,12 +9836,12 @@ retry_wb_alloc:
 					int32_t target_die = conv_ftl->die_count ?
 						(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
 
-					slc_retry++;
-					migrate_some_cold_from_slc(conv_ftl, slc_pages_per_superblock(conv_ftl),
-								   target_die);
+						slc_retry++;
+						migrate_some_cold_from_slc(conv_ftl, slc_pages_per_superblock(conv_ftl),
+									   target_die);
 
-					if (should_gc_slc_any_die_critical(conv_ftl, &starved_die))
-						do_gc_for_die(conv_ftl, starved_die, true);
+						if (should_gc_slc_any_die_critical(conv_ftl, &starved_die))
+							do_gc_for_die(conv_ftl, starved_die, true);
 
 					forground_gc(conv_ftl, FGC_MODE_HARD);
 					if (chain_id_valid(conv_ftl, chain_id) && conv_ftl->die_count)
@@ -9964,11 +9952,11 @@ retry_wb_alloc:
 					   conv_ftl->slc_gc_free_thres_low,
 					   slc_stats.total);
 
-				if (slc_free_lines < conv_ftl->slc_high_watermark) {
-					target_lines = conv_ftl->slc_target_watermark;
-					if (!target_lines || target_lines >= slc_stats.total)
-						target_lines = (slc_stats.total > 1) ?
-							(slc_stats.total - 1) : slc_stats.total;
+					if (slc_free_lines < conv_ftl->slc_high_watermark) {
+						target_lines = conv_ftl->slc_target_watermark;
+						if (!target_lines || target_lines >= slc_stats.total)
+							target_lines = (slc_stats.total > 1) ?
+								(slc_stats.total - 1) : slc_stats.total;
 
 					over_lines = (slc_free_lines < target_lines) ?
 						(target_lines - slc_free_lines) : 1;
@@ -9979,11 +9967,11 @@ retry_wb_alloc:
 					if (cap_pages && max_pages > cap_pages)
 						max_pages = cap_pages;
 
-					NVMEV_DEBUG("[DEBUG] SLC free low (%u < %u), migrating %u cold pages (target_free=%u, cap=%u)\n",
-						   slc_free_lines, conv_ftl->slc_high_watermark,
-						   max_pages, target_lines, cap_pages);
-					migrate_some_cold_from_slc(conv_ftl, max_pages, target_die);
-				}
+						NVMEV_DEBUG("[DEBUG] SLC free low (%u < %u), migrating %u cold pages (target_free=%u, cap=%u)\n",
+							    slc_free_lines, conv_ftl->slc_high_watermark,
+							    max_pages, target_lines, cap_pages);
+							migrate_some_cold_from_slc(conv_ftl, max_pages, target_die);
+						}
 
 				if (slc_free_lines < conv_ftl->slc_gc_free_thres_low) {
 					forground_gc(conv_ftl, FGC_MODE_HARD);
