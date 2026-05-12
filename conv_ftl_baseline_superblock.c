@@ -84,9 +84,10 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define SLC_EMERGENCY_RESERVE 10
 #define INVALID_CHAIN_ID U32_MAX
 #define INVALID_CHAIN_DIE 0xFFU
-#define SLC_MIGRATE_FREE_PCT 30U
-#define SLC_SOFT_GC_FREE_PCT 20U
-#define SLC_HARD_GC_FREE_PCT 10U
+#define SLC_MIGRATE_FREE_PCT 10U
+#define SLC_MIGRATE_TARGET_FREE_PCT 15U
+#define SLC_SOFT_GC_FREE_PCT 10U
+#define SLC_HARD_GC_FREE_PCT 5U
 #define REPROMOTE_READ_TRIGGER 1024U
 #define REPROMOTE_BATCH_PAGES 512U
 #define REPROMOTE_HEAT_FLOOR 4U
@@ -4176,7 +4177,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		conv_ftl->slc_high_watermark =
 			pages_to_lines_ceil(tmp, slc_sb_pages);
 
-		tmp = div_u64(slc_total_pages * SLC_MIGRATE_FREE_PCT, 100);
+		tmp = div_u64(slc_total_pages * SLC_MIGRATE_TARGET_FREE_PCT, 100);
 		conv_ftl->slc_target_watermark =
 			pages_to_lines_ceil(tmp, slc_sb_pages);
 
@@ -7925,7 +7926,7 @@ static bool qlc_closed_sb_candidate(struct conv_ftl *conv_ftl, uint32_t blk)
 		return false;
 
 	spin_lock(&conv_ftl->qlc_lock);
-	candidate = !conv_ftl->qlc_sb_state ||
+	candidate = conv_ftl->qlc_sb_state &&
 		conv_ftl->qlc_sb_state[idx] == NVMEV_SB_CLOSED;
 	spin_unlock(&conv_ftl->qlc_lock);
 	return candidate;
@@ -7953,10 +7954,8 @@ static bool qlc_closed_line_candidate(struct conv_ftl *conv_ftl,
 	spin_lock(&conv_ftl->qlc_lock);
 	line = &lm->lines[idx];
 	if (line->vpc > 0 && !(gc_wp && gc_wp->curline == line)) {
-		candidate = true;
-		if (conv_ftl->qlc_sb_state &&
-		    conv_ftl->qlc_sb_state[idx] != NVMEV_SB_CLOSED)
-			candidate = false;
+		candidate = conv_ftl->qlc_sb_state &&
+			conv_ftl->qlc_sb_state[idx] == NVMEV_SB_CLOSED;
 		for (slot = 0; slot < NVMEV_SUPERBLOCK_ACTIVE_LIMIT; slot++) {
 			struct write_pointer *wp =
 				baseline_qlc_active_wp(conv_ftl, slot, die);
@@ -8493,52 +8492,71 @@ retry_wb_alloc:
 			swr.stime = nsecs_completed;
             }
 
-			if (control_tick) {
-				uint32_t target_lines;
-				uint32_t over_lines;
-				uint32_t max_pages;
-				uint32_t cap_pages;
-				int32_t target_die = conv_ftl->die_count ?
-					(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
+				if (control_tick) {
+					uint32_t target_lines;
+					uint32_t max_pages;
+					uint32_t maint_iters = 0;
+					uint32_t maint_limit;
+					int32_t target_die = conv_ftl->die_count ?
+						(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
 
-				collect_slc_stats(conv_ftl, &slc_stats);
-				slc_free_lines = slc_stats.free;
-				slc_used_lines = slc_stats.total - slc_free_lines;
+					collect_slc_stats(conv_ftl, &slc_stats);
+					slc_free_lines = slc_stats.free;
+					slc_used_lines = slc_stats.total - slc_free_lines;
+					target_lines = conv_ftl->slc_target_watermark;
+					if (!target_lines || target_lines >= slc_stats.total)
+						target_lines = (slc_stats.total > 1) ?
+							(slc_stats.total - 1) : slc_stats.total;
+					if (target_lines < conv_ftl->slc_high_watermark)
+						target_lines = conv_ftl->slc_high_watermark;
 
-				NVMEV_DEBUG("[DEBUG] SLC control tick: free_lines=%u, used_lines=%u, migrate=%u, soft_gc=%u, hard_gc=%u, total=%u\n",
-					   slc_free_lines, slc_used_lines,
-					   conv_ftl->slc_high_watermark,
-					   conv_ftl->slc_gc_free_thres_high,
-					   conv_ftl->slc_gc_free_thres_low,
-					   slc_stats.total);
+					NVMEV_DEBUG("[DEBUG] SLC control tick: free_lines=%u, used_lines=%u, migrate_low=%u, target=%u, soft_gc=%u, hard_gc=%u, total=%u\n",
+						   slc_free_lines, slc_used_lines,
+						   conv_ftl->slc_high_watermark,
+						   target_lines,
+						   conv_ftl->slc_gc_free_thres_high,
+						   conv_ftl->slc_gc_free_thres_low,
+						   slc_stats.total);
 
 					if (slc_free_lines < conv_ftl->slc_high_watermark) {
-						target_lines = conv_ftl->slc_target_watermark;
-						if (!target_lines || target_lines >= slc_stats.total)
-							target_lines = (slc_stats.total > 1) ?
-								(slc_stats.total - 1) : slc_stats.total;
+						max_pages = slc_pages_per_superblock(conv_ftl);
+						if (max_pages < 8)
+							max_pages = 8;
+						maint_limit = slc_stats.total ? slc_stats.total : 1;
 
-						over_lines = (slc_free_lines < target_lines) ?
-						(target_lines - slc_free_lines) : 1;
-					max_pages = over_lines * slc_pages_per_superblock(conv_ftl);
-					cap_pages = slc_pages_per_superblock(conv_ftl);
-					if (max_pages < 8)
-						max_pages = 8;
-					if (cap_pages && max_pages > cap_pages)
-						max_pages = cap_pages;
+						while (slc_free_lines < target_lines &&
+						       maint_iters < maint_limit) {
+							if (slc_has_any_victim(conv_ftl)) {
+								if (do_gc_superblock_slc(conv_ftl, true) < 0)
+									break;
+							} else {
+								uint32_t migrated;
 
-						NVMEV_DEBUG("[DEBUG] SLC free low (%u < %u), migrating %u cold pages (target_free=%u, cap=%u)\n",
-							    slc_free_lines, conv_ftl->slc_high_watermark,
-							    max_pages, target_lines, cap_pages);
-							migrate_some_cold_from_slc(conv_ftl, max_pages, target_die);
+								NVMEV_DEBUG("[DEBUG] SLC free low (%u < %u), migrating cold pages (%u pages, target_free=%u)\n",
+									    slc_free_lines,
+									    conv_ftl->slc_high_watermark,
+									    max_pages, target_lines);
+								migrated = migrate_some_cold_from_slc(
+									conv_ftl, max_pages, target_die);
+								if (!migrated && !slc_has_any_victim(conv_ftl))
+									break;
+								if (do_gc_superblock_slc(conv_ftl, true) < 0)
+									break;
+							}
+
+							maint_iters++;
+							collect_slc_stats(conv_ftl, &slc_stats);
+							slc_free_lines = slc_stats.free;
+							slc_used_lines = slc_stats.total - slc_free_lines;
 						}
+					}
 
-				if (slc_free_lines < conv_ftl->slc_gc_free_thres_low) {
-					forground_gc(conv_ftl, FGC_MODE_HARD);
-				} else if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-					forground_gc(conv_ftl, FGC_MODE_SOFT);
+					if (slc_free_lines < conv_ftl->slc_gc_free_thres_low) {
+						forground_gc(conv_ftl, FGC_MODE_HARD);
+					} else if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+						forground_gc(conv_ftl, FGC_MODE_SOFT);
+					}
 				}
-			}
         }
 
 		nsecs_latest = max(nsecs_completed, nsecs_latest);

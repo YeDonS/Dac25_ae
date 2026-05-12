@@ -110,12 +110,13 @@ enum slc_sb_state_e {
 #define SLC_EMERGENCY_RESERVE 10
 #define INVALID_CHAIN_ID U32_MAX
 #define INVALID_CHAIN_DIE 0xFFU
-#define SLC_MIGRATE_FREE_PCT 15U
-#define SLC_MIGRATE_TARGET_FREE_PCT 10U
+#define SLC_MIGRATE_FREE_PCT 10U
+#define SLC_MIGRATE_TARGET_FREE_PCT 15U
 #define SLC_SOFT_GC_FREE_PCT 10U
 #define SLC_HARD_GC_FREE_PCT 5U
 #define SLC_REPROMOTE_GUARD_FREE_PCT 5U
 #define SLC_SB_RECENT_GUARD_PCT 10U
+#define SLC_MIGRATED_VICTIM_BACKLOG_HIGH 8U
 /* QLC GC trigger: kick in when QLC free drops to this fraction of total.
  * Per the design we want QLC GC to start earlier so chain repacking and
  * opportunistic SLC repromotion have more headroom to work with. */
@@ -3869,10 +3870,12 @@ static bool slc_mixed_sb_summary_better(const struct slc_sb_summary_no1 *cand,
 		return false;
 	if (!have_best || !best)
 		return true;
-	if (cand->avg_heat != best->avg_heat)
-		return cand->avg_heat < best->avg_heat;
 	if (cand->heat_sum != best->heat_sum)
 		return cand->heat_sum < best->heat_sum;
+	if (cand->total_vpc != best->total_vpc)
+		return cand->total_vpc < best->total_vpc;
+	if (cand->avg_heat != best->avg_heat)
+		return cand->avg_heat < best->avg_heat;
 	return cand->blk_id < best->blk_id;
 }
 
@@ -3915,6 +3918,18 @@ static bool slc_migrated_victim_enqueue(struct conv_ftl *conv_ftl,
 	queued = slc_migrated_victim_enqueue_locked(conv_ftl, blk_id);
 	spin_unlock(&conv_ftl->slc_lock);
 	return queued;
+}
+
+static uint32_t slc_migrated_victim_backlog(struct conv_ftl *conv_ftl)
+{
+	uint32_t count;
+
+	if (!conv_ftl)
+		return 0;
+	spin_lock(&conv_ftl->slc_lock);
+	count = conv_ftl->slc_sb_migrated_victim_count;
+	spin_unlock(&conv_ftl->slc_lock);
+	return count;
 }
 
 static bool slc_sb_recent_guarded(struct conv_ftl *conv_ftl, uint32_t blk_id)
@@ -3984,10 +3999,12 @@ static bool slc_migration_sb_better(const struct slc_sb_summary_no1 *cand,
 		return false;
 	if (!have_best || !best)
 		return true;
-	if (cand->avg_heat != best->avg_heat)
-		return cand->avg_heat < best->avg_heat;
 	if (cand->heat_sum != best->heat_sum)
 		return cand->heat_sum < best->heat_sum;
+	if (cand->total_vpc != best->total_vpc)
+		return cand->total_vpc < best->total_vpc;
+	if (cand->avg_heat != best->avg_heat)
+		return cand->avg_heat < best->avg_heat;
 	return cand->blk_id < best->blk_id;
 }
 
@@ -7656,6 +7673,21 @@ static int do_gc_superblock_slc(struct conv_ftl *conv_ftl, bool force)
 	return 0;
 }
 
+static uint32_t slc_drain_migrated_victims(struct conv_ftl *conv_ftl,
+					   uint32_t target_backlog,
+					   uint32_t max_gc)
+{
+	uint32_t done = 0;
+
+	while (done < max_gc &&
+	       slc_migrated_victim_backlog(conv_ftl) > target_backlog) {
+		if (do_gc_superblock_slc(conv_ftl, true) < 0)
+			break;
+		done++;
+	}
+	return done;
+}
+
 static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 {
 	static uint64_t gc_last_print_ns = 0;
@@ -10223,7 +10255,7 @@ static bool qlc_closed_sb_candidate(struct conv_ftl *conv_ftl, uint32_t blk)
 		return false;
 
 	spin_lock(&conv_ftl->qlc_lock);
-	candidate = !conv_ftl->qlc_sb_state ||
+	candidate = conv_ftl->qlc_sb_state &&
 		conv_ftl->qlc_sb_state[idx] == NVMEV_SB_CLOSED;
 	spin_unlock(&conv_ftl->qlc_lock);
 	return candidate;
@@ -10258,10 +10290,8 @@ static bool qlc_closed_line_candidate(struct conv_ftl *conv_ftl,
 	if (line->vpc > 0 &&
 	    !(host_wp && host_wp->curline == line) &&
 	    !(gc_wp && gc_wp->curline == line)) {
-		candidate = true;
-		if (conv_ftl->qlc_sb_state &&
-		    conv_ftl->qlc_sb_state[idx] != NVMEV_SB_CLOSED)
-			candidate = false;
+		candidate = conv_ftl->qlc_sb_state &&
+			conv_ftl->qlc_sb_state[idx] == NVMEV_SB_CLOSED;
 	}
 	spin_unlock(&conv_ftl->qlc_lock);
 	return candidate;
@@ -11052,52 +11082,87 @@ retry_wb_alloc:
 			swr.stime = nsecs_completed;
             }
 
-			if (control_tick) {
-				uint32_t target_lines;
-				uint32_t over_lines;
-				uint32_t max_pages;
-				uint32_t cap_pages;
-				int32_t target_die = conv_ftl->die_count ?
-					(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
+				if (control_tick) {
+					uint32_t target_lines;
+					uint32_t max_pages;
+					uint32_t maint_iters = 0;
+					uint32_t maint_limit;
+					uint32_t victim_backlog;
+					int32_t target_die = conv_ftl->die_count ?
+						(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
 
-				collect_slc_stats(conv_ftl, &slc_stats);
-				slc_free_lines = slc_stats.free;
-				slc_used_lines = slc_stats.total - slc_free_lines;
+					collect_slc_stats(conv_ftl, &slc_stats);
+					slc_free_lines = slc_stats.free;
+					slc_used_lines = slc_stats.total - slc_free_lines;
+					target_lines = conv_ftl->slc_target_watermark;
+					if (!target_lines || target_lines >= slc_stats.total)
+						target_lines = (slc_stats.total > 1) ?
+							(slc_stats.total - 1) : slc_stats.total;
+					if (target_lines < conv_ftl->slc_high_watermark)
+						target_lines = conv_ftl->slc_high_watermark;
 
-				NVMEV_DEBUG("[DEBUG] SLC control tick: free_lines=%u, used_lines=%u, migrate=%u, soft_gc=%u, hard_gc=%u, total=%u\n",
-					   slc_free_lines, slc_used_lines,
-					   conv_ftl->slc_high_watermark,
-					   conv_ftl->slc_gc_free_thres_high,
-					   conv_ftl->slc_gc_free_thres_low,
-					   slc_stats.total);
+					NVMEV_DEBUG("[DEBUG] SLC control tick: free_lines=%u, used_lines=%u, migrate_low=%u, target=%u, soft_gc=%u, hard_gc=%u, total=%u\n",
+						   slc_free_lines, slc_used_lines,
+						   conv_ftl->slc_high_watermark,
+						   target_lines,
+						   conv_ftl->slc_gc_free_thres_high,
+						   conv_ftl->slc_gc_free_thres_low,
+						   slc_stats.total);
+
+					victim_backlog = slc_migrated_victim_backlog(conv_ftl);
+					if (victim_backlog > SLC_MIGRATED_VICTIM_BACKLOG_HIGH) {
+						uint32_t drain_limit =
+							victim_backlog - SLC_MIGRATED_VICTIM_BACKLOG_HIGH;
+
+						(void)slc_drain_migrated_victims(
+							conv_ftl, SLC_MIGRATED_VICTIM_BACKLOG_HIGH,
+							drain_limit);
+						collect_slc_stats(conv_ftl, &slc_stats);
+						slc_free_lines = slc_stats.free;
+						slc_used_lines = slc_stats.total - slc_free_lines;
+					}
 
 					if (slc_free_lines < conv_ftl->slc_high_watermark) {
-						target_lines = conv_ftl->slc_target_watermark;
-						if (!target_lines || target_lines >= slc_stats.total)
-							target_lines = (slc_stats.total > 1) ?
-								(slc_stats.total - 1) : slc_stats.total;
+						maint_limit = target_lines - slc_free_lines;
+						if (!maint_limit)
+							maint_limit = 1;
+						max_pages = slc_pages_per_superblock(conv_ftl);
+						if (max_pages < 8)
+							max_pages = 8;
 
-					over_lines = (slc_free_lines < target_lines) ?
-						(target_lines - slc_free_lines) : 1;
-					max_pages = over_lines * slc_pages_per_superblock(conv_ftl);
-					cap_pages = slc_pages_per_superblock(conv_ftl);
-					if (max_pages < 8)
-						max_pages = 8;
-					if (cap_pages && max_pages > cap_pages)
-						max_pages = cap_pages;
+						while (slc_free_lines < target_lines &&
+						       maint_iters < maint_limit) {
+							uint32_t migrated = 0;
 
-						NVMEV_DEBUG("[DEBUG] SLC free low (%u < %u), migrating %u cold pages (target_free=%u, cap=%u)\n",
-							    slc_free_lines, conv_ftl->slc_high_watermark,
-							    max_pages, target_lines, cap_pages);
-							migrate_some_cold_from_slc(conv_ftl, max_pages, target_die);
+							victim_backlog =
+								slc_migrated_victim_backlog(conv_ftl);
+							if (!victim_backlog) {
+								NVMEV_DEBUG("[DEBUG] SLC free low (%u < %u), migrating one cold SB (%u pages, target_free=%u)\n",
+									    slc_free_lines,
+									    conv_ftl->slc_high_watermark,
+									    max_pages, target_lines);
+								migrated = migrate_some_cold_from_slc(
+									conv_ftl, max_pages, target_die);
+								if (!migrated &&
+								    !slc_migrated_victim_backlog(conv_ftl))
+									break;
+							}
+							if (do_gc_superblock_slc(conv_ftl, true) < 0)
+								break;
+
+							maint_iters++;
+							collect_slc_stats(conv_ftl, &slc_stats);
+							slc_free_lines = slc_stats.free;
+							slc_used_lines = slc_stats.total - slc_free_lines;
 						}
+					}
 
-				if (slc_free_lines < conv_ftl->slc_gc_free_thres_low) {
-					forground_gc(conv_ftl, FGC_MODE_HARD);
-				} else if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
-					forground_gc(conv_ftl, FGC_MODE_SOFT);
+					if (slc_free_lines < conv_ftl->slc_gc_free_thres_low) {
+						forground_gc(conv_ftl, FGC_MODE_HARD);
+					} else if (slc_free_lines <= conv_ftl->slc_gc_free_thres_high) {
+						forground_gc(conv_ftl, FGC_MODE_SOFT);
+					}
 				}
-			}
         }
 
 		nsecs_latest = max(nsecs_completed, nsecs_latest);
