@@ -280,6 +280,10 @@ struct conv_ftl {
 	uint32_t *slc_die_resident_count;  /* 当前每个 die 的 SLC resident 页数 */
 	uint32_t *slc_die_resident_cursor; /* 每个 die 的冷迁移扫描游标 */
 	uint32_t slc_migration_scan_cursor; /* SB-level cold migration 扫描游标 */
+	uint32_t slc_migration_no_progress_scan_visits; /* no-progress migration scanned SBs */
+	uint32_t slc_migration_no_progress_victim_q;    /* victim_q when cooldown was armed */
+	uint64_t slc_migration_no_progress_epoch;       /* heat epoch when cooldown was armed */
+	bool slc_migration_no_progress_active;          /* skip repeated no-progress scans */
 	uint32_t slc_resident_capacity_per_die; /* 每个 die 的 resident set 容量 */
 	uint64_t *qlc_page_wcnt;     /* 每个 LPN 写入到 QLC 的次数 */
 	uint64_t qlc_total_wcnt;     /* 写入到 QLC 的总次数 */
