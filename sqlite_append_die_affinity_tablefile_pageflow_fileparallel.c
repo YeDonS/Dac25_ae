@@ -2386,6 +2386,8 @@ static int run_random_row_read_burst(const struct dataset_layout *layout,
 		double dt;
 		int rc;
 
+		if (lower_bound < 0)
+			lower_bound = 0;
 		if (upper_bound <= lower_bound || !stmts[tbl])
 			continue;
 		selectable_rows = (unsigned int)(upper_bound - lower_bound);
@@ -3348,27 +3350,34 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 			if (tbl >= layout->table_count)
 				break;
 
-			row_count = tables[tbl].rows_inserted;
+			row_count = tables[tbl].max_record_id_exclusive > 0 ?
+				(unsigned int)tables[tbl].max_record_id_exclusive :
+				tables[tbl].rows_inserted;
 			reads = read_plan ? read_plan[tbl] : 1U;
 			if (row_count == 0 || reads == 0)
 				continue;
 
-				drop_file_cache(tables[tbl].db_path);
-				ctxs[launched].thread_id = launched;
-				ctxs[launched].table_id = tbl;
-				ctxs[launched].db_path = tables[tbl].db_path;
-				ctxs[launched].record_id_begin = tables[tbl].next_record_id + 1;
-				ctxs[launched].record_id_end = tables[tbl].max_record_id_exclusive;
-				ctxs[launched].repeats = reads * (opts && opts->cold_full_read_iters ?
-					opts->cold_full_read_iters : 1U);
-				ctxs[launched].mode = opts ? opts->cold_full_read_mode :
-					COLD_FULL_READ_FULL_SCAN;
-				ctxs[launched].rng_seed = (opts ? opts->seed : 42U) ^
-					(0x9e3779b9U * (tbl + 1U));
-				ctxs[launched].chunk_rows = opts && opts->cold_random_chunk_rows ?
-					opts->cold_random_chunk_rows : DEFAULT_COLD_RANDOM_CHUNK_ROWS;
-				ctxs[launched].elapsed_sec = 0.0;
-				ctxs[launched].rows_read = 0;
+			drop_file_cache(tables[tbl].db_path);
+			ctxs[launched].thread_id = launched;
+			ctxs[launched].table_id = tbl;
+			ctxs[launched].db_path = tables[tbl].db_path;
+			ctxs[launched].record_id_begin = 0;
+			ctxs[launched].record_id_end = tables[tbl].max_record_id_exclusive;
+			ctxs[launched].repeats = reads * (opts && opts->cold_full_read_iters ?
+				opts->cold_full_read_iters : 1U);
+			ctxs[launched].mode = opts ? opts->cold_full_read_mode :
+				COLD_FULL_READ_FULL_SCAN;
+			ctxs[launched].rng_seed = (opts ? opts->seed : 42U) ^
+				(0x9e3779b9U * (tbl + 1U));
+			ctxs[launched].chunk_rows = opts && opts->cold_random_chunk_rows ?
+				opts->cold_random_chunk_rows : DEFAULT_COLD_RANDOM_CHUNK_ROWS;
+			ctxs[launched].elapsed_sec = 0.0;
+			ctxs[launched].latency_sum_sec = 0.0;
+			ctxs[launched].latency_ops = 0;
+			ctxs[launched].latencies_sec = NULL;
+			ctxs[launched].latency_count = 0;
+			ctxs[launched].latency_cap = 0;
+			ctxs[launched].rows_read = 0;
 				printf("[sqlite_cold_fileparallel] batch=%u table=%u thread=%u ids=[%d,%d) repeats=%u mode=%s chunk_rows=%u\n",
 				       batch_begin / threads, tbl, launched,
 				       ctxs[launched].record_id_begin,
