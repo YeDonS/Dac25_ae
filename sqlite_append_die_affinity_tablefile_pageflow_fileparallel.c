@@ -255,6 +255,11 @@ struct concurrent_read_ctx {
 	unsigned int rng_seed;
 	unsigned int chunk_rows;
 	double elapsed_sec;
+	double latency_sum_sec;
+	unsigned long long latency_ops;
+	double *latencies_sec;
+	size_t latency_count;
+	size_t latency_cap;
 	unsigned long long rows_read;
 };
 
@@ -293,6 +298,12 @@ struct cold_mixed_phase_stats {
 	double read_sec;
 	double elapsed_sec;
 	int rc;
+};
+
+struct latency_sample_vec {
+	double *samples;
+	size_t count;
+	size_t cap;
 };
 
 static const struct option long_opts[] = {
@@ -2196,6 +2207,110 @@ static unsigned int pick_table(unsigned int table_count, const struct workload_o
 			       unsigned int *state);
 static void drop_file_cache(const char *path);
 
+static int latency_vec_push(struct latency_sample_vec *vec, double value)
+{
+	double *new_samples;
+	size_t new_cap;
+
+	if (!vec)
+		return 0;
+	if (vec->count == vec->cap) {
+		new_cap = vec->cap ? vec->cap * 2U : 4096U;
+		new_samples = realloc(vec->samples, new_cap * sizeof(*vec->samples));
+		if (!new_samples)
+			return -ENOMEM;
+		vec->samples = new_samples;
+		vec->cap = new_cap;
+	}
+	vec->samples[vec->count++] = value;
+	return 0;
+}
+
+static int latency_vec_extend(struct latency_sample_vec *dst,
+			      const double *src, size_t count)
+{
+	double *new_samples;
+	size_t new_cap;
+
+	if (!dst || !src || count == 0)
+		return 0;
+	if (dst->count + count > dst->cap) {
+		new_cap = dst->cap ? dst->cap : 4096U;
+		while (new_cap < dst->count + count)
+			new_cap *= 2U;
+		new_samples = realloc(dst->samples, new_cap * sizeof(*dst->samples));
+		if (!new_samples)
+			return -ENOMEM;
+		dst->samples = new_samples;
+		dst->cap = new_cap;
+	}
+	memcpy(dst->samples + dst->count, src, count * sizeof(*src));
+	dst->count += count;
+	return 0;
+}
+
+static void latency_vec_free(struct latency_sample_vec *vec)
+{
+	if (!vec)
+		return;
+	free(vec->samples);
+	vec->samples = NULL;
+	vec->count = 0;
+	vec->cap = 0;
+}
+
+static int cmp_double_asc(const void *a, const void *b)
+{
+	double da = *(const double *)a;
+	double db = *(const double *)b;
+
+	if (da < db)
+		return -1;
+	if (da > db)
+		return 1;
+	return 0;
+}
+
+static double percentile_sorted(const double *samples, size_t count, double pct)
+{
+	size_t idx;
+
+	if (!samples || count == 0)
+		return 0.0;
+	if (pct <= 0.0)
+		return samples[0];
+	if (pct >= 100.0)
+		return samples[count - 1];
+	idx = (size_t)ceil((pct / 100.0) * (double)count);
+	if (idx == 0)
+		idx = 1;
+	if (idx > count)
+		idx = count;
+	return samples[idx - 1];
+}
+
+static void report_latency_samples(const char *label, struct latency_sample_vec *vec)
+{
+	double sum = 0.0;
+	double avg;
+
+	if (!label || !vec || vec->count == 0) {
+		printf("[sqlite_init] %s_latency count=0\n", label ? label : "read");
+		return;
+	}
+	qsort(vec->samples, vec->count, sizeof(*vec->samples), cmp_double_asc);
+	for (size_t i = 0; i < vec->count; ++i)
+		sum += vec->samples[i];
+	avg = sum / (double)vec->count;
+	printf("[sqlite_init] %s_latency count=%zu avg=%.9fs p50=%.9fs p95=%.9fs p99=%.9fs p999=%.9fs max=%.9fs\n",
+	       label, vec->count, avg,
+	       percentile_sorted(vec->samples, vec->count, 50.0),
+	       percentile_sorted(vec->samples, vec->count, 95.0),
+	       percentile_sorted(vec->samples, vec->count, 99.0),
+	       percentile_sorted(vec->samples, vec->count, 99.9),
+	       vec->samples[vec->count - 1]);
+}
+
 static unsigned long long cold_mixed_target_reads(unsigned long long rows_written,
 						  double ratio)
 {
@@ -2218,6 +2333,7 @@ static int run_random_row_read_burst(const struct dataset_layout *layout,
 				     double *cold_per_table,
 				     double *table_latency,
 				     unsigned long long *table_read_ops,
+				     struct latency_sample_vec *latencies,
 				     unsigned long long *total_rows_out,
 				     double *elapsed_out)
 {
@@ -2262,10 +2378,11 @@ static int run_random_row_read_burst(const struct dataset_layout *layout,
 		rc = sqlite3_step(stmts[tbl]);
 		if (rc != SQLITE_DONE)
 			return -EIO;
-		dt = monotonic_sec() - t0;
+			dt = monotonic_sec() - t0;
+			(void)latency_vec_push(latencies, dt);
 
-		if (cold_per_table)
-			cold_per_table[tbl] += dt;
+			if (cold_per_table)
+				cold_per_table[tbl] += dt;
 		if (table_latency)
 			table_latency[tbl] += dt;
 		if (table_read_ops)
@@ -2403,10 +2520,11 @@ static int run_cold_mixed_append_random_read(const struct dataset_layout *layout
 						reads_due = target_reads - stats->row_reads;
 				}
 
-				rc = run_random_row_read_burst(layout, tables, opts, stmts, reads_due,
-							       &rng_state, cold_per_table,
-							       table_latency, table_read_ops,
-							       &stats->row_reads, &read_elapsed);
+					rc = run_random_row_read_burst(layout, tables, opts, stmts, reads_due,
+								       &rng_state, cold_per_table,
+								       table_latency, table_read_ops,
+								       NULL, &stats->row_reads,
+								       &read_elapsed);
 				stats->read_sec += read_elapsed;
 				if (rc != 0)
 					goto out;
@@ -2701,6 +2819,27 @@ static int pread_full(int fd, void *buf, size_t bytes, off_t off)
 	return 0;
 }
 
+static int concurrent_read_push_latency(struct concurrent_read_ctx *ctx, double latency)
+{
+	struct latency_sample_vec vec;
+	int rc;
+
+	if (!ctx)
+		return 0;
+	vec.samples = ctx->latencies_sec;
+	vec.count = ctx->latency_count;
+	vec.cap = ctx->latency_cap;
+	rc = latency_vec_push(&vec, latency);
+	ctx->latencies_sec = vec.samples;
+	ctx->latency_count = vec.count;
+	ctx->latency_cap = vec.cap;
+	if (rc != 0)
+		return rc;
+	ctx->latency_sum_sec += latency;
+	ctx->latency_ops++;
+	return 0;
+}
+
 static void *full_scan_worker(void *arg)
 {
 	struct concurrent_read_ctx *ctx = arg;
@@ -2745,59 +2884,81 @@ static void *full_scan_worker(void *arg)
 			for (unsigned int i = 0; i < chunk_count; ++i)
 				order[i] = i;
 			shuffle_u32(order, chunk_count, &state);
-			for (unsigned int i = 0; i < chunk_count; ++i) {
-				int begin = ctx->record_id_begin + (int)(order[i] * chunk_rows);
-				int end = begin + (int)chunk_rows;
-				int rc;
+				for (unsigned int i = 0; i < chunk_count; ++i) {
+					int begin = ctx->record_id_begin + (int)(order[i] * chunk_rows);
+					int end = begin + (int)chunk_rows;
+					double t0;
+					double dt;
+					int rc;
 
-				if (end > ctx->record_id_end)
-					end = ctx->record_id_end;
-				rc = scan_stmt_range(stmt, begin, end, &ctx->rows_read);
-				if (rc != SQLITE_DONE) {
-					rep = ctx->repeats;
-					break;
+					if (end > ctx->record_id_end)
+						end = ctx->record_id_end;
+					t0 = monotonic_sec();
+					rc = scan_stmt_range(stmt, begin, end, &ctx->rows_read);
+					dt = monotonic_sec() - t0;
+					if (rc != SQLITE_DONE) {
+						rep = ctx->repeats;
+						break;
+					}
+					if (concurrent_read_push_latency(ctx, dt) != 0) {
+						rep = ctx->repeats;
+						break;
+					}
 				}
-			}
-			}
+				}
 			free(order);
 		} else if (ctx->mode == COLD_FULL_READ_QUOTA_ROW_GROUPED) {
 			unsigned int total_rows = (ctx->record_id_end > ctx->record_id_begin) ?
 				(unsigned int)(ctx->record_id_end - ctx->record_id_begin) : 0U;
 			unsigned int state = ctx->rng_seed ? ctx->rng_seed : 1U;
 
-			for (unsigned int i = 0; i < ctx->repeats && total_rows > 0; ++i) {
-				int row_id = ctx->record_id_begin +
-					(int)(next_rand(&state) % total_rows);
-				int rc = scan_stmt_one_row(stmt, row_id, &ctx->rows_read);
+				for (unsigned int i = 0; i < ctx->repeats && total_rows > 0; ++i) {
+					int row_id = ctx->record_id_begin +
+						(int)(next_rand(&state) % total_rows);
+					double t0 = monotonic_sec();
+					int rc = scan_stmt_one_row(stmt, row_id, &ctx->rows_read);
+					double dt = monotonic_sec() - t0;
 
-				if (rc != SQLITE_DONE)
-					break;
-			}
-		} else if (ctx->mode == COLD_FULL_READ_RANDOM_ROW) {
+					if (rc != SQLITE_DONE)
+						break;
+					if (concurrent_read_push_latency(ctx, dt) != 0)
+						break;
+				}
+			} else if (ctx->mode == COLD_FULL_READ_RANDOM_ROW) {
 			unsigned int total_rows = (ctx->record_id_end > ctx->record_id_begin) ?
 				(unsigned int)(ctx->record_id_end - ctx->record_id_begin) : 0U;
 			unsigned int state = ctx->rng_seed ? ctx->rng_seed : 1U;
 
 			for (unsigned int rep = 0; rep < ctx->repeats && total_rows > 0; ++rep) {
-				for (unsigned int i = 0; i < total_rows; ++i) {
-					int row_id = ctx->record_id_begin +
-						(int)(next_rand(&state) % total_rows);
-					int rc = scan_stmt_one_row(stmt, row_id, &ctx->rows_read);
+					for (unsigned int i = 0; i < total_rows; ++i) {
+						int row_id = ctx->record_id_begin +
+							(int)(next_rand(&state) % total_rows);
+						double t0 = monotonic_sec();
+						int rc = scan_stmt_one_row(stmt, row_id, &ctx->rows_read);
+						double dt = monotonic_sec() - t0;
 
-					if (rc != SQLITE_DONE) {
-						rep = ctx->repeats;
-						break;
+						if (rc != SQLITE_DONE) {
+							rep = ctx->repeats;
+							break;
+						}
+						if (concurrent_read_push_latency(ctx, dt) != 0) {
+							rep = ctx->repeats;
+							break;
+						}
 					}
 				}
+			} else {
+				for (unsigned int rep = 0; rep < ctx->repeats; ++rep) {
+					double t0 = monotonic_sec();
+					int rc = scan_stmt_range(stmt, ctx->record_id_begin,
+						      ctx->record_id_end, &ctx->rows_read);
+					double dt = monotonic_sec() - t0;
+				if (rc != SQLITE_DONE)
+					break;
+				if (concurrent_read_push_latency(ctx, dt) != 0)
+					break;
 			}
-		} else {
-			for (unsigned int rep = 0; rep < ctx->repeats; ++rep) {
-				int rc = scan_stmt_range(stmt, ctx->record_id_begin,
-					      ctx->record_id_end, &ctx->rows_read);
-			if (rc != SQLITE_DONE)
-				break;
 		}
-	}
 
 	ctx->elapsed_sec = monotonic_sec() - start;
 	sqlite3_finalize(stmt);
@@ -3124,6 +3285,9 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 					    unsigned int threads,
 					    const unsigned int *read_plan,
 					    double *cold_per_table,
+					    double *table_latency,
+					    unsigned long long *table_read_ops,
+					    struct latency_sample_vec *cold_read_latencies,
 					    unsigned long long *total_rows_out)
 {
 	pthread_t *tids = NULL;
@@ -3199,9 +3363,18 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 			pthread_join(tids[i], NULL);
 			total_rows += ctxs[i].rows_read;
 			cold_per_table[tbl] = ctxs[i].elapsed_sec;
+			if (table_latency)
+				table_latency[tbl] += ctxs[i].latency_sum_sec;
+			if (table_read_ops)
+				table_read_ops[tbl] += ctxs[i].latency_ops;
+			(void)latency_vec_extend(cold_read_latencies,
+						 ctxs[i].latencies_sec,
+						 ctxs[i].latency_count);
 			printf("[sqlite_cold_fileparallel] batch=%u table=%u thread=%u time=%.6fs rows=%llu\n",
 			       batch_begin / threads, tbl, i,
 			       ctxs[i].elapsed_sec, ctxs[i].rows_read);
+			free(ctxs[i].latencies_sec);
+			ctxs[i].latencies_sec = NULL;
 		}
 	}
 
@@ -3960,6 +4133,7 @@ static int run_init_mode(const struct workload_options *opts)
 	struct append_phase_stats cold_append_stats = {};
 	struct append_phase_ctx cold_append_ctx = {};
 	struct cold_mixed_phase_stats cold_mixed_stats = {};
+	struct latency_sample_vec cold_read_latencies = {};
 	pthread_t cold_append_thread;
 	struct bg_nand_stats bg_nand_before = {};
 	struct bg_nand_stats bg_nand_after_mixed = {};
@@ -4290,7 +4464,10 @@ static int run_init_mode(const struct workload_options *opts)
 
 		cold_read_time = run_cold_full_scan_concurrent(&layout, tables, opts,
 							       opts->cold_concurrent_threads,
-							       read_plan, cold_per_table, &cold_rows);
+							       read_plan, cold_per_table,
+							       table_latency, table_read_ops,
+							       &cold_read_latencies,
+							       &cold_rows);
 		if (cold_append_thread_started) {
 			pthread_join(cold_append_thread, NULL);
 			cold_append_thread_started = false;
@@ -4410,6 +4587,7 @@ static int run_init_mode(const struct workload_options *opts)
 			map_cache_stats_out_path);
 	}
 	report_cold_tail_latency(&layout, tables, table_latency, table_read_ops);
+	report_latency_samples("cold_read", &cold_read_latencies);
 	dataset_layout_to_file(layout_path, &layout);
 
 	{
@@ -4538,6 +4716,7 @@ out:
 	free(table_latency);
 	free(cold_per_table);
 	free(table_read_ops);
+	latency_vec_free(&cold_read_latencies);
 	close_refstyle_dummy_file(&ref_dummy);
 	if (tables) {
 		for (unsigned int i = 0; i < layout.table_count; ++i)
