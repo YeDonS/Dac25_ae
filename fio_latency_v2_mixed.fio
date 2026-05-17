@@ -1,0 +1,228 @@
+; NVMeVirt latency-maintenance workload
+; Usage:
+;   sudo fio --filename=/dev/nvme0n1 evaluation/fio_latency_v2_mixed.fio \
+;     --output=result/latency_v2_mixed.json --output-format=json
+;
+; Layout:
+;   0-8G  shared read/write measurement region
+;
+; Init alternates 1G write + 10G normal-distribution read for 8 rounds:
+; total init write ~= 8G, total init read ~= 80G.  The final read/write jobs
+; run concurrently because there is no stonewall between them.
+
+[global]
+ioengine=libaio
+direct=1
+thread=1
+group_reporting=1
+time_based=0
+norandommap=1
+randrepeat=0
+invalidate=1
+bs=4k
+iodepth=32
+filename=/dev/nvme0n1
+
+[init_write_0g_1g]
+description=Init round 1: write 1G before reading it.
+rw=write
+offset=0
+size=1G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_read_0g_1g]
+description=Init round 1: normal-distribution read 10G from the 1G just written.
+rw=randread
+random_distribution=normal
+offset=0
+size=1G
+io_size=10G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_write_1g_2g]
+description=Init round 2: write next 1G.
+rw=write
+offset=1G
+size=1G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_read_1g_2g]
+description=Init round 2: normal-distribution read 10G from the 1G just written.
+rw=randread
+random_distribution=normal
+offset=1G
+size=1G
+io_size=10G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_write_2g_3g]
+description=Init round 3: write next 1G.
+rw=write
+offset=2G
+size=1G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_read_2g_3g]
+description=Init round 3: normal-distribution read 10G from the 1G just written.
+rw=randread
+random_distribution=normal
+offset=2G
+size=1G
+io_size=10G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_write_3g_4g]
+description=Init round 4: write next 1G.
+rw=write
+offset=3G
+size=1G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_read_3g_4g]
+description=Init round 4: normal-distribution read 10G from the 1G just written.
+rw=randread
+random_distribution=normal
+offset=3G
+size=1G
+io_size=10G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_write_4g_5g]
+description=Init round 5: write next 1G.
+rw=write
+offset=4G
+size=1G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_read_4g_5g]
+description=Init round 5: normal-distribution read 10G from the 1G just written.
+rw=randread
+random_distribution=normal
+offset=4G
+size=1G
+io_size=10G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_write_5g_6g]
+description=Init round 6: write next 1G.
+rw=write
+offset=5G
+size=1G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_read_5g_6g]
+description=Init round 6: normal-distribution read 10G from the 1G just written.
+rw=randread
+random_distribution=normal
+offset=5G
+size=1G
+io_size=10G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_write_6g_7g]
+description=Init round 7: write next 1G.
+rw=write
+offset=6G
+size=1G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_read_6g_7g]
+description=Init round 7: normal-distribution read 10G from the 1G just written.
+rw=randread
+random_distribution=normal
+offset=6G
+size=1G
+io_size=10G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_write_7g_8g]
+description=Init round 8: write next 1G.
+rw=write
+offset=7G
+size=1G
+iodepth=32
+numjobs=1
+stonewall
+
+[init_read_7g_8g]
+description=Init round 8: normal-distribution read 10G from the 1G just written.
+rw=randread
+random_distribution=normal
+offset=7G
+size=1G
+io_size=10G
+iodepth=32
+numjobs=1
+stonewall
+
+[prewarm_seq_read]
+description=Sequential read warmup over the full initialized 8G region.
+rw=read
+offset=0
+size=8G
+iodepth=32
+numjobs=1
+stonewall
+
+[prewarm_normal_read]
+description=Normal-distribution random read warmup over the full initialized 8G region.
+rw=randread
+random_distribution=normal
+offset=0
+size=8G
+iodepth=32
+numjobs=2
+io_size=16G
+stonewall
+
+[measure_reads]
+description=Measured normal-distribution reads; 2 jobs x 40G = about 80G total reads.
+rw=randread
+random_distribution=normal
+offset=0
+size=8G
+iodepth=16
+numjobs=2
+io_size=40G
+write_lat_log=lat_v2_read
+log_avg_msec=1000
+
+[measure_writes]
+description=Concurrent random writes; 2 jobs x 4G = about 8G total writes.
+rw=randwrite
+random_distribution=normal
+offset=0
+size=8G
+iodepth=32
+numjobs=2
+io_size=4G
+write_lat_log=lat_v2_write
+log_avg_msec=1000

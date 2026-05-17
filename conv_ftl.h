@@ -310,21 +310,13 @@ struct conv_ftl {
 	struct workqueue_struct *bg_migration_wq;
 	struct work_struct repromotion_work;
 	struct work_struct qlc_rebalance_work;
-	/* [LATENCY v1] idle-aware preemptible maintenance.
-	 * 仅 conv_ftl_latency_superblock.c 变体使用; 其他变体不 INIT_WORK 也不 queue,
-	 * 这里只占 ~24B struct 空间且为 0 初始化, baseline 不受影响。
-	 *
-	 * 设计动机: 旧 baseline 在 conv_write() control_tick 内同步调用
-	 * migrate_some_cold_from_slc() / forground_gc(), 把 SLC->QLC 迁移和 SLC GC
-	 * 压在 host write entry 的关键路径上 (图 scenario A)。Latency 变体改成:
-	 *  - 低/中水位 (>5% SLC free): conv_write 只 enqueue + kick slc_maint_work,
-	 *    实际工作在 bg_migration_wq 上跑, 不延长 host nsecs_target;
-	 *  - 高水位 (2%-5%): conv_write 做 1 个 page 的 inline-bounded sync 保证 forward
-	 *    progress, 大头仍 enqueue;
-	 *  - 紧急 (<2%): 保留原同步路径, host write 被阻塞至 SLC free 回升。 */
+	/* SLC maintenance worker state. Baseline accounts foreground SLC
+	 * migration/GC in conv_write() completion time; latency uses these fields
+	 * for BG/URGENT async maintenance and accounts only foreground stalls. */
 	struct work_struct slc_maint_work;
 	uint64_t slc_maint_runs;
 	uint64_t slc_maint_pages;
+	uint64_t fg_maint_latest_ns;          /* foreground SLC maintenance completion time */
 	atomic64_t total_host_reads;
 	uint32_t repromote_period_reads;       /* 每多少次主机读触发一次回迁 worker */
 	uint32_t repromote_budget_per_run;     /* 每轮回迁最多处理多少页 */
@@ -539,6 +531,10 @@ struct conv_ftl {
 	uint64_t maint_v2_demand_skips;
 	uint64_t maint_v2_emergency_overrides;
 	uint64_t maint_v2_tasks_done;
+	uint64_t maint_v2_tasks_requeued;
+	uint64_t maint_v2_tasks_yielded;
+	uint64_t maint_v2_stale_tasks;
+	uint64_t maint_v2_no_progress_runs;
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
