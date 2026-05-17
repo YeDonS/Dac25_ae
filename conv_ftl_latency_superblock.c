@@ -894,6 +894,9 @@ static inline bool qlc_zone_is_fast(uint8_t zone)
 static noinline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn);
 static noinline uint64_t get_rmap_ent(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static inline uint32_t encode_die(struct ssdparams *spp, const struct ppa *ppa);
+static inline void decode_die(struct ssdparams *spp, uint32_t die,
+			      uint32_t *ch, uint32_t *lun);
+static inline struct line_mgmt *get_slc_die_lm(struct conv_ftl *conv_ftl, uint32_t die);
 static inline bool mapped_ppa(struct ppa *ppa);
 static inline bool valid_ppa(struct conv_ftl *conv_ftl, struct ppa *ppa);
 static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id);
