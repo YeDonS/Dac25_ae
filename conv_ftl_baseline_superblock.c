@@ -6593,18 +6593,20 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 	die %= conv_ftl->die_count;
 	wp = &conv_ftl->gc_slc_lunwp[die];
 	lm = get_slc_die_lm(conv_ftl, die);
-	if (!wp->curline) {
-		NVMEV_ERROR("advance_gc_slc_write_pointer: GC WP for die %u not initialized\n", die);
-		return;
-	}
 	if (!lm || !lm->lines) {
 		NVMEV_ERROR("advance_gc_slc_write_pointer: missing line manager for die %u\n", die);
 		return;
 	}
 
+	spin_lock(&conv_ftl->slc_lock);
+	if (!wp->curline) {
+		spin_unlock(&conv_ftl->slc_lock);
+		NVMEV_DEBUG("advance_gc_slc_write_pointer: GC WP for die %u not initialized\n", die);
+		return;
+	}
+
 	wp->pg++;
 	if (wp->pg >= spp->pgs_per_blk) {
-		spin_lock(&conv_ftl->slc_lock);
 		if (wp->curline->vpc == spp->pgs_per_lun_line) {
 			list_add_tail(&wp->curline->entry, &lm->full_line_list);
 			lm->full_line_cnt++;
@@ -6616,11 +6618,11 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 		wp->blk = 0;
 		wp->pg = 0;
 		wp->pl = 0;
-		spin_unlock(&conv_ftl->slc_lock);
 	}
 
 	if ((wp->pg % spp->pgs_per_oneshotpg) == 0)
 		conv_ftl->lunpointer = (die + 1) % conv_ftl->die_count;
+	spin_unlock(&conv_ftl->slc_lock);
 }
 
 static void qlc_reset_die_progress(struct write_pointer *wp)
