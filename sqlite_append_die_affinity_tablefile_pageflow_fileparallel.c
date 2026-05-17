@@ -82,6 +82,7 @@
 #define DEFAULT_COLD_EXTRA_APPEND_BYTES (0ULL)
 #define DEFAULT_COLD_FULL_READ_ITERS 1U
 #define DEFAULT_COLD_RANDOM_CHUNK_ROWS 128U
+#define WORKLOAD_FIX_MARKER "cold-read-base-range-v2"
 #define DIE_STATS_RESET_PATH "/sys/module/nvmev/parameters/die_stats_reset"
 
 enum cold_extra_mode {
@@ -4319,6 +4320,7 @@ static int run_init_mode(const struct workload_options *opts)
 	       layout.table_count ? layout.rows_per_table[0] : 0U);
 	printf("[sqlite_init] cold_parallel_model=fileparallel one-thread-per-table-batch threads=%u\n",
 	       opts->cold_concurrent_threads ? opts->cold_concurrent_threads : 1U);
+	printf("[sqlite_init] workload_fix=%s\n", WORKLOAD_FIX_MARKER);
 	printf("[sqlite_init] refstyle_dummy_bytes=%llu align_pages=%u mode=%s\n",
 	       opts->refstyle_dummy_bytes,
 	       opts->align_pages,
