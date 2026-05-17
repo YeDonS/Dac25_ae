@@ -80,6 +80,7 @@ struct heat_tracking {
 	uint64_t *access_count;     /* 每个 LPN 的访问计数 */
 	uint64_t *last_access_time; /* 每个 LPN 的最后访问时间 */
 	uint64_t *write_epoch;      /* 最近写入序号 */
+	uint64_t *write_heat_epoch; /* LPN 最近写入时的全局 heat epoch */
 	uint32_t migration_threshold; /* 迁移阈值 */
 };
 
@@ -278,6 +279,7 @@ struct conv_ftl {
 	uint32_t *slc_resident_slot; /* LPN -> slot in slc_resident_lpns, U32_MAX if absent */
 	uint32_t *slc_die_resident_count;  /* 当前每个 die 的 SLC resident 页数 */
 	uint32_t *slc_die_resident_cursor; /* 每个 die 的冷迁移扫描游标 */
+	uint32_t slc_migration_scan_cursor; /* SB-level cold migration 扫描游标 */
 	uint32_t slc_resident_capacity_per_die; /* 每个 die 的 resident set 容量 */
 	uint64_t *qlc_page_wcnt;     /* 每个 LPN 写入到 QLC 的次数 */
 	uint64_t qlc_total_wcnt;     /* 写入到 QLC 的总次数 */
@@ -449,6 +451,7 @@ struct conv_ftl {
 	atomic_t test_phase_active_reads;       /* currently active host reads */
 	atomic_t test_phase_active_overwrites;  /* currently active overwrite writes */
 	atomic_t test_phase_active_bg_ops;      /* currently active bg migration ops */
+	uint64_t heat_epoch;                    /* read/preheat epoch for cold migration guard */
 	atomic64_t slc_resident_page_cnt; /* 当前驻留在 SLC 的页面数 */
 	atomic_t slc_recover_lock;        /* 序列化 SLC 回收 */
 	spinlock_t event_log_lock;        /* 保护调试事件环形日志 */
@@ -475,6 +478,7 @@ struct conv_ftl {
 	struct dentry *debug_lpn_die_change_stats; /* debugfs entry for current die-change counts */
 	struct dentry *debug_test_phase;   /* debugfs entry for toggling test phase */
 	struct dentry *debug_test_phase_stats; /* debugfs entry for test phase counters */
+	struct dentry *debug_heat_epoch;   /* debugfs entry for advancing heat epoch */
 	struct dentry *debug_read_repromotion; /* debugfs entry for read repromotion toggle */
 	struct dentry *debug_map_cache_stats; /* debugfs entry for CMT hit/miss counters */
 	struct dentry *debug_map_residency_csv; /* debugfs CSV entry for mapping residency snapshots */

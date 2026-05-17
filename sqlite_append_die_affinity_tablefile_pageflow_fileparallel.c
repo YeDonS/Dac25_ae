@@ -76,6 +76,7 @@
 #define DEFAULT_MAP_CACHE_STATS_PATH "/sys/kernel/debug/nvmev/ftl0/map_cache_stats"
 #define DEFAULT_FTL_HOST_PAGE_BYTES 4096ULL
 #define DEFAULT_TEST_PHASE_PATH "/sys/kernel/debug/nvmev/ftl0/test_phase"
+#define DEFAULT_HEAT_EPOCH_PATH "/sys/kernel/debug/nvmev/ftl0/heat_epoch"
 #define DEFAULT_GC_NAND_TIMING_PATH "/sys/module/nvmev/parameters/gc_nand_timing"
 #define DEFAULT_BG_NAND_STATS_PATH "/sys/module/nvmev/parameters/bg_nand_stats"
 #define DEFAULT_COLD_EXTRA_APPEND_BYTES (0ULL)
@@ -215,6 +216,7 @@ struct workload_options {
 	unsigned long long refstyle_dummy_bytes;
 	unsigned int align_pages;
 	const char *test_phase_path;
+	const char *heat_epoch_path;
 	bool enable_gc_nand_timing;
 	const char *gc_nand_timing_path;
 	const char *bg_nand_stats_path;
@@ -349,6 +351,7 @@ static const struct option long_opts[] = {
 	{"map-cache-stats-path", required_argument, NULL, 1037},
 	{"cold-extra-read-ratio", required_argument, NULL, 1038},
 	{"cold-extra-row-reads-per-batch", required_argument, NULL, 1039},
+	{"heat-epoch-path", required_argument, NULL, 1040},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -628,6 +631,26 @@ static int set_test_phase_state(const struct workload_options *opts,
 	       enabled ? "on" : "off",
 	       phase ? phase : "phase",
 	       opts->test_phase_path);
+	return 0;
+}
+
+static int advance_heat_epoch(const struct workload_options *opts, const char *phase)
+{
+	int rc;
+
+	if (!opts || !opts->heat_epoch_path || !opts->heat_epoch_path[0])
+		return 0;
+
+	rc = write_string_file(opts->heat_epoch_path, "1");
+	if (rc != 0) {
+		fprintf(stderr,
+			"[sqlite_init] failed to advance heat_epoch for %s via %s (%d)\n",
+			phase ? phase : "phase", opts->heat_epoch_path, rc);
+		return 0;
+	}
+
+	printf("[sqlite_init] heat_epoch_advance phase=%s path=%s\n",
+	       phase ? phase : "phase", opts->heat_epoch_path);
 	return 0;
 }
 
@@ -4383,6 +4406,9 @@ static int run_init_mode(const struct workload_options *opts)
 					    table_latency, table_read_ops, &event_elapsed);
 			if (rc != 0)
 				goto out;
+			rc = advance_heat_epoch(opts, "init-read-event");
+			if (rc != 0)
+				goto out;
 			total_read_time += event_elapsed;
 			while (next_read_event_pages && next_read_event_pages <= grown_pages_total)
 				next_read_event_pages += opts->interleave_pages;
@@ -4746,8 +4772,9 @@ static void usage(const char *prog)
 			"  --cold-full-read-iters N\n"
 			"  --page-chain-path PATH\n"
 		"  --page-die-transition-path PATH\n"
-			"  --enable-gc-nand-timing\n"
-			"  --gc-nand-timing-path PATH\n"
+				"  --enable-gc-nand-timing\n"
+				"  --heat-epoch-path PATH\n"
+				"  --gc-nand-timing-path PATH\n"
 			"  --bg-nand-stats-path PATH\n"
 			"  --map-cache-stats-path PATH\n"
 			"  --cold-extra-append-bytes SIZE\n"
@@ -4790,6 +4817,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->refstyle_dummy_bytes = DEFAULT_REFSTYLE_DUMMY_BYTES;
 	opts->align_pages = 0;
 	opts->test_phase_path = DEFAULT_TEST_PHASE_PATH;
+	opts->heat_epoch_path = DEFAULT_HEAT_EPOCH_PATH;
 	opts->enable_gc_nand_timing = false;
 	opts->gc_nand_timing_path = DEFAULT_GC_NAND_TIMING_PATH;
 	opts->bg_nand_stats_path = DEFAULT_BG_NAND_STATS_PATH;
@@ -4888,12 +4916,15 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 				break;
 			case 1021:
 				break;
-		case 1022:
-			opts->test_phase_path = optarg;
-			break;
-		case 1023:
-			opts->page_tier_path = optarg;
-			break;
+			case 1022:
+				opts->test_phase_path = optarg;
+				break;
+			case 1040:
+				opts->heat_epoch_path = optarg;
+				break;
+			case 1023:
+				opts->page_tier_path = optarg;
+				break;
 		case 1024:
 			break;
 		case 1025:

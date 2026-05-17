@@ -34,6 +34,7 @@ SQLITE_ALIGN_PAGES=${SQLITE_ALIGN_PAGES:-0}
 SQLITE_DIE_AFFINITY_STATS_PATH=${SQLITE_DIE_AFFINITY_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/die_affinity_stats}
 SQLITE_LPN_DIE_CHANGE_STATS_PATH=${SQLITE_LPN_DIE_CHANGE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/lpn_die_change_stats}
 SQLITE_TEST_PHASE_PATH=${SQLITE_TEST_PHASE_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase}
+SQLITE_HEAT_EPOCH_PATH=${SQLITE_HEAT_EPOCH_PATH:-/sys/kernel/debug/nvmev/ftl0/heat_epoch}
 SQLITE_TEST_PHASE_STATS_PATH=${SQLITE_TEST_PHASE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase_stats}
 SQLITE_SUPERBLOCK_STATS_PATH=${SQLITE_SUPERBLOCK_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/superblock_stats}
 SQLITE_DIE_STATS_PATH=${SQLITE_DIE_STATS_PATH:-/sys/module/nvmev/parameters/die_stats}
@@ -237,7 +238,7 @@ run_one_test() {
     echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  cold_mode=$cold_mode  window_pages=$window_pages  cmt=$cmt_label($cmt_bytes bytes)  tag=$tag"
     echo "  per-table-db=ON  logical_row_bytes~32KB  est_row_pages~8  tables=$SQLITE_TABLE_COUNT  rows/tbl_override=$SQLITE_ROWS_PER_TABLE"
     echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$window_pages  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  normal_mean=$NORMAL_MEAN  normal_stddev=$NORMAL_STDDEV  cold_mode=$cold_mode  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  cold_extra_read_ratio=$SQLITE_COLD_EXTRA_READ_RATIO  cold_extra_row_reads_per_batch=$SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
-    echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH"
+    echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH  heat_epoch_path=$SQLITE_HEAT_EPOCH_PATH"
     echo "  note: default run uses no dummy; cold scan uses one thread per table file within each batch"
     echo "================================================================"
 
@@ -293,9 +294,10 @@ run_one_test() {
         --cold-extra-mode "$SQLITE_COLD_EXTRA_MODE" \
         --cold-extra-read-ratio "$SQLITE_COLD_EXTRA_READ_RATIO" \
         --cold-extra-row-reads-per-batch "$SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH" \
-        --cold-concurrent-threads "$threads" \
-        --test-phase-path "$SQLITE_TEST_PHASE_PATH" \
-        --gc-nand-timing-path "$SQLITE_GC_NAND_TIMING_PATH" \
+	        --cold-concurrent-threads "$threads" \
+	        --test-phase-path "$SQLITE_TEST_PHASE_PATH" \
+	        --heat-epoch-path "$SQLITE_HEAT_EPOCH_PATH" \
+	        --gc-nand-timing-path "$SQLITE_GC_NAND_TIMING_PATH" \
         --bg-nand-stats-path "$SQLITE_BG_NAND_STATS_PATH" \
         --strict-cold-per-select \
         "${extra_args[@]}" \
