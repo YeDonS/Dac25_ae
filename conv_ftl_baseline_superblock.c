@@ -1990,14 +1990,21 @@ static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn)
 	struct heat_tracking *ht;
 	uint64_t epoch, age, guard_window;
 
-	if (!conv_ftl)
+	if (!conv_ftl || !conv_ftl->ssd || lpn >= conv_ftl->ssd->sp.tt_pgs)
 		return false;
-	if (conv_ftl->test_phase_active)
+	if (READ_ONCE(conv_ftl->test_phase_active))
 		return false;
 
 	ht = &conv_ftl->heat_track;
 	if (ht && ht->write_heat_epoch) {
+		struct line_pool_stats slc_stats;
+
 		epoch = ht->write_heat_epoch[lpn];
+		/* Epoch guard is a freshness hint, not a hard safety rule. If SLC is
+		 * already under GC pressure, let cold migration make space. */
+		collect_slc_stats(conv_ftl, &slc_stats);
+		if (slc_stats.free <= conv_ftl->slc_gc_free_thres_high)
+			return false;
 		return epoch != 0 && epoch == READ_ONCE(conv_ftl->heat_epoch);
 	}
 	if (!ht || !ht->write_epoch)
