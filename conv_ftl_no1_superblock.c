@@ -110,17 +110,16 @@ enum slc_sb_state_e {
 #define SLC_EMERGENCY_RESERVE 10
 #define INVALID_CHAIN_ID U32_MAX
 #define INVALID_CHAIN_DIE 0xFFU
-#define SLC_MIGRATE_FREE_PCT 10U
-#define SLC_MIGRATE_TARGET_FREE_PCT 15U
-#define SLC_SOFT_GC_FREE_PCT 10U
-#define SLC_HARD_GC_FREE_PCT 5U
+#define SLC_MIGRATE_FREE_PCT 30U
+#define SLC_MIGRATE_TARGET_FREE_PCT SLC_MIGRATE_FREE_PCT
+#define SLC_SOFT_GC_FREE_PCT 20U
+#define SLC_HARD_GC_FREE_PCT 10U
 #define SLC_REPROMOTE_GUARD_FREE_PCT 5U
 #define SLC_SB_RECENT_GUARD_PCT 10U
 #define SLC_MIGRATED_VICTIM_BACKLOG_HIGH 8U
-/* QLC GC trigger: kick in when QLC free drops to this fraction of total.
- * Per the design we want QLC GC to start earlier so chain repacking and
- * opportunistic SLC repromotion have more headroom to work with. */
-#define QLC_GC_FREE_PCT 30U
+#define MIG_MONITOR_INTERVAL_NS 30000000000ULL
+/* QLC GC trigger: keep aligned with the baseline superblock variant. */
+#define QLC_GC_FREE_PCT 15U
 #define QLC_FAST_HIGH_WM_PCT 90U
 #define QLC_FAST_TARGET_WM_PCT 80U
 #define QLC_PROMOTE_RATIO_NUM 1U
@@ -1845,10 +1844,13 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 	{
 		static uint64_t mig_last_ns = 0;
 		static uint32_t mig_total_calls = 0;
-		static uint32_t mig_total_sb_scanned = 0;
-		static uint32_t mig_total_sb_sampled = 0;
-		static uint32_t mig_total_sb_migrated = 0;
-		static uint32_t mig_total_sb_mixed_migrated = 0;
+		static uint64_t mig_total_sb_scanned = 0;
+		static uint64_t mig_total_sb_sampled = 0;
+		static uint64_t mig_total_sb_migrated = 0;
+		static uint64_t mig_total_sb_mixed_migrated = 0;
+		static uint64_t last_gc_count = 0;
+		static uint64_t last_gc_invalid = 0;
+		static uint64_t last_gc_valid = 0;
 		uint64_t now_ns = ktime_get_ns();
 
 		mig_total_calls++;
@@ -1857,18 +1859,54 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 		mig_total_sb_migrated += sb_migrated;
 		mig_total_sb_mixed_migrated += sb_mixed_migrated;
 
-		if (mig_last_ns == 0)
+		if (mig_last_ns == 0) {
 			mig_last_ns = now_ns;
-		if (now_ns - mig_last_ns >= 5000000000ULL) {
-			NVMEV_ERROR("[MIG-MONITOR] SLC->QLC cold migration: calls=%u sb_scanned=%u sb_sampled=%u sb_migrated=%u sb_mixed_migrated=%u victim_q=%u (mode=coldest_sb)\n",
-				    mig_total_calls, mig_total_sb_scanned, mig_total_sb_sampled,
-				    mig_total_sb_migrated, mig_total_sb_mixed_migrated,
-				    conv_ftl->slc_sb_migrated_victim_count);
+			last_gc_count = conv_ftl->slc_sb_gc_count;
+			last_gc_invalid = conv_ftl->slc_sb_gc_invalid_pages;
+			last_gc_valid = conv_ftl->slc_sb_gc_valid_pages;
+		}
+		if (now_ns - mig_last_ns >= MIG_MONITOR_INTERVAL_NS) {
+			struct line_pool_stats slc_st;
+			uint64_t gc_count_delta = conv_ftl->slc_sb_gc_count - last_gc_count;
+			uint64_t gc_invalid_delta = conv_ftl->slc_sb_gc_invalid_pages - last_gc_invalid;
+			uint64_t gc_valid_delta = conv_ftl->slc_sb_gc_valid_pages - last_gc_valid;
+			uint32_t free_pct = 0, full_pct = 0, victim_pct = 0;
+
+			collect_slc_stats(conv_ftl, &slc_st);
+			if (slc_st.total) {
+				free_pct = slc_st.free * 100U / slc_st.total;
+				full_pct = slc_st.full * 100U / slc_st.total;
+				victim_pct = slc_st.victim * 100U / slc_st.total;
+			}
+
+			NVMEV_ERROR("[MIG-MONITOR] SLC->QLC cold migration: calls=%u sb_scanned=%llu sb_sampled=%llu sb_migrated=%llu sb_mixed_migrated=%llu victim_q=%u victim_cap=%u heat_epoch=%llu global_read_sum=%llu global_valid_pg_cnt=%llu gc_sb=%llu gc_invalid=%llu gc_valid=%llu slc_free=%u/%u(%u%%) slc_full=%u(%u%%) slc_victim=%u(%u%%) thres(mig/soft/hard)=%u/%u/%u (mode=coldest_sb)\n",
+				    mig_total_calls,
+				    (unsigned long long)mig_total_sb_scanned,
+				    (unsigned long long)mig_total_sb_sampled,
+				    (unsigned long long)mig_total_sb_migrated,
+				    (unsigned long long)mig_total_sb_mixed_migrated,
+				    conv_ftl->slc_sb_migrated_victim_count,
+				    SLC_MIGRATED_VICTIM_BACKLOG_HIGH,
+				    (unsigned long long)READ_ONCE(conv_ftl->heat_epoch),
+				    (unsigned long long)conv_ftl->global_read_sum,
+				    (unsigned long long)conv_ftl->global_valid_pg_cnt,
+				    (unsigned long long)gc_count_delta,
+				    (unsigned long long)gc_invalid_delta,
+				    (unsigned long long)gc_valid_delta,
+				    slc_st.free, slc_st.total, free_pct,
+				    slc_st.full, full_pct,
+				    slc_st.victim, victim_pct,
+				    conv_ftl->slc_high_watermark,
+				    conv_ftl->slc_gc_free_thres_high,
+				    conv_ftl->slc_gc_free_thres_low);
 			mig_total_calls = 0;
 			mig_total_sb_scanned = 0;
 			mig_total_sb_sampled = 0;
 			mig_total_sb_migrated = 0;
 			mig_total_sb_mixed_migrated = 0;
+			last_gc_count = conv_ftl->slc_sb_gc_count;
+			last_gc_invalid = conv_ftl->slc_sb_gc_invalid_pages;
+			last_gc_valid = conv_ftl->slc_sb_gc_valid_pages;
 			mig_last_ns = now_ns;
 		}
 	}
@@ -8393,12 +8431,15 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 	die %= conv_ftl->die_count;
 	wp = &conv_ftl->gc_slc_lunwp[die];
 	lm = get_slc_die_lm(conv_ftl, die);
-	if (!wp->curline) {
-		NVMEV_ERROR("advance_gc_slc_write_pointer: GC WP for die %u not initialized\n", die);
-		return;
-	}
 	if (!lm || !lm->lines) {
 		NVMEV_ERROR("advance_gc_slc_write_pointer: missing line manager for die %u\n", die);
+		return;
+	}
+
+	spin_lock(&conv_ftl->slc_lock);
+	if (!wp->curline) {
+		spin_unlock(&conv_ftl->slc_lock);
+		NVMEV_DEBUG("advance_gc_slc_write_pointer: GC WP for die %u not initialized\n", die);
 		return;
 	}
 
@@ -8406,7 +8447,6 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 	if (wp->pg >= spp->pgs_per_blk) {
 		blk_filled = wp->blk;
 		die_filled = true;
-		spin_lock(&conv_ftl->slc_lock);
 		if (wp->curline->vpc == spp->pgs_per_lun_line) {
 			list_add_tail(&wp->curline->entry, &lm->full_line_list);
 			lm->full_line_cnt++;
@@ -8420,11 +8460,11 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 		wp->pl = 0;
 		if (die_filled)
 			slc_sb_note_die_full_locked(conv_ftl, blk_filled, die);
-		spin_unlock(&conv_ftl->slc_lock);
 	}
 
 	if ((wp->pg % spp->pgs_per_oneshotpg) == 0)
 		conv_ftl->lunpointer = (die + 1) % conv_ftl->die_count;
+	spin_unlock(&conv_ftl->slc_lock);
 }
 
 static void qlc_reset_die_progress(struct write_pointer *wp)

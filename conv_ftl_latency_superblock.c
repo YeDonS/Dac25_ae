@@ -84,15 +84,16 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define SLC_EMERGENCY_RESERVE 10
 #define INVALID_CHAIN_ID U32_MAX
 #define INVALID_CHAIN_DIE 0xFFU
-#define SLC_MIGRATE_FREE_PCT 10U
-#define SLC_MIGRATE_TARGET_FREE_PCT 15U
-#define SLC_SOFT_GC_FREE_PCT 10U
-#define SLC_HARD_GC_FREE_PCT 5U
+#define SLC_MIGRATE_FREE_PCT 30U
+#define SLC_MIGRATE_TARGET_FREE_PCT SLC_MIGRATE_FREE_PCT
+#define SLC_SOFT_GC_FREE_PCT 20U
+#define SLC_HARD_GC_FREE_PCT 10U
 #define REPROMOTE_READ_TRIGGER 1024U
 #define REPROMOTE_BATCH_PAGES 512U
 #define REPROMOTE_HEAT_FLOOR 4U
 #define QLC_CLOSED_REPROMOTE_TRIGGER 10U
 #define SLC_REPROMOTE_GUARD_FREE_PCT 5U
+#define MIG_MONITOR_INTERVAL_NS 30000000000ULL
 #define QLC_GC_FREE_PCT 15U
 #define QLC_FAST_HIGH_WM_PCT 90U
 #define QLC_FAST_TARGET_WM_PCT 80U
@@ -1553,9 +1554,12 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 	{
 		static uint64_t mig_last_ns = 0;
 		static uint32_t mig_total_calls = 0;
-		static uint32_t mig_total_migrated = 0;
-		static uint32_t mig_total_sampled = 0;
-		static uint32_t mig_total_sb_scanned = 0;
+		static uint64_t mig_total_migrated = 0;
+		static uint64_t mig_total_sampled = 0;
+		static uint64_t mig_total_sb_scanned = 0;
+		static uint64_t last_gc_count = 0;
+		static uint64_t last_gc_invalid = 0;
+		static uint64_t last_gc_valid = 0;
 		uint64_t now_ns = ktime_get_ns();
 
 		mig_total_calls++;
@@ -1563,17 +1567,51 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 		mig_total_sampled += sampled;
 		mig_total_sb_scanned += scanned;
 
-		if (mig_last_ns == 0)
+		if (mig_last_ns == 0) {
 			mig_last_ns = now_ns;
-		if (now_ns - mig_last_ns >= 5000000000ULL) {
-			NVMEV_ERROR("[MIG-MONITOR] SLC->QLC SB migration: calls=%u sb_scanned=%u page_sampled=%u migrated=%u victim_q=%u\n",
-				    mig_total_calls, mig_total_sb_scanned, mig_total_sampled,
-				    mig_total_migrated,
-				    conv_ftl->slc_sb_migrated_victim_count);
+			last_gc_count = conv_ftl->slc_sb_gc_count;
+			last_gc_invalid = conv_ftl->slc_sb_gc_invalid_pages;
+			last_gc_valid = conv_ftl->slc_sb_gc_valid_pages;
+		}
+		if (now_ns - mig_last_ns >= MIG_MONITOR_INTERVAL_NS) {
+			struct line_pool_stats slc_st;
+			uint64_t gc_count_delta = conv_ftl->slc_sb_gc_count - last_gc_count;
+			uint64_t gc_invalid_delta = conv_ftl->slc_sb_gc_invalid_pages - last_gc_invalid;
+			uint64_t gc_valid_delta = conv_ftl->slc_sb_gc_valid_pages - last_gc_valid;
+			uint32_t free_pct = 0, full_pct = 0, victim_pct = 0;
+
+			collect_slc_stats(conv_ftl, &slc_st);
+			if (slc_st.total) {
+				free_pct = slc_st.free * 100U / slc_st.total;
+				full_pct = slc_st.full * 100U / slc_st.total;
+				victim_pct = slc_st.victim * 100U / slc_st.total;
+			}
+
+			NVMEV_ERROR("[MIG-MONITOR] SLC->QLC SB migration: calls=%u sb_scanned=%llu page_sampled=%llu migrated=%llu victim_q=%u heat_epoch=%llu global_read_sum=%llu global_valid_pg_cnt=%llu gc_sb=%llu gc_invalid=%llu gc_valid=%llu slc_free=%u/%u(%u%%) slc_full=%u(%u%%) slc_victim=%u(%u%%) thres(mig/soft/hard)=%u/%u/%u\n",
+				    mig_total_calls,
+				    (unsigned long long)mig_total_sb_scanned,
+				    (unsigned long long)mig_total_sampled,
+				    (unsigned long long)mig_total_migrated,
+				    conv_ftl->slc_sb_migrated_victim_count,
+				    (unsigned long long)READ_ONCE(conv_ftl->heat_epoch),
+				    (unsigned long long)conv_ftl->global_read_sum,
+				    (unsigned long long)conv_ftl->global_valid_pg_cnt,
+				    (unsigned long long)gc_count_delta,
+				    (unsigned long long)gc_invalid_delta,
+				    (unsigned long long)gc_valid_delta,
+				    slc_st.free, slc_st.total, free_pct,
+				    slc_st.full, full_pct,
+				    slc_st.victim, victim_pct,
+				    conv_ftl->slc_high_watermark,
+				    conv_ftl->slc_gc_free_thres_high,
+				    conv_ftl->slc_gc_free_thres_low);
 			mig_total_calls = 0;
 			mig_total_migrated = 0;
 			mig_total_sampled = 0;
 			mig_total_sb_scanned = 0;
+			last_gc_count = conv_ftl->slc_sb_gc_count;
+			last_gc_invalid = conv_ftl->slc_sb_gc_invalid_pages;
+			last_gc_valid = conv_ftl->slc_sb_gc_valid_pages;
 			mig_last_ns = now_ns;
 		}
 	}
@@ -6359,18 +6397,20 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 	die %= conv_ftl->die_count;
 	wp = &conv_ftl->gc_slc_lunwp[die];
 	lm = get_slc_die_lm(conv_ftl, die);
-	if (!wp->curline) {
-		NVMEV_ERROR("advance_gc_slc_write_pointer: GC WP for die %u not initialized\n", die);
-		return;
-	}
 	if (!lm || !lm->lines) {
 		NVMEV_ERROR("advance_gc_slc_write_pointer: missing line manager for die %u\n", die);
 		return;
 	}
 
+	spin_lock(&conv_ftl->slc_lock);
+	if (!wp->curline) {
+		spin_unlock(&conv_ftl->slc_lock);
+		NVMEV_DEBUG("advance_gc_slc_write_pointer: GC WP for die %u not initialized\n", die);
+		return;
+	}
+
 	wp->pg++;
 	if (wp->pg >= spp->pgs_per_blk) {
-		spin_lock(&conv_ftl->slc_lock);
 		if (wp->curline->vpc == spp->pgs_per_lun_line) {
 			list_add_tail(&wp->curline->entry, &lm->full_line_list);
 			lm->full_line_cnt++;
@@ -6382,11 +6422,11 @@ static void advance_gc_slc_write_pointer(struct conv_ftl *conv_ftl, uint32_t die
 		wp->blk = 0;
 		wp->pg = 0;
 		wp->pl = 0;
-		spin_unlock(&conv_ftl->slc_lock);
 	}
 
 	if ((wp->pg % spp->pgs_per_oneshotpg) == 0)
 		conv_ftl->lunpointer = (die + 1) % conv_ftl->die_count;
+	spin_unlock(&conv_ftl->slc_lock);
 }
 
 static void qlc_reset_die_progress(struct write_pointer *wp)
