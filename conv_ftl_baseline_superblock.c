@@ -84,10 +84,10 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define SLC_EMERGENCY_RESERVE 10
 #define INVALID_CHAIN_ID U32_MAX
 #define INVALID_CHAIN_DIE 0xFFU
-#define SLC_MIGRATE_FREE_PCT 10U
-#define SLC_MIGRATE_TARGET_FREE_PCT 15U
-#define SLC_SOFT_GC_FREE_PCT 10U
-#define SLC_HARD_GC_FREE_PCT 5U
+#define SLC_MIGRATE_FREE_PCT 30U
+#define SLC_MIGRATE_TARGET_FREE_PCT SLC_MIGRATE_FREE_PCT
+#define SLC_SOFT_GC_FREE_PCT 20U
+#define SLC_HARD_GC_FREE_PCT 10U
 #define REPROMOTE_READ_TRIGGER 1024U
 #define REPROMOTE_BATCH_PAGES 512U
 #define REPROMOTE_HEAT_FLOOR 4U
@@ -5357,14 +5357,11 @@ static int do_gc_superblock_slc(struct conv_ftl *conv_ftl, bool force)
 	return 0;
 }
 
-static bool maintain_slc_free_to_target(struct conv_ftl *conv_ftl, int32_t target_die,
-					uint64_t *latest_ns)
+static bool maintain_slc_one_step(struct conv_ftl *conv_ftl, int32_t target_die,
+				  uint64_t *latest_ns)
 {
 	struct line_pool_stats slc_stats;
-	uint32_t target_lines;
 	uint32_t max_pages;
-	uint32_t maint_iters = 0;
-	uint32_t maint_limit;
 	bool progressed = false;
 
 	if (!conv_ftl)
@@ -5372,47 +5369,25 @@ static bool maintain_slc_free_to_target(struct conv_ftl *conv_ftl, int32_t targe
 
 	conv_ftl->fg_maint_latest_ns = latest_ns ? *latest_ns : 0;
 	collect_slc_stats(conv_ftl, &slc_stats);
-	if (slc_stats.free >= conv_ftl->slc_high_watermark)
-		return true;
-
-	target_lines = conv_ftl->slc_target_watermark;
-	if (!target_lines || target_lines >= slc_stats.total)
-		target_lines = (slc_stats.total > 1) ?
-			(slc_stats.total - 1) : slc_stats.total;
-	if (target_lines < conv_ftl->slc_high_watermark)
-		target_lines = conv_ftl->slc_high_watermark;
-
 	max_pages = slc_pages_per_superblock(conv_ftl);
 	if (max_pages < 8)
 		max_pages = 8;
-	maint_limit = slc_stats.total ? slc_stats.total : 1;
 
-	while (slc_stats.free < target_lines && maint_iters < maint_limit) {
-		if (slc_has_any_victim(conv_ftl)) {
-			if (do_gc_superblock_slc(conv_ftl, true) < 0)
-				break;
+	if (slc_stats.free < conv_ftl->slc_high_watermark) {
+		if (migrate_some_cold_from_slc(conv_ftl, max_pages, target_die))
 			progressed = true;
-		} else {
-			uint32_t migrated;
-
-			migrated = migrate_some_cold_from_slc(conv_ftl, max_pages,
-							      target_die);
-			if (!migrated && !slc_has_any_victim(conv_ftl))
-				break;
-			if (do_gc_superblock_slc(conv_ftl, true) < 0)
-				break;
-			progressed = true;
-		}
-
-		maint_iters++;
-		collect_slc_stats(conv_ftl, &slc_stats);
-		if (latest_ns)
-			*latest_ns = max(*latest_ns, conv_ftl->fg_maint_latest_ns);
+	}
+	if (slc_stats.free < conv_ftl->slc_gc_free_thres_low) {
+		forground_gc(conv_ftl, FGC_MODE_HARD);
+		progressed = true;
+	} else if (slc_stats.free <= conv_ftl->slc_gc_free_thres_high) {
+		forground_gc(conv_ftl, FGC_MODE_SOFT);
+		progressed = true;
 	}
 
 	if (latest_ns)
 		*latest_ns = max(*latest_ns, conv_ftl->fg_maint_latest_ns);
-	return slc_stats.free >= target_lines || progressed;
+	return progressed;
 }
 
 static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
@@ -8471,8 +8446,8 @@ retry_wb_alloc:
 
 				collect_slc_stats(conv_ftl, &pre_slc_stats);
 				if (pre_slc_stats.free < conv_ftl->slc_high_watermark) {
-					maintain_slc_free_to_target(conv_ftl, target_die,
-								    &nsecs_latest);
+					maintain_slc_one_step(conv_ftl, target_die,
+							      &nsecs_latest);
 					swr.stime = max(swr.stime, nsecs_latest);
 				}
 			}
@@ -8483,8 +8458,8 @@ retry_wb_alloc:
 					(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
 
 				slc_retry++;
-				maintain_slc_free_to_target(conv_ftl, target_die,
-							    &nsecs_latest);
+				maintain_slc_one_step(conv_ftl, target_die,
+						      &nsecs_latest);
 				swr.stime = max(swr.stime, nsecs_latest);
 				ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
 			}
@@ -8583,8 +8558,8 @@ retry_wb_alloc:
 				   slc_stats.total);
 
 			if (slc_free_lines < conv_ftl->slc_high_watermark) {
-				maintain_slc_free_to_target(conv_ftl, target_die,
-							    &nsecs_latest);
+				maintain_slc_one_step(conv_ftl, target_die,
+						      &nsecs_latest);
 				swr.stime = max(swr.stime, nsecs_latest);
 			}
 		}
