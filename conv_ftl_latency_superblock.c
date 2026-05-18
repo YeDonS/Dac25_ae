@@ -1523,8 +1523,11 @@ static uint32_t migrate_superblock_cold_pages_from_slc(struct conv_ftl *conv_ftl
 }
 
 /* [SB-QUEUE GC v1] Scan closed SBs through a bounded cursor. For each SB,
- * migrate cold pages page-by-page until the budget is spent. Any SB touched by
- * cold-page migration becomes eligible for queue-driven SLC GC.
+ * migrate cold pages page-by-page until the budget is spent. A SB only becomes
+ * GC-eligible when this pass did not exhaust its budget on that SB, meaning the
+ * current heat/guard filters found no more cold pages to demote. This avoids
+ * queueing a half-migrated SB and then having GC write most of its valid pages
+ * straight back into SLC.
  *
  * vs 旧 baseline migrate_some_cold_from_slc 的 per-LPN cursor 扫描:
  *   - 永远跳过正在写的 ACTIVE SB (closed-only);
@@ -1555,7 +1558,9 @@ static uint32_t migrate_cold_pages_to_victim_queue_from_slc(struct conv_ftl *con
 	 * 仅用于排序近似, 没选中也没关系 (下一轮会再选)。 */
 	for (scanned = 0; scanned < scan_limit && moved < max_pages; scanned++) {
 		struct baseline_sb_summary sum;
+		uint32_t budget_left;
 		uint32_t sb_moved = 0;
+		bool enqueue_for_gc = false;
 
 		blk_id = (start + scanned) % total;
 		if (stats)
@@ -1583,16 +1588,30 @@ static uint32_t migrate_cold_pages_to_victim_queue_from_slc(struct conv_ftl *con
 			continue;
 		}
 
+		budget_left = max_pages - moved;
 		if (sum.total_vpc)
 			sb_moved = migrate_superblock_cold_pages_from_slc(conv_ftl, blk_id,
-									  max_pages - moved,
+									  budget_left,
 									  cold_thresh_x10,
 									  guard_disabled,
 									  stats);
-		if (sb_moved || sum.total_vpc == 0) {
-			moved += sb_moved;
-			(void)slc_migrated_victim_enqueue(conv_ftl, blk_id);
+		moved += sb_moved;
+
+		if (sum.total_vpc == 0) {
+			enqueue_for_gc = true;
+		} else if (sb_moved < budget_left) {
+			struct baseline_sb_summary after;
+
+			if (!slc_sb_collect_summary(conv_ftl, blk_id, &after)) {
+				enqueue_for_gc = true;
+			} else if (!after.active && !after.open_writer &&
+				   (after.total_vpc == 0 || after.total_ipc > 0)) {
+				enqueue_for_gc = true;
+			}
 		}
+
+		if (enqueue_for_gc)
+			(void)slc_migrated_victim_enqueue(conv_ftl, blk_id);
 		if (need_resched())
 			cond_resched();
 	}
@@ -5452,16 +5471,30 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 		uint32_t actual_die;
 		uint32_t die_index;
 		bool chain_gc_to_qlc = false;
+		bool pressure_gc_to_qlc = false;
 
 		collect_slc_stats(conv_ftl, &slc_st);
 		slc_critical = (slc_st.free <= SLC_EMERGENCY_RESERVE);
+		if (!slc_critical && slc_st.free <= conv_ftl->slc_gc_free_thres_high) {
+			uint64_t cold_thresh_x10 = get_dynamic_cold_threshold_x10(conv_ftl);
+			uint64_t acc = 0;
+			uint64_t acc_x10 = 0;
+			bool guard_disabled = slc_st.free <= conv_ftl->slc_gc_free_thres_low;
+
+			if (conv_ftl->heat_track.access_count && lpn < spp->tt_pgs)
+				acc = conv_ftl->heat_track.access_count[lpn];
+			acc_x10 = (acc > U64_MAX / 10ULL) ? U64_MAX : acc * 10ULL;
+			if (acc_x10 <= cold_thresh_x10 &&
+			    !recent_write_guard_with_pressure(conv_ftl, lpn, guard_disabled))
+				pressure_gc_to_qlc = true;
+		}
 #if NVMEV_ENABLE_CHAIN_AGGREGATION
 		if (!slc_critical)
 			chain_gc_to_qlc =
 				slc_chain_gc_should_migrate_to_qlc(conv_ftl, old_ppa, lpn);
 #endif
 
-		if (slc_critical || chain_gc_to_qlc) {
+		if (slc_critical || chain_gc_to_qlc || pressure_gc_to_qlc) {
 			if (migrate_page_to_qlc(conv_ftl, lpn, old_ppa) < 0)
 				return -1;
 			if (chain_gc_to_qlc)
@@ -9129,9 +9162,9 @@ static void bg_slc_maint_worker(struct work_struct *work)
 		budget = 8;
 		break;
 	case SLC_LEVEL_BG:
-		budget = slc_pages_per_superblock(conv_ftl) / 4;
-		if (budget < 16)
-			budget = 16;
+		budget = slc_pages_per_superblock(conv_ftl);
+		if (budget < 32)
+			budget = 32;
 		break;
 	case SLC_LEVEL_URGENT:
 		budget = slc_pages_per_superblock(conv_ftl);
