@@ -58,7 +58,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_ENABLE_HOST_DIE_HINT 1
 #endif
 #ifndef NVMEV_ENABLE_QLC_HOTCOLD
-#define NVMEV_ENABLE_QLC_HOTCOLD 0
+#define NVMEV_ENABLE_QLC_HOTCOLD 1
 #endif
 #ifndef NVMEV_ENABLE_READ_REPROMOTION
 #define NVMEV_ENABLE_READ_REPROMOTION 1
@@ -67,16 +67,16 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_ENABLE_INTERNAL_DIE_AFFINITY 0
 #endif
 #ifndef NVMEV_ENABLE_DIE_BATCHED_REPROMOTION
-#define NVMEV_ENABLE_DIE_BATCHED_REPROMOTION 0
+#define NVMEV_ENABLE_DIE_BATCHED_REPROMOTION 1
 #endif
 #ifndef NVMEV_ENABLE_QLC_REBALANCE
-#define NVMEV_ENABLE_QLC_REBALANCE 0
+#define NVMEV_ENABLE_QLC_REBALANCE 1
 #endif
 #ifndef NVMEV_TEST_PHASE_REPROMOTION_ENABLE
-#define NVMEV_TEST_PHASE_REPROMOTION_ENABLE 0
+#define NVMEV_TEST_PHASE_REPROMOTION_ENABLE 1
 #endif
 #ifndef NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE
-#define NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE NVMEV_TEST_PHASE_REPROMOTION_ENABLE
+#define NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE 1
 #endif
 /* Variant: baseline with host append/overwrite die hint retained; other optional mechanisms disabled.
  * Superblock variant: free-line accounting is reported and thresholded at one
@@ -2764,7 +2764,7 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		return 0;
 
 	seq_printf(m, "active %u\n", test_phase_enabled(conv_ftl) ? 1U : 0U);
-	seq_printf(m, "mechanism_source conv_ftl_latency_superblock\n");
+	seq_printf(m, "mechanism_source conv_ftl_all_superblock\n");
 	seq_printf(m, "mechanism_scheduler %s\n",
 		   maint_v2_enabled(conv_ftl) ? "v2_per_die_idle_demand" :
 					       "v1_global_worker");
@@ -2940,7 +2940,7 @@ static int baseline_superblock_stats_show(struct seq_file *m, void *v)
 	v2_decisions = v2_skips + conv_ftl->maint_v2_tasks_done;
 
 	seq_puts(m, "# baseline superblock_stats: point-in-time counters; *_pct is integer percent\n");
-	seq_printf(m, "mechanism_source conv_ftl_latency_superblock\n");
+	seq_printf(m, "mechanism_source conv_ftl_all_superblock\n");
 	seq_printf(m, "mechanism_scheduler %s\n",
 		   maint_v2_enabled(conv_ftl) ? "v2_per_die_idle_demand" :
 					       "v1_global_worker");

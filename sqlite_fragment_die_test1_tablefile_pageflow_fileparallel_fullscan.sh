@@ -104,6 +104,7 @@ validate_workload_outputs() {
     local tag="$1"
     local init_txt="$2"
     local expected_cold_mode="$3"
+    local expected_log_cold_mode="$3"
     local ok=0
     local cold_extra_mixed=0
 
@@ -112,6 +113,11 @@ validate_workload_outputs() {
             cold_extra_mixed=1
             ;;
     esac
+
+    if [[ "$SQLITE_COLD_EXTRA_MODE" == "concurrent" ]] &&
+       [[ "$expected_cold_mode" == "random-row-concurrent" ]]; then
+        expected_log_cold_mode="read-concurrent+append-concurrent"
+    fi
 
     if [[ -f "${RESULT_FOLDER}/sqlite_table_tier_${tag}.csv" ]]; then
         ok=1
@@ -135,9 +141,9 @@ validate_workload_outputs() {
     if [[ "$ok" != "1" ]]; then
         return 1
     fi
-    if [[ -n "$expected_cold_mode" ]] &&
-       ! grep -q "\\[sqlite_init\\].*tag=${tag}.*cold_mode=${expected_cold_mode}" "$init_txt" 2>/dev/null; then
-        echo "ERROR: cold mode mismatch for tag=${tag}; expected cold_mode=${expected_cold_mode}" >&2
+    if [[ -n "$expected_log_cold_mode" ]] &&
+       ! grep -q "\\[sqlite_init\\].*tag=${tag}.*cold_mode=${expected_log_cold_mode}" "$init_txt" 2>/dev/null; then
+        echo "ERROR: cold mode mismatch for tag=${tag}; expected cold_mode=${expected_log_cold_mode}" >&2
         print_init_log_tail "$init_txt"
         return 1
     fi
