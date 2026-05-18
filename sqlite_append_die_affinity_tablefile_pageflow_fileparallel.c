@@ -4665,11 +4665,6 @@ static int run_init_mode(const struct workload_options *opts)
 			printf("[sqlite_init] table_bytes=%.2fGiB dummy_bytes=%.2fGiB combined_write_bytes=%.2fGiB\n",
 			       table_gib, dummy_gib, table_gib + dummy_gib);
 			if (opts->cold_extra_append_bytes > 0 && opts->cold_extra_mode != COLD_EXTRA_MODE_OFF) {
-				const char *read_mode = cold_full_read_mode_label(opts->cold_full_read_mode);
-
-				cold_mode = opts->cold_extra_mode == COLD_EXTRA_MODE_CONCURRENT ?
-					"read-concurrent+append-concurrent" :
-					read_mode;
 				printf("[sqlite_init] cold_extra_append mode=%s target_bytes=%llu actual_payload_bytes=%llu "
 				       "rows_written=%llu page_growth=%llu append_time=%.6fs stage_total=%.6fs\n",
 				       cold_extra_mode_label(opts->cold_extra_mode),
