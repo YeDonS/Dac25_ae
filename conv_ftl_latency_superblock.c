@@ -1058,7 +1058,7 @@ static int  maint_v2_alloc(struct conv_ftl *conv_ftl);
 static void maint_v2_free(struct conv_ftl *conv_ftl);
 
 /* V2 dispatcher 主入口 (从 bg_slc_maint_worker 在 V2 启用时调用) */
-static void bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
+static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 				   enum slc_pressure_level level);
 
 static uint32_t migrate_chain_chunk_from_slc(struct conv_ftl *conv_ftl, struct ppa *seed_ppa,
@@ -1644,14 +1644,17 @@ static uint32_t migrate_cold_pages_to_victim_queue_from_slc(struct conv_ftl *con
 		if (stats)
 			stats->scanned_sbs++;
 		/* 已经在 GC 队列里的 SB 不重复选: 让 GC 先消费再说。 */
-		if (conv_ftl->slc_sb_migrated_victim &&
-		    conv_ftl->slc_sb_migrated_victim[blk_id]) {
-			if (stats)
-				stats->skip_queued++;
-			continue;
-		}
-		if (!slc_sb_collect_summary(conv_ftl, blk_id, &sum))
-			continue;
+			if (conv_ftl->slc_sb_migrated_victim &&
+			    conv_ftl->slc_sb_migrated_victim[blk_id]) {
+				if (stats)
+					stats->skip_queued++;
+				continue;
+			}
+			if (maint_v2_enabled(conv_ftl) &&
+			    maint_sb_get_phase(conv_ftl, blk_id) != MAINT_SB_PHASE_IDLE)
+				continue;
+			if (!slc_sb_collect_summary(conv_ftl, blk_id, &sum))
+				continue;
 		if (stats)
 			stats->sampled_pages += sum.heat_count;
 		/* 关键: 跳过正在写入的 ACTIVE SB (closed-only migration) */
@@ -9000,7 +9003,7 @@ static int maint_enqueue_sb_gc(struct conv_ftl *conv_ftl, uint32_t sb_id,
 
 /* V2 worker 主循环: 按 die slack 排序, 跳过 demand/channel busy 的 die,
  * 每次只跑一个 task; 跑完看是否还有 work 决定要不要 re-queue。 */
-static void bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
+static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 				   enum slc_pressure_level level)
 {
 	uint64_t now;
@@ -9014,7 +9017,7 @@ static void bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 	bool more_work = false;
 
 	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->die_count)
-		return;
+		return false;
 	total_dies = conv_ftl->die_count;
 	now = __get_ioclock(conv_ftl->ssd);
 
@@ -9061,7 +9064,7 @@ static void bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 	if (!slack || !order) {
 		kfree(slack);
 		kfree(order);
-		return;
+		return false;
 	}
 	for (d = 0; d < total_dies; d++) {
 		slack[d] = die_slack_ns(conv_ftl, d, now);
@@ -9229,6 +9232,7 @@ static void bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 
 	kfree(slack);
 	kfree(order);
+	return executed > 0;
 }
 
 static int maint_v2_alloc(struct conv_ftl *conv_ftl)
@@ -9347,10 +9351,9 @@ static void bg_slc_maint_worker(struct work_struct *work)
 
 	/* [LATENCY v2] 如果 V2 数组已分配, 走 idle-die dispatcher;
 	 * 否则降级到 V1 行为 (全局 sb 扫描)。 */
-	if (maint_v2_enabled(conv_ftl)) {
-		bg_slc_maint_worker_v2(conv_ftl, level);
+	if (maint_v2_enabled(conv_ftl) &&
+	    bg_slc_maint_worker_v2(conv_ftl, level))
 		return;
-	}
 
 	switch (level) {
 	case SLC_LEVEL_IDLE_ONLY:

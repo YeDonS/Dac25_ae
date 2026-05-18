@@ -10,14 +10,17 @@ NVMEV_DIR="${SCRIPT_DIR}/../nvmevirt_DA"
 VARIANTS="${VARIANTS:-die_base_sb die_latency_sb_v1 die_latency_sb die_all_sb}"
 RUN_SQLITE="${RUN_SQLITE:-1}"
 RUN_FIO="${RUN_FIO:-1}"
-FIO_INIT_BYTES="${FIO_INIT_BYTES:-8G}"
-FIO_PREWARM_READ_BYTES="${FIO_PREWARM_READ_BYTES:-32G}"
-FIO_MEASURE_READ_BYTES="${FIO_MEASURE_READ_BYTES:-40G}"
-FIO_MEASURE_WRITE_BYTES="${FIO_MEASURE_WRITE_BYTES:-4G}"
-FIO_READ_JOBS="${FIO_READ_JOBS:-2}"
-FIO_WRITE_JOBS="${FIO_WRITE_JOBS:-2}"
-FIO_READ_IODEPTH="${FIO_READ_IODEPTH:-16}"
-FIO_WRITE_IODEPTH="${FIO_WRITE_IODEPTH:-32}"
+FIO_JOB_FILE="${FIO_JOB_FILE:-fio_latency_v2_mixed.fio}"
+FIO_READ_JOBS="${FIO_READ_JOBS:-}"
+FIO_WRITE_JOBS="${FIO_WRITE_JOBS:-}"
+FIO_READ_IODEPTH="${FIO_READ_IODEPTH:-}"
+FIO_WRITE_IODEPTH="${FIO_WRITE_IODEPTH:-}"
+FIO_MEASURE_READ_BYTES="${FIO_MEASURE_READ_BYTES:-}"
+FIO_MEASURE_WRITE_BYTES="${FIO_MEASURE_WRITE_BYTES:-}"
+FIO_READ_RATE="${FIO_READ_RATE:-}"
+FIO_WRITE_RATE="${FIO_WRITE_RATE:-}"
+FIO_READ_RATE_IOPS="${FIO_READ_RATE_IOPS:-}"
+FIO_WRITE_RATE_IOPS="${FIO_WRITE_RATE_IOPS:-}"
 FIO_TEST_PHASE_PATH="${FIO_TEST_PHASE_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase}"
 
 mkdir -p "$RESULT_FOLDER"
@@ -52,13 +55,14 @@ run_fio_one_variant() {
     local variant="$1"
     local ts
     local out_json
+    local fio_job_tmp
 
     ts="$(date +%Y%m%d_%H%M%S)"
     out_json="${RESULT_FOLDER%/}/fio_latency_mixed_${variant}_${ts}.json"
+    fio_job_tmp="$(mktemp "${TMPDIR:-/tmp}/fio_latency_v2_mixed_${variant}.XXXXXX.fio")"
 
     load_variant_module "$variant"
     lsblk
-    source setdevice.sh
     echo 0 | sudo tee /sys/block/${DATA_NAME}/queue/read_ahead_kb >/dev/null 2>&1 || true
     drop_caches
 
@@ -66,71 +70,77 @@ run_fio_one_variant() {
         echo 0 | sudo tee "$FIO_TEST_PHASE_PATH" >/dev/null || true
     fi
 
-    echo "=== fio init/prewarm: variant=$variant ==="
-    sudo fio \
-        --name=init_write \
-        --filename="$DATA_DEV" \
-        --ioengine=libaio \
-        --direct=1 \
-        --rw=write \
-        --bs=4k \
-        --iodepth=32 \
-        --size="$FIO_INIT_BYTES" \
-        --numjobs=1 \
-        --group_reporting=1
+    awk \
+        -v filename="$DATA_DEV" \
+        -v test_phase_path="$FIO_TEST_PHASE_PATH" \
+        -v read_jobs="$FIO_READ_JOBS" \
+        -v write_jobs="$FIO_WRITE_JOBS" \
+        -v read_iodepth="$FIO_READ_IODEPTH" \
+        -v write_iodepth="$FIO_WRITE_IODEPTH" \
+        -v read_io_size="$FIO_MEASURE_READ_BYTES" \
+        -v write_io_size="$FIO_MEASURE_WRITE_BYTES" \
+        -v read_rate="$FIO_READ_RATE" \
+        -v write_rate="$FIO_WRITE_RATE" \
+        -v read_rate_iops="$FIO_READ_RATE_IOPS" \
+        -v write_rate_iops="$FIO_WRITE_RATE_IOPS" '
+        function emit_measure_extras() {
+            if (section == "measure_reads" && !read_done) {
+                print "exec_prerun=echo 1 > " test_phase_path
+                if (read_rate != "") print "rate=" read_rate
+                if (read_rate_iops != "") print "rate_iops=" read_rate_iops
+                read_done = 1
+            } else if (section == "measure_writes" && !write_done) {
+                print "exec_prerun=echo 1 > " test_phase_path
+                if (write_rate != "") print "rate=" write_rate
+                if (write_rate_iops != "") print "rate_iops=" write_rate_iops
+                write_done = 1
+            }
+        }
+        /^\[/ {
+            emit_measure_extras()
+            section = $0
+            gsub(/^\[/, "", section)
+            gsub(/\]$/, "", section)
+            print
+            next
+        }
+        section == "global" && /^filename=/ {
+            print "filename=" filename
+            next
+        }
+        section == "measure_reads" && /^(rate|rate_iops|exec_prerun)=/ { next }
+        section == "measure_writes" && /^(rate|rate_iops|exec_prerun)=/ { next }
+        section == "measure_reads" && /^iodepth=/ && read_iodepth != "" {
+            print "iodepth=" read_iodepth
+            next
+        }
+        section == "measure_writes" && /^iodepth=/ && write_iodepth != "" {
+            print "iodepth=" write_iodepth
+            next
+        }
+        section == "measure_reads" && /^numjobs=/ && read_jobs != "" {
+            print "numjobs=" read_jobs
+            next
+        }
+        section == "measure_writes" && /^numjobs=/ && write_jobs != "" {
+            print "numjobs=" write_jobs
+            next
+        }
+        section == "measure_reads" && /^io_size=/ && read_io_size != "" {
+            print "io_size=" read_io_size
+            next
+        }
+        section == "measure_writes" && /^io_size=/ && write_io_size != "" {
+            print "io_size=" write_io_size
+            next
+        }
+        { print }
+        END { emit_measure_extras() }
+    ' "$FIO_JOB_FILE" > "$fio_job_tmp"
 
-    sudo fio \
-        --name=prewarm_normal_read \
-        --filename="$DATA_DEV" \
-        --ioengine=libaio \
-        --direct=1 \
-        --rw=randread \
-        --random_distribution=normal \
-        --bs=4k \
-        --iodepth=32 \
-        --size="$FIO_INIT_BYTES" \
-        --io_size="$FIO_PREWARM_READ_BYTES" \
-        --numjobs=2 \
-        --group_reporting=1
-
-    if [[ -w "$FIO_TEST_PHASE_PATH" ]]; then
-        echo 1 | sudo tee "$FIO_TEST_PHASE_PATH" >/dev/null || true
-    fi
-
-    echo "=== fio measured read/write: variant=$variant output=$out_json ==="
-    sudo fio \
-        --ioengine=libaio \
-        --direct=1 \
-        --thread=1 \
-        --group_reporting=1 \
-        --time_based=0 \
-        --norandommap=1 \
-        --randrepeat=0 \
-        --invalidate=1 \
-        --bs=4k \
-        --filename="$DATA_DEV" \
-        --name=measure_reads \
-        --rw=randread \
-        --random_distribution=normal \
-        --offset=0 \
-        --size="$FIO_INIT_BYTES" \
-        --iodepth="$FIO_READ_IODEPTH" \
-        --numjobs="$FIO_READ_JOBS" \
-        --io_size="$FIO_MEASURE_READ_BYTES" \
-        --write_lat_log="fio_${variant}_read" \
-        --log_avg_msec=1000 \
-        --name=measure_writes \
-        --rw=randwrite \
-        --random_distribution=normal \
-        --offset=0 \
-        --size="$FIO_INIT_BYTES" \
-        --iodepth="$FIO_WRITE_IODEPTH" \
-        --numjobs="$FIO_WRITE_JOBS" \
-        --io_size="$FIO_MEASURE_WRITE_BYTES" \
-        --write_lat_log="fio_${variant}_write" \
-        --log_avg_msec=1000 \
-        --output="$out_json" \
-        --output-format=json
+    cp "$fio_job_tmp" "${RESULT_FOLDER%/}/fio_job_${variant}_${ts}.fio" 2>/dev/null || true
+    echo "=== fio jobfile: variant=$variant job=$fio_job_tmp output=$out_json ==="
+    sudo fio "$fio_job_tmp" --output="$out_json" --output-format=json
 
     if [[ -w "$FIO_TEST_PHASE_PATH" ]]; then
         echo 0 | sudo tee "$FIO_TEST_PHASE_PATH" >/dev/null || true
@@ -145,7 +155,9 @@ run_fio_one_variant() {
             > "${RESULT_FOLDER%/}/fio_superblock_stats_${variant}_${ts}.txt" || true
     fi
 
-    source resetdevice.sh
+    rm -f "$fio_job_tmp"
+    sudo rmmod nvmev 2>/dev/null || rmmod nvmev 2>/dev/null || true
+    sleep 5
 }
 
 if [[ "$RUN_SQLITE" == "1" ]]; then
