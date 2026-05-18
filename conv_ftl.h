@@ -378,9 +378,10 @@ struct conv_ftl {
 		uint8_t  *slc_sb_state;             /* NVMEV_SB_FREE / NVMEV_SB_ACTIVE / NVMEV_SB_CLOSED */
 		uint8_t  *slc_sb_active_counted;    /* ACTIVE SBs that consume the host/chain active cap */
 		uint32_t *slc_sb_owner_chain;       /* first chain to write into this SB (parasitic writers don't change owner) */
-		uint16_t *slc_sb_die_full_mask;     /* bit i: die i has filled its portion of this SB */
-		uint8_t  *slc_sb_migrated_victim;   /* SBs processed by SLC->QLC migration and eligible for SLC GC */
-		uint8_t  *slc_sb_recent_guard;      /* recently closed SBs protected from cold migration */
+			uint16_t *slc_sb_die_full_mask;     /* bit i: die i has filled its portion of this SB */
+			uint8_t  *slc_sb_migrated_victim;   /* SBs processed by SLC->QLC migration and eligible for SLC GC */
+			uint8_t  *slc_sb_maint_state;       /* SLC maintenance exclusion: idle/migrating/queued/gcing */
+			uint8_t  *slc_sb_recent_guard;      /* recently closed SBs protected from cold migration */
 		uint32_t *slc_sb_generation;        /* increments when an SB starts a new lifecycle */
 		uint8_t  *qlc_sb_state;             /* QLC SB state, indexed by qlc blk idx */
 		uint8_t  *qlc_sb_active_counted;    /* QLC ACTIVE SBs that consume the active cap */
