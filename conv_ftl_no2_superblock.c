@@ -58,7 +58,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_ENABLE_HOST_DIE_HINT 1
 #endif
 #ifndef NVMEV_ENABLE_QLC_HOTCOLD
-#define NVMEV_ENABLE_QLC_HOTCOLD 0
+#define NVMEV_ENABLE_QLC_HOTCOLD 1
 #endif
 #ifndef NVMEV_ENABLE_READ_REPROMOTION
 #define NVMEV_ENABLE_READ_REPROMOTION 1
@@ -67,12 +67,18 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define NVMEV_ENABLE_INTERNAL_DIE_AFFINITY 0
 #endif
 #ifndef NVMEV_ENABLE_DIE_BATCHED_REPROMOTION
-#define NVMEV_ENABLE_DIE_BATCHED_REPROMOTION 0
+#define NVMEV_ENABLE_DIE_BATCHED_REPROMOTION 1
 #endif
 #ifndef NVMEV_ENABLE_QLC_REBALANCE
-#define NVMEV_ENABLE_QLC_REBALANCE 0
+#define NVMEV_ENABLE_QLC_REBALANCE 1
 #endif
-/* Variant: baseline with host append/overwrite die hint retained; other optional mechanisms disabled.
+#ifndef NVMEV_TEST_PHASE_REPROMOTION_ENABLE
+#define NVMEV_TEST_PHASE_REPROMOTION_ENABLE 1
+#endif
+#ifndef NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE
+#define NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE 1
+#endif
+/* Variant: no-latency scheduler with QLC hot/cold, repromotion, and rebalance enabled.
  * Superblock variant: free-line accounting is reported and thresholded at one
  * block-id stripe across all dies, rather than at one physical block per die.
  */
@@ -2627,8 +2633,8 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 			div64_u64(internal_write_pages * 1000ULL, host_write_pages);
 
 	seq_printf(m, "active %u\n", test_phase_enabled(conv_ftl) ? 1U : 0U);
-	seq_printf(m, "mechanism_source conv_ftl_baseline_superblock\n");
-	seq_printf(m, "mechanism_scheduler baseline_control_tick\n");
+	seq_printf(m, "mechanism_source conv_ftl_no2_superblock\n");
+	seq_printf(m, "mechanism_scheduler baseline_control_tick_no_latency\n");
 	seq_printf(m, "slc_migration_core page_level_cold_filter\n");
 	seq_printf(m, "compile_read_repromotion_enabled %u\n",
 		   (uint32_t)NVMEV_ENABLE_READ_REPROMOTION);
@@ -2638,7 +2644,12 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   (uint32_t)NVMEV_ENABLE_QLC_REBALANCE);
 	seq_printf(m, "compile_qlc_hotcold_enabled %u\n",
 		   (uint32_t)NVMEV_ENABLE_QLC_HOTCOLD);
-	seq_printf(m, "test_phase_repromote_policy enabled\n");
+	seq_printf(m, "compile_test_phase_repromotion_enabled %u\n",
+		   (uint32_t)NVMEV_TEST_PHASE_REPROMOTION_ENABLE);
+	seq_printf(m, "compile_test_phase_qlc_rebalance_enabled %u\n",
+		   (uint32_t)NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE);
+	seq_printf(m, "test_phase_repromote_policy %s\n",
+		   NVMEV_TEST_PHASE_REPROMOTION_ENABLE ? "enabled" : "blocked");
 	seq_printf(m, "read_requests %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_reqs));
 	seq_printf(m, "overwrite_requests %lld\n",
