@@ -162,7 +162,7 @@ run_fio_one_variant() {
 
 if [[ "$RUN_SQLITE" == "1" ]]; then
     FORCE_REBUILD="${FORCE_REBUILD:-1}" \
-    SQLITE_REBUILD_DIE_MODULES="${SQLITE_REBUILD_DIE_MODULES:-1}" \
+    SQLITE_REBUILD_DIE_MODULES="${SQLITE_REBUILD_DIE_MODULES:-0}" \
     THREAD_COUNTS="${THREAD_COUNTS:-1}" \
     VARIANTS="$VARIANTS" \
     SQLITE_ACCESS_DIST_LIST="${SQLITE_ACCESS_DIST_LIST:-zipf}" \
@@ -185,7 +185,7 @@ if [[ "$RUN_SQLITE" == "1" ]]; then
 fi
 
 if [[ "$RUN_FIO" == "1" ]]; then
-    if [[ "${SQLITE_REBUILD_DIE_MODULES:-1}" == "1" ]]; then
+    if [[ "${SQLITE_REBUILD_DIE_MODULES:-0}" == "1" ]]; then
         (cd "$NVMEV_DIR" && bash build_die.sh $VARIANTS)
     fi
     for variant in $VARIANTS; do

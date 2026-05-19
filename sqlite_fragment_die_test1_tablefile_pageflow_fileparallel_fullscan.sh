@@ -141,11 +141,20 @@ validate_workload_outputs() {
     if [[ "$ok" != "1" ]]; then
         return 1
     fi
-    if [[ -n "$expected_log_cold_mode" ]] &&
-       ! grep -q "\\[sqlite_init\\].*tag=${tag}.*cold_mode=${expected_log_cold_mode}" "$init_txt" 2>/dev/null; then
-        echo "ERROR: cold mode mismatch for tag=${tag}; expected cold_mode=${expected_log_cold_mode}" >&2
-        print_init_log_tail "$init_txt"
-        return 1
+    if [[ -n "$expected_log_cold_mode" ]]; then
+        local cold_mode_ok=0
+        if grep -q "\\[sqlite_init\\].*tag=${tag}.*cold_mode=${expected_log_cold_mode}" "$init_txt" 2>/dev/null; then
+            cold_mode_ok=1
+        elif [[ "$SQLITE_COLD_EXTRA_MODE" == "concurrent" ]] &&
+             [[ "$expected_cold_mode" == "random-row-concurrent" ]] &&
+             grep -q "\\[sqlite_init\\].*tag=${tag}.*cold_mode=${expected_cold_mode}" "$init_txt" 2>/dev/null; then
+            cold_mode_ok=1
+        fi
+        if [[ "$cold_mode_ok" != "1" ]]; then
+            echo "ERROR: cold mode mismatch for tag=${tag}; expected cold_mode=${expected_log_cold_mode}" >&2
+            print_init_log_tail "$init_txt"
+            return 1
+        fi
     fi
     if [[ "$expected_cold_mode" == "quota-row-shuffled" ]] &&
        [[ "$cold_extra_mixed" != "1" ]] &&
