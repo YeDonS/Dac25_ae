@@ -96,7 +96,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define SLC_HARD_GC_FREE_PCT 10U
 #define SLC_MIGRATION_VICTIM_CAP_PCT 5U
 #define SLC_MIGRATION_SCAN_SB_BUDGET 64U
-#define REPROMOTE_READ_TRIGGER 1024U
+#define REPROMOTE_READ_TRIGGER 32U
 #define REPROMOTE_BATCH_PAGES 512U
 #define REPROMOTE_HEAT_FLOOR 4U
 #define QLC_CLOSED_REPROMOTE_TRIGGER 10U
@@ -9037,8 +9037,7 @@ static uint32_t migrate_hot_from_closed_qlc(struct conv_ftl *conv_ftl)
 	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->qlc_closed_repromote_size)
 		return 0;
 
-	if (!qlc_closed_repromote_take_trigger(conv_ftl))
-		return 0;
+	(void)qlc_closed_repromote_take_trigger(conv_ftl);
 
 	if (conv_ftl->slc_repromote_guard_lines) {
 		collect_slc_stats(conv_ftl, &slc_stats);
