@@ -7669,14 +7669,19 @@ static void qlc_close_active_line(struct conv_ftl *conv_ftl, struct write_pointe
 	uint64_t full_threshold;
 	bool kick_repromote = false;
 
-	if (!wp || !wp->curline)
+	if (!conv_ftl || !wp || !lm)
 		return;
+
+	spin_lock(&conv_ftl->qlc_lock);
+	if (!wp->curline) {
+		spin_unlock(&conv_ftl->qlc_lock);
+		return;
+	}
 
 	line = wp->curline;
 	full_threshold = conv_ftl->qlc_pgs_per_blk;
 	written_pages = qlc_line_written_pages(line);
 
-	spin_lock(&conv_ftl->qlc_lock);
 	if (written_pages >= full_threshold && line->vpc >= full_threshold) {
 		list_add_tail(&line->entry, &lm->full_line_list);
 		lm->full_line_cnt++;
@@ -7731,10 +7736,14 @@ static void qlc_build_type_priority(uint32_t preferred, uint32_t *order)
 static int qlc_try_allocate_zone(struct conv_ftl *conv_ftl, struct write_pointer *wp,
 				 struct line *line, uint32_t zone, struct ppa *ppa_out)
 {
-	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	uint32_t pg_idx;
 	uint32_t step = QLC_PAGE_PATTERN;
 	uint32_t type = zone % QLC_PAGE_PATTERN;
+
+	if (!conv_ftl || !wp || !line || !ppa_out)
+		return -EINVAL;
+	if (READ_ONCE(wp->curline) != line)
+		return -EAGAIN;
 
 	for (pg_idx = type; pg_idx < conv_ftl->qlc_pgs_per_blk; pg_idx += step) {
 		struct ppa candidate;
@@ -7751,6 +7760,8 @@ static int qlc_try_allocate_zone(struct conv_ftl *conv_ftl, struct write_pointer
 		if (!page)
 			continue;
 		if (page->status == PG_FREE) {
+			if (READ_ONCE(wp->curline) != line)
+				return -EAGAIN;
 			*ppa_out = candidate;
 			if (zone < QLC_ZONE_COUNT)
 				line->zone_written[zone]++;
@@ -7791,7 +7802,8 @@ static int qlc_do_allocate(struct conv_ftl *conv_ftl, struct write_pointer *wp,
 				qlc_record_page_write(conv_ftl, wp, lm, die);
 				return 0;
 			}
-			qlc_close_active_line(conv_ftl, wp, lm, die);
+			if (READ_ONCE(wp->curline) == line)
+				qlc_close_active_line(conv_ftl, wp, lm, die);
 		}
 	}
 
@@ -7807,6 +7819,7 @@ static int qlc_get_new_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zo
 	uint32_t actual_die;
 	uint32_t type_order[QLC_PAGE_PATTERN];
 	uint32_t type_idx;
+	struct line *last_line = NULL;
 
 	if (!conv_ftl || !conv_ftl->die_count)
 		return -ENOSPC;
@@ -7828,14 +7841,20 @@ static int qlc_get_new_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zo
 
 	qlc_build_type_priority(zone_hint, type_order);
 	for (type_idx = 0; type_idx < QLC_PAGE_PATTERN; type_idx++) {
-		if (qlc_try_allocate_zone(conv_ftl, wp, wp->curline,
+		struct line *line = READ_ONCE(wp->curline);
+
+		if (!line)
+			break;
+		last_line = line;
+		if (qlc_try_allocate_zone(conv_ftl, wp, line,
 					  type_order[type_idx], ppa_out) == 0) {
 			qlc_record_page_write(conv_ftl, wp, lm, actual_die);
 			return 0;
 		}
 	}
 
-	qlc_close_active_line(conv_ftl, wp, lm, actual_die);
+	if (wp && last_line && READ_ONCE(wp->curline) == last_line)
+		qlc_close_active_line(conv_ftl, wp, lm, actual_die);
 	return -ENOSPC;
 }
 

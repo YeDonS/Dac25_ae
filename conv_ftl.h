@@ -453,9 +453,25 @@ struct conv_ftl {
 	atomic64_t test_phase_read_overwrite_conflicts; /* read overlapped overwrite */
 	atomic64_t test_phase_read_die_conflicts;   /* reads delayed because target die was busy */
 	atomic64_t test_phase_read_die_wait_ns;     /* cumulative die-busy wait added to reads */
+	atomic64_t test_phase_host_read_nand_ops;   /* foreground NAND reads issued by host reads */
+	atomic64_t test_phase_host_read_slc_ops;    /* host read NAND ops served from SLC */
+	atomic64_t test_phase_host_read_qlc_ops;    /* host read NAND ops served from QLC */
+	atomic64_t test_phase_read_nand_bg_overlap_ops; /* foreground read NAND ops issued while bg active */
+	atomic64_t test_phase_host_write_pages;     /* host logical pages written during test phase */
+	atomic64_t test_phase_host_write_nand_ops;  /* foreground NAND writes issued by host writes */
+	atomic64_t test_phase_write_early_completion_reqs; /* writes completed before NAND program completion */
+	atomic64_t test_phase_slc_to_qlc_nand_reads;  /* internal SLC->QLC migration reads */
+	atomic64_t test_phase_slc_to_qlc_nand_writes; /* internal SLC->QLC migration writes */
+	atomic64_t test_phase_repromote_nand_reads;   /* internal QLC->SLC repromotion reads */
+	atomic64_t test_phase_repromote_nand_writes;  /* internal QLC->SLC repromotion writes */
 	atomic_t test_phase_active_reads;       /* currently active host reads */
 	atomic_t test_phase_active_overwrites;  /* currently active overwrite writes */
 	atomic_t test_phase_active_bg_ops;      /* currently active bg migration ops */
+	uint64_t test_phase_host_writes_start;
+	uint64_t test_phase_slc_sb_migration_pages_start;
+	uint64_t test_phase_slc_sb_gc_valid_pages_start;
+	uint64_t test_phase_slc_sb_gc_invalid_pages_start;
+	uint64_t test_phase_qlc_closed_repromote_pages_start;
 	uint64_t heat_epoch;                    /* read/preheat epoch for cold migration guard */
 	atomic64_t slc_resident_page_cnt; /* 当前驻留在 SLC 的页面数 */
 	atomic_t slc_recover_lock;        /* 序列化 SLC 回收 */
