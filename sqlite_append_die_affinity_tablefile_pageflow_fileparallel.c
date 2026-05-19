@@ -2997,6 +2997,9 @@ static double run_cold_quota_row_shuffled(const struct dataset_layout *layout,
 					  const struct workload_options *opts,
 					  const unsigned int *read_plan,
 					  double *cold_per_table,
+					  double *table_latency,
+					  unsigned long long *table_read_ops,
+					  struct latency_sample_vec *latencies,
 					  unsigned long long *total_rows_out)
 {
 	struct quota_row_event *events = NULL;
@@ -3109,6 +3112,14 @@ static double run_cold_quota_row_shuffled(const struct dataset_layout *layout,
 		}
 		dt = monotonic_sec() - t0;
 		cold_per_table[tbl] += dt;
+		if (latencies && latency_vec_push(latencies, dt) != 0) {
+			rc = -ENOMEM;
+			break;
+		}
+		if (table_latency)
+			table_latency[tbl] += dt;
+		if (table_read_ops)
+			table_read_ops[tbl]++;
 		table_events[tbl] += (*total_rows_out > rows_before) ? 1ULL : 0ULL;
 	}
 	wall_start = monotonic_sec() - wall_start;
@@ -3323,7 +3334,9 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 
 	if (opts && opts->cold_full_read_mode == COLD_FULL_READ_QUOTA_ROW_SHUFFLED)
 		return run_cold_quota_row_shuffled(layout, tables, opts, read_plan,
-						   cold_per_table, total_rows_out);
+						   cold_per_table, table_latency,
+						   table_read_ops, cold_read_latencies,
+						   total_rows_out);
 	if (opts && opts->cold_full_read_mode == COLD_FULL_READ_QUOTA_PAGE_SHUFFLED)
 		return run_cold_quota_page_shuffled(layout, tables, opts, read_plan,
 						    cold_per_table, total_rows_out);
