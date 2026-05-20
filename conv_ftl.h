@@ -15,6 +15,14 @@ struct dentry;
 
 #define QLC_ZONE_COUNT 4
 
+enum nvmev_slc_sb_fold_state {
+	NVMEV_SLC_FOLD_IDLE = 0,
+	NVMEV_SLC_FOLD_FOLDING = 1,
+	NVMEV_SLC_FOLD_GC_READY = 2,
+	NVMEV_SLC_FOLD_GCING = 3,
+	NVMEV_SLC_FOLD_DEFERRED = 4,
+};
+
 enum nvmev_die_change_reason {
 	NVMEV_DIE_CHANGE_NONE = 0,
 	NVMEV_DIE_CHANGE_HOST_APPEND,
@@ -81,6 +89,7 @@ struct heat_tracking {
 	uint64_t *last_access_time; /* 每个 LPN 的最后访问时间 */
 	uint64_t *write_epoch;      /* 最近写入序号 */
 	uint64_t *write_heat_epoch; /* LPN 最近写入时的全局 heat epoch */
+	uint64_t *write_read_guard_epoch; /* test phase read-window guard epoch */
 	uint32_t migration_threshold; /* 迁移阈值 */
 };
 
@@ -280,6 +289,8 @@ struct conv_ftl {
 	uint32_t *slc_die_resident_count;  /* 当前每个 die 的 SLC resident 页数 */
 	uint32_t *slc_die_resident_cursor; /* 每个 die 的冷迁移扫描游标 */
 	uint32_t slc_migration_scan_cursor; /* SB-level cold migration 扫描游标 */
+	uint8_t *slc_sb_fold_state;       /* per-SB partial fold state */
+	uint32_t *slc_sb_fold_next_idx;   /* next die*pages_per_block+pg to scan */
 	uint32_t slc_migration_no_progress_scan_visits; /* no-progress migration scanned SBs */
 	uint32_t slc_migration_no_progress_victim_q;    /* victim_q when cooldown was armed */
 	uint64_t slc_migration_no_progress_epoch;       /* heat epoch when cooldown was armed */
@@ -422,6 +433,11 @@ struct conv_ftl {
 	uint64_t slc_sb_migration_victim_enqueues;
 	uint64_t slc_sb_migration_victim_dequeues;
 	uint64_t slc_sb_migration_victim_stale;
+	uint64_t slc_sb_fold_partial;
+	uint64_t slc_sb_fold_resumes;
+	uint64_t slc_sb_fold_completed;
+	uint64_t slc_sb_fold_deferred_recent;
+	uint64_t slc_sb_fold_yield_read_prio;
 	uint64_t slc_sb_recent_guard_skips;
 	uint64_t slc_sb_recent_guard_forced;
 	uint64_t slc_sb_gc_count;
@@ -465,9 +481,16 @@ struct conv_ftl {
 	atomic64_t test_phase_slc_to_qlc_nand_writes; /* internal SLC->QLC migration writes */
 	atomic64_t test_phase_repromote_nand_reads;   /* internal QLC->SLC repromotion reads */
 	atomic64_t test_phase_repromote_nand_writes;  /* internal QLC->SLC repromotion writes */
+	atomic64_t test_phase_guard_read_reqs;        /* read requests used by recent-write guard */
+	atomic64_t test_phase_guard_epoch;            /* current read-window guard epoch */
+	atomic64_t test_phase_recent_guard_skips;     /* SLC->QLC migration pages skipped by guard */
+	atomic64_t test_phase_recent_guard_forced;    /* guarded pages migrated under SLC pressure */
+	atomic64_t test_phase_last_read_ktime_ns;     /* host read arrival wall-clock for read-priority bg yield */
+	atomic64_t test_phase_read_priority_yields;   /* bg workers yielded to foreground reads */
 	atomic_t test_phase_active_reads;       /* currently active host reads */
 	atomic_t test_phase_active_overwrites;  /* currently active overwrite writes */
 	atomic_t test_phase_active_bg_ops;      /* currently active bg migration ops */
+	atomic_t latency3_bg_read_priority_gate; /* only latency3: enable bg read-priority checks */
 	uint64_t test_phase_host_writes_start;
 	uint64_t test_phase_slc_sb_migration_pages_start;
 	uint64_t test_phase_slc_sb_gc_valid_pages_start;

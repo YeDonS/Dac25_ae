@@ -225,6 +225,9 @@ struct workload_options {
 	enum cold_extra_mode cold_extra_mode;
 	double cold_extra_read_ratio;
 	unsigned int cold_extra_row_reads_per_batch;
+	unsigned int cold_extra_sleep_us;
+	unsigned int cold_extra_read_sleep_every;
+	unsigned int cold_extra_write_sleep_every;
 };
 
 struct refstyle_dummy_state {
@@ -257,6 +260,7 @@ struct concurrent_read_ctx {
 	enum cold_full_read_mode mode;
 	unsigned int rng_seed;
 	unsigned int chunk_rows;
+	const struct workload_options *opts;
 	double elapsed_sec;
 	double latency_sum_sec;
 	unsigned long long latency_ops;
@@ -353,6 +357,9 @@ static const struct option long_opts[] = {
 	{"cold-extra-read-ratio", required_argument, NULL, 1038},
 	{"cold-extra-row-reads-per-batch", required_argument, NULL, 1039},
 	{"heat-epoch-path", required_argument, NULL, 1040},
+	{"cold-extra-sleep-us", required_argument, NULL, 1041},
+	{"cold-extra-read-sleep-every", required_argument, NULL, 1042},
+	{"cold-extra-write-sleep-every", required_argument, NULL, 1043},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -364,6 +371,16 @@ static double monotonic_sec(void)
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
 		return 0.0;
 	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void maybe_cold_extra_sleep(const struct workload_options *opts,
+				   unsigned long long completed,
+				   unsigned int every)
+{
+	if (!opts || opts->cold_extra_sleep_us == 0 || every == 0 || completed == 0)
+		return;
+	if ((completed % every) == 0)
+		usleep((useconds_t)opts->cold_extra_sleep_us);
 }
 
 static unsigned int next_rand(unsigned int *state)
@@ -2214,6 +2231,8 @@ static void *append_tables_round_robin_worker(void *arg)
 			stats->rows_written += rows_step;
 			stats->payload_bytes_written += (unsigned long long)rows_step * ROW_PAYLOAD_BYTES;
 			stats->page_growth += pages_step;
+			maybe_cold_extra_sleep(opts, stats->rows_written,
+					       opts->cold_extra_write_sleep_every);
 
 			if (table->rows_inserted < table->total_rows)
 				active[next_active++] = table_id;
@@ -2362,6 +2381,7 @@ static int run_random_row_read_burst(const struct dataset_layout *layout,
 				     double *elapsed_out)
 {
 	double start;
+	unsigned long long completed_reads = 0;
 
 	if (!layout || !tables || !opts || !stmts || !rng_state || events == 0) {
 		if (elapsed_out)
@@ -2415,6 +2435,10 @@ static int run_random_row_read_burst(const struct dataset_layout *layout,
 			table_read_ops[tbl]++;
 		if (total_rows_out)
 			(*total_rows_out)++;
+		completed_reads++;
+		maybe_cold_extra_sleep(opts,
+				       total_rows_out ? *total_rows_out : completed_reads,
+				       opts->cold_extra_read_sleep_every);
 
 		row_index = (unsigned int)(table->max_record_id_exclusive - 1 - row_id);
 		if (row_index < table->total_rows) {
@@ -2521,6 +2545,8 @@ static int run_cold_mixed_append_random_read(const struct dataset_layout *layout
 				round_rows += rows_step;
 				round_bytes += (unsigned long long)rows_step * ROW_PAYLOAD_BYTES;
 				pages_since_last_read += pages_step;
+				maybe_cold_extra_sleep(opts, stats->rows_written,
+						       opts->cold_extra_write_sleep_every);
 
 				if (table->rows_inserted < table->total_rows)
 					active[next_active++] = table_id;
@@ -2863,6 +2889,8 @@ static int concurrent_read_push_latency(struct concurrent_read_ctx *ctx, double 
 		return rc;
 	ctx->latency_sum_sec += latency;
 	ctx->latency_ops++;
+	maybe_cold_extra_sleep(ctx->opts, ctx->latency_ops,
+			       ctx->opts ? ctx->opts->cold_extra_read_sleep_every : 0);
 	return 0;
 }
 
@@ -3121,6 +3149,8 @@ static double run_cold_quota_row_shuffled(const struct dataset_layout *layout,
 		if (table_read_ops)
 			table_read_ops[tbl]++;
 		table_events[tbl] += (*total_rows_out > rows_before) ? 1ULL : 0ULL;
+		maybe_cold_extra_sleep(opts, *total_rows_out,
+				       opts->cold_extra_read_sleep_every);
 	}
 	wall_start = monotonic_sec() - wall_start;
 
@@ -3289,6 +3319,8 @@ static double run_cold_quota_page_shuffled(const struct dataset_layout *layout,
 		cold_per_table[tbl] += dt;
 		table_events[tbl]++;
 		(*total_pages_out)++;
+		maybe_cold_extra_sleep(opts, *total_pages_out,
+				       opts->cold_extra_read_sleep_every);
 	}
 	wall_start = monotonic_sec() - wall_start;
 
@@ -3385,6 +3417,7 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 				(0x9e3779b9U * (tbl + 1U));
 			ctxs[launched].chunk_rows = opts && opts->cold_random_chunk_rows ?
 				opts->cold_random_chunk_rows : DEFAULT_COLD_RANDOM_CHUNK_ROWS;
+			ctxs[launched].opts = opts;
 			ctxs[launched].elapsed_sec = 0.0;
 			ctxs[launched].latency_sum_sec = 0.0;
 			ctxs[launched].latency_ops = 0;
@@ -4341,6 +4374,10 @@ static int run_init_mode(const struct workload_options *opts)
 	       "per-row-autocommit-dummy-row-roundrobin" : "window-transaction");
 	printf("[sqlite_init] test_phase_path=%s\n",
 	       opts->test_phase_path ? opts->test_phase_path : "(null)");
+	printf("[sqlite_init] cold_extra_sleep_us=%u read_sleep_every=%u write_sleep_every=%u\n",
+	       opts->cold_extra_sleep_us,
+	       opts->cold_extra_read_sleep_every,
+	       opts->cold_extra_write_sleep_every);
 	if (opts->refstyle_dummy_bytes > 0) {
 		printf("[sqlite_init] estimated_pages_per_table=%.0f estimated_rounds=%.2f "
 		       "(one macro round = each active table grows by ~1 row = %u host pages: %u SQLite + %u dummy)\n",
@@ -4800,6 +4837,9 @@ static void usage(const char *prog)
 		"  --cold-extra-mode off|serial|concurrent|serial-mixed\n"
 			"  --cold-extra-read-ratio N\n"
 			"  --cold-extra-row-reads-per-batch N\n"
+			"  --cold-extra-sleep-us N\n"
+			"  --cold-extra-read-sleep-every N\n"
+			"  --cold-extra-write-sleep-every N\n"
 		"  --tag TAG\n", prog);
 }
 
@@ -4845,6 +4885,9 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->cold_extra_mode = COLD_EXTRA_MODE_OFF;
 	opts->cold_extra_read_ratio = 10.0;
 	opts->cold_extra_row_reads_per_batch = 0;
+	opts->cold_extra_sleep_us = 0;
+	opts->cold_extra_read_sleep_every = 0;
+	opts->cold_extra_write_sleep_every = 0;
 	opts->cold_full_read_mode = COLD_FULL_READ_FULL_SCAN;
 	opts->cold_full_read_iters = DEFAULT_COLD_FULL_READ_ITERS;
 	opts->cold_random_chunk_rows = DEFAULT_COLD_RANDOM_CHUNK_ROWS;
@@ -4988,6 +5031,18 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 					break;
 				case 1039:
 					opts->cold_extra_row_reads_per_batch =
+						(unsigned int)strtoul(optarg, NULL, 10);
+					break;
+				case 1041:
+					opts->cold_extra_sleep_us =
+						(unsigned int)strtoul(optarg, NULL, 10);
+					break;
+				case 1042:
+					opts->cold_extra_read_sleep_every =
+						(unsigned int)strtoul(optarg, NULL, 10);
+					break;
+				case 1043:
+					opts->cold_extra_write_sleep_every =
 						(unsigned int)strtoul(optarg, NULL, 10);
 					break;
 				case 'h':

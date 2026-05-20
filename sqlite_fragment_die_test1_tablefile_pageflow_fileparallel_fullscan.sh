@@ -55,6 +55,13 @@ SQLITE_COLD_EXTRA_APPEND_BYTES=${SQLITE_COLD_EXTRA_APPEND_BYTES:-0}
 SQLITE_COLD_EXTRA_MODE=${SQLITE_COLD_EXTRA_MODE:-off}
 SQLITE_COLD_EXTRA_READ_RATIO=${SQLITE_COLD_EXTRA_READ_RATIO:-10}
 SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH=${SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH:-0}
+SQLITE_COLD_EXTRA_SLEEP_US=${SQLITE_COLD_EXTRA_SLEEP_US:-0}
+SQLITE_COLD_EXTRA_READ_SLEEP_EVERY=${SQLITE_COLD_EXTRA_READ_SLEEP_EVERY:-0}
+SQLITE_COLD_EXTRA_WRITE_SLEEP_EVERY=${SQLITE_COLD_EXTRA_WRITE_SLEEP_EVERY:-0}
+SQLITE_TEST_PHASE_RECENT_WRITE_GUARD=${SQLITE_TEST_PHASE_RECENT_WRITE_GUARD:-1}
+SQLITE_TEST_PHASE_GUARD_READ_REQS=${SQLITE_TEST_PHASE_GUARD_READ_REQS:-64}
+SQLITE_TEST_PHASE_RECENT_WRITE_GUARD_PATH=${SQLITE_TEST_PHASE_RECENT_WRITE_GUARD_PATH:-/sys/module/nvmev/parameters/test_phase_recent_write_guard}
+SQLITE_TEST_PHASE_GUARD_READ_REQS_PATH=${SQLITE_TEST_PHASE_GUARD_READ_REQS_PATH:-/sys/module/nvmev/parameters/test_phase_guard_read_reqs}
 SQLITE_ACCESS_DIST=${SQLITE_ACCESS_DIST:-zipf}
 SQLITE_ACCESS_DIST_LIST=${SQLITE_ACCESS_DIST_LIST:-$SQLITE_ACCESS_DIST}
 NORMAL_MEAN=${NORMAL_MEAN:--1}
@@ -228,6 +235,32 @@ load_die_module() {
     sleep 1
 }
 
+set_optional_module_param() {
+    local path="$1"
+    local value="$2"
+    local label="$3"
+
+    if [[ -z "$path" || -z "$value" ]]; then
+        return 0
+    fi
+    if [[ ! -e "$path" ]]; then
+        echo "[module_param] skip $label: $path not present"
+        return 0
+    fi
+    if echo "$value" | sudo tee "$path" >/dev/null; then
+        echo "[module_param] $label=$value path=$path"
+    else
+        echo "[module_param] failed to set $label=$value path=$path" >&2
+    fi
+}
+
+configure_test_phase_guard_params() {
+    set_optional_module_param "$SQLITE_TEST_PHASE_RECENT_WRITE_GUARD_PATH" \
+        "$SQLITE_TEST_PHASE_RECENT_WRITE_GUARD" "test_phase_recent_write_guard"
+    set_optional_module_param "$SQLITE_TEST_PHASE_GUARD_READ_REQS_PATH" \
+        "$SQLITE_TEST_PHASE_GUARD_READ_REQS" "test_phase_guard_read_reqs"
+}
+
 run_one_test() {
     local variant="$1"
     local threads="$2"
@@ -252,12 +285,13 @@ run_one_test() {
     echo "================================================================"
     echo "  [TEST1-TABLEFILE-PAGEFLOW-FILEPARALLEL-FULLSCAN] variant=$variant  threads=$threads  cold_mode=$cold_mode  window_pages=$window_pages  cmt=$cmt_label($cmt_bytes bytes)  tag=$tag"
     echo "  per-table-db=ON  logical_row_bytes~32KB  est_row_pages~8  tables=$SQLITE_TABLE_COUNT  rows/tbl_override=$SQLITE_ROWS_PER_TABLE"
-    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$window_pages  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  normal_mean=$NORMAL_MEAN  normal_stddev=$NORMAL_STDDEV  cold_mode=$cold_mode  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  cold_extra_read_ratio=$SQLITE_COLD_EXTRA_READ_RATIO  cold_extra_row_reads_per_batch=$SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
-    echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH  heat_epoch_path=$SQLITE_HEAT_EPOCH_PATH"
+    echo "  target=$SQLITE_TARGET_BYTES  window_tables=$SQLITE_WINDOW_TABLES  window_pages_per_table=$window_pages  window_passes_per_round=$SQLITE_WINDOW_PASSES_PER_ROUND  interleave_pages=$SQLITE_INTERLEAVE_PAGES  access_dist=$SQLITE_ACCESS_DIST  zipf_alpha=$ZIPF_ALPHA  normal_mean=$NORMAL_MEAN  normal_stddev=$NORMAL_STDDEV  cold_mode=$cold_mode  cold_extra_append_bytes=$SQLITE_COLD_EXTRA_APPEND_BYTES  cold_extra_mode=$SQLITE_COLD_EXTRA_MODE  cold_extra_read_ratio=$SQLITE_COLD_EXTRA_READ_RATIO  cold_extra_row_reads_per_batch=$SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH  cold_extra_sleep_us=$SQLITE_COLD_EXTRA_SLEEP_US  read_sleep_every=$SQLITE_COLD_EXTRA_READ_SLEEP_EVERY  write_sleep_every=$SQLITE_COLD_EXTRA_WRITE_SLEEP_EVERY  refstyle_dummy=$SQLITE_REFSTYLE_DUMMY_BYTES  align_pages=$SQLITE_ALIGN_PAGES"
+    echo "  gc_nand_timing=$SQLITE_GC_NAND_TIMING  gc_nand_timing_path=$SQLITE_GC_NAND_TIMING_PATH  bg_nand_stats_path=$SQLITE_BG_NAND_STATS_PATH  heat_epoch_path=$SQLITE_HEAT_EPOCH_PATH  recent_write_guard=$SQLITE_TEST_PHASE_RECENT_WRITE_GUARD  guard_read_reqs=$SQLITE_TEST_PHASE_GUARD_READ_REQS"
     echo "  note: default run uses no dummy; cold scan uses one thread per table file within each batch"
     echo "================================================================"
 
     load_die_module "$variant" "$cmt_bytes"
+    configure_test_phase_guard_params
 
     lsblk
     source setdevice.sh
@@ -309,6 +343,9 @@ run_one_test() {
         --cold-extra-mode "$SQLITE_COLD_EXTRA_MODE" \
         --cold-extra-read-ratio "$SQLITE_COLD_EXTRA_READ_RATIO" \
         --cold-extra-row-reads-per-batch "$SQLITE_COLD_EXTRA_ROW_READS_PER_BATCH" \
+        --cold-extra-sleep-us "$SQLITE_COLD_EXTRA_SLEEP_US" \
+        --cold-extra-read-sleep-every "$SQLITE_COLD_EXTRA_READ_SLEEP_EVERY" \
+        --cold-extra-write-sleep-every "$SQLITE_COLD_EXTRA_WRITE_SLEEP_EVERY" \
 	        --cold-concurrent-threads "$threads" \
 	        --test-phase-path "$SQLITE_TEST_PHASE_PATH" \
 	        --heat-epoch-path "$SQLITE_HEAT_EPOCH_PATH" \

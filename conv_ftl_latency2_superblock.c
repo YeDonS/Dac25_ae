@@ -48,6 +48,18 @@ static unsigned long long nvmev_ftl_slow_ns;
 module_param_named(ftl_slow_ns, nvmev_ftl_slow_ns, ullong, 0644);
 MODULE_PARM_DESC(ftl_slow_ns, "Log FTL command time if above threshold (ns), 0 disables");
 
+static bool nvmev_test_phase_recent_write_guard = true;
+module_param_named(test_phase_recent_write_guard,
+		   nvmev_test_phase_recent_write_guard, bool, 0644);
+MODULE_PARM_DESC(test_phase_recent_write_guard,
+		 "Protect pages written in the current test-phase read window from SLC->QLC migration");
+
+static unsigned int nvmev_test_phase_guard_read_reqs = 64;
+module_param_named(test_phase_guard_read_reqs,
+		   nvmev_test_phase_guard_read_reqs, uint, 0644);
+MODULE_PARM_DESC(test_phase_guard_read_reqs,
+		 "Number of test-phase read requests per recent-write guard epoch");
+
 void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			      struct buffer *write_buffer, unsigned int buffs_to_release);
 
@@ -2284,6 +2296,35 @@ static uint64_t get_dynamic_cold_threshold_x10(struct conv_ftl *conv_ftl)
 	return ht ? (uint64_t)ht->migration_threshold * 10ULL : 0;
 }
 
+static inline bool test_phase_recent_write_guard_active(const struct conv_ftl *conv_ftl)
+{
+	return conv_ftl && READ_ONCE(conv_ftl->test_phase_active) &&
+		READ_ONCE(nvmev_test_phase_recent_write_guard) &&
+		READ_ONCE(nvmev_test_phase_guard_read_reqs) > 0;
+}
+
+static uint64_t test_phase_guard_epoch_for_reads(uint64_t reads)
+{
+	unsigned int window = READ_ONCE(nvmev_test_phase_guard_read_reqs);
+
+	if (!window)
+		return 0;
+	if (!reads)
+		return 1;
+	return div64_u64(reads - 1, window) + 1;
+}
+
+static uint64_t test_phase_write_guard_epoch(struct conv_ftl *conv_ftl)
+{
+	uint64_t epoch;
+
+	if (!test_phase_recent_write_guard_active(conv_ftl))
+		return 0;
+
+	epoch = (uint64_t)atomic64_read(&conv_ftl->test_phase_guard_epoch);
+	return epoch ? epoch : 1;
+}
+
 static bool recent_write_guard_with_pressure(struct conv_ftl *conv_ftl, uint64_t lpn,
 					     bool slc_pressure)
 {
@@ -2292,10 +2333,27 @@ static bool recent_write_guard_with_pressure(struct conv_ftl *conv_ftl, uint64_t
 
 	if (!conv_ftl || !conv_ftl->ssd || lpn >= conv_ftl->ssd->sp.tt_pgs)
 		return false;
-	if (READ_ONCE(conv_ftl->test_phase_active))
-		return false;
 
 	ht = &conv_ftl->heat_track;
+	if (READ_ONCE(conv_ftl->test_phase_active)) {
+		uint64_t current_epoch;
+
+		if (!test_phase_recent_write_guard_active(conv_ftl) ||
+		    !ht->write_read_guard_epoch)
+			return false;
+
+		epoch = ht->write_read_guard_epoch[lpn];
+		current_epoch = test_phase_write_guard_epoch(conv_ftl);
+		if (!epoch || epoch != current_epoch)
+			return false;
+		if (slc_pressure) {
+			atomic64_inc(&conv_ftl->test_phase_recent_guard_forced);
+			return false;
+		}
+		atomic64_inc(&conv_ftl->test_phase_recent_guard_skips);
+		return true;
+	}
+
 	if (ht && ht->write_heat_epoch) {
 		epoch = ht->write_heat_epoch[lpn];
 		if (slc_pressure)
@@ -2611,6 +2669,10 @@ static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
 	atomic64_set(&conv_ftl->test_phase_slc_to_qlc_nand_writes, 0);
 	atomic64_set(&conv_ftl->test_phase_repromote_nand_reads, 0);
 	atomic64_set(&conv_ftl->test_phase_repromote_nand_writes, 0);
+	atomic64_set(&conv_ftl->test_phase_guard_read_reqs, 0);
+	atomic64_set(&conv_ftl->test_phase_guard_epoch, 1);
+	atomic64_set(&conv_ftl->test_phase_recent_guard_skips, 0);
+	atomic64_set(&conv_ftl->test_phase_recent_guard_forced, 0);
 	atomic_set(&conv_ftl->test_phase_active_reads, 0);
 	atomic_set(&conv_ftl->test_phase_active_overwrites, 0);
 	atomic_set(&conv_ftl->test_phase_active_bg_ops, 0);
@@ -2652,7 +2714,16 @@ static void test_phase_note_read_begin(struct conv_ftl *conv_ftl, bool *tracked)
 	if (!test_phase_enabled(conv_ftl))
 		return;
 
-	atomic64_inc(&conv_ftl->test_phase_read_reqs);
+	{
+		uint64_t reads =
+			(uint64_t)atomic64_inc_return(&conv_ftl->test_phase_read_reqs);
+
+		if (test_phase_recent_write_guard_active(conv_ftl)) {
+			atomic64_set(&conv_ftl->test_phase_guard_read_reqs, reads);
+			atomic64_set(&conv_ftl->test_phase_guard_epoch,
+				     test_phase_guard_epoch_for_reads(reads));
+		}
+	}
 	atomic_inc(&conv_ftl->test_phase_active_reads);
 	if (atomic_read(&conv_ftl->test_phase_active_bg_ops) > 0)
 		atomic64_inc(&conv_ftl->test_phase_read_bg_conflicts);
@@ -2883,6 +2954,20 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   NVMEV_TEST_PHASE_REPROMOTION_ENABLE ? "enabled" : "blocked");
 	seq_printf(m, "read_requests %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_reqs));
+	seq_printf(m, "test_phase_recent_write_guard_config %u\n",
+		   READ_ONCE(nvmev_test_phase_recent_write_guard) ? 1U : 0U);
+	seq_printf(m, "test_phase_recent_write_guard_active %u\n",
+		   test_phase_recent_write_guard_active(conv_ftl) ? 1U : 0U);
+	seq_printf(m, "test_phase_guard_read_reqs_config %u\n",
+		   READ_ONCE(nvmev_test_phase_guard_read_reqs));
+	seq_printf(m, "test_phase_guard_read_reqs %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_guard_read_reqs));
+	seq_printf(m, "test_phase_guard_epoch %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_guard_epoch));
+	seq_printf(m, "test_phase_recent_guard_skips %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_recent_guard_skips));
+	seq_printf(m, "test_phase_recent_guard_forced %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_recent_guard_forced));
 	seq_printf(m, "overwrite_requests %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_overwrite_reqs));
 	seq_printf(m, "bg_repromote_ops %lld\n",
@@ -4424,6 +4509,31 @@ static int init_heat_tracking_with_retry(struct conv_ftl *conv_ftl, int max_retr
 		ht->write_epoch = NULL;
 		return -ENOMEM;
 	}
+
+	retry_count = 0;
+	while (retry_count < max_retries) {
+		ht->write_read_guard_epoch = vmalloc(sizeof(uint64_t) * spp->tt_pgs);
+		if (ht->write_read_guard_epoch)
+			break;
+		NVMEV_ERROR("Failed to allocate write read-guard epoch memory, retry %d/%d\n",
+			   retry_count + 1, max_retries);
+		msleep(50);
+		retry_count++;
+	}
+
+	if (!ht->write_read_guard_epoch) {
+		NVMEV_ERROR("Failed to allocate write read-guard epoch memory after %d retries\n",
+			   max_retries);
+		vfree(ht->access_count);
+		vfree(ht->last_access_time);
+		vfree(ht->write_epoch);
+		vfree(ht->write_heat_epoch);
+		ht->access_count = NULL;
+		ht->last_access_time = NULL;
+		ht->write_epoch = NULL;
+		ht->write_heat_epoch = NULL;
+		return -ENOMEM;
+	}
 		
 	/* 重试分配 page_in_slc */
 	retry_count = 0;
@@ -4444,10 +4554,12 @@ static int init_heat_tracking_with_retry(struct conv_ftl *conv_ftl, int max_retr
 		vfree(ht->last_access_time);
 		vfree(ht->write_epoch);
 		vfree(ht->write_heat_epoch);
+		vfree(ht->write_read_guard_epoch);
 		ht->access_count = NULL;
 		ht->last_access_time = NULL;
 		ht->write_epoch = NULL;
 		ht->write_heat_epoch = NULL;
+		ht->write_read_guard_epoch = NULL;
 		return -ENOMEM;
 	}
 
@@ -4469,6 +4581,7 @@ static int init_heat_tracking_with_retry(struct conv_ftl *conv_ftl, int max_retr
 			vfree(ht->last_access_time);
 			vfree(ht->write_epoch);
 			vfree(ht->write_heat_epoch);
+			vfree(ht->write_read_guard_epoch);
 			vfree(conv_ftl->page_in_slc);
 			vfree(conv_ftl->slc_resident_lpns);
 			vfree(conv_ftl->slc_resident_slot);
@@ -4478,6 +4591,7 @@ static int init_heat_tracking_with_retry(struct conv_ftl *conv_ftl, int max_retr
 			ht->last_access_time = NULL;
 			ht->write_epoch = NULL;
 			ht->write_heat_epoch = NULL;
+			ht->write_read_guard_epoch = NULL;
 			conv_ftl->page_in_slc = NULL;
 			conv_ftl->slc_resident_lpns = NULL;
 			conv_ftl->slc_resident_slot = NULL;
@@ -4494,6 +4608,7 @@ static int init_heat_tracking_with_retry(struct conv_ftl *conv_ftl, int max_retr
 		ht->last_access_time[i] = 0;
 		ht->write_epoch[i] = 0;
 		ht->write_heat_epoch[i] = 0;
+		ht->write_read_guard_epoch[i] = 0;
 		conv_ftl->page_in_slc[i] = false;
 		if (conv_ftl->slc_resident_slot)
 			conv_ftl->slc_resident_slot[i] = U32_MAX;
@@ -4728,6 +4843,7 @@ static void remove_heat_tracking(struct conv_ftl *conv_ftl)
 	vfree(conv_ftl->heat_track.last_access_time);
 	vfree(conv_ftl->heat_track.write_epoch);
 	vfree(conv_ftl->heat_track.write_heat_epoch);
+	vfree(conv_ftl->heat_track.write_read_guard_epoch);
 	vfree(conv_ftl->page_in_slc);
 	vfree(conv_ftl->slc_resident_lpns);
 	vfree(conv_ftl->slc_resident_slot);
@@ -4737,6 +4853,7 @@ static void remove_heat_tracking(struct conv_ftl *conv_ftl)
 	conv_ftl->heat_track.last_access_time = NULL;
 	conv_ftl->heat_track.write_epoch = NULL;
 	conv_ftl->heat_track.write_heat_epoch = NULL;
+	conv_ftl->heat_track.write_read_guard_epoch = NULL;
 	conv_ftl->page_in_slc = NULL;
 	conv_ftl->slc_resident_lpns = NULL;
 	conv_ftl->slc_resident_slot = NULL;
@@ -6045,6 +6162,14 @@ static bool select_sb_victim_slc_locked(struct conv_ftl *conv_ftl,
 		struct baseline_sb_summary cand;
 
 		if (!conv_ftl->slc_sb_migrated_victim[i])
+			continue;
+		/* [LATENCY v2] 与 1665-1667 的 cold migration 扫描对称:
+		 * 如果 V2 已经把这条 SB 拉进 MIG/GC_RDY/GC phase, 它的 per-die
+		 * task 正在处理这条 SB; V1 fallback GC 不能再选它, 否则会跟
+		 * V2 worker 撞车 (重复搬页 / 重复 erase / phase 状态错位)。
+		 * 等 V2 把 phase 还回 IDLE 再考虑。 */
+		if (maint_v2_enabled(conv_ftl) &&
+		    maint_sb_get_phase(conv_ftl, i) != MAINT_SB_PHASE_IDLE)
 			continue;
 		if (!slc_sb_collect_summary(conv_ftl, i, &cand)) {
 			/* SB 已经完全 free 但 victim 位还残留 — 清掉。 */
@@ -10511,6 +10636,9 @@ retry_wb_alloc:
 	        if (conv_ftl->heat_track.write_heat_epoch)
 	            conv_ftl->heat_track.write_heat_epoch[local_lpn] =
 	                READ_ONCE(conv_ftl->heat_epoch);
+	        if (conv_ftl->heat_track.write_read_guard_epoch)
+	            conv_ftl->heat_track.write_read_guard_epoch[local_lpn] =
+	                test_phase_write_guard_epoch(conv_ftl);
 
 		//NVMEV_ERROR("PPA: ch:%d, lun:%d, blk:%d, pg:%d \n", ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg );
 

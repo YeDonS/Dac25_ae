@@ -12,6 +12,7 @@ set -e
 #   ./build_die.sh die_base_sb   # baseline with superblock free-line accounting
 #   ./build_die.sh die_latency1_sb # pure V1 latency maintenance worker
 #   ./build_die.sh die_latency2_sb # V1 core + V2 per-die idle/demand scheduler
+#   ./build_die.sh die_latency3_sb # V1 core + foreground-read-priority bg workers
 #   ./build_die.sh die_all_sb   # latency superblock + QLC hot/cold + repromotion + QLC rebalance
 #   ./build_die.sh die_no1_sb    # chain-only with superblock accounting and 14 active superblocks
 #   ./build_die.sh die_base_lru  # baseline + 8MiB demand-loaded mapping CMT + LRU
@@ -57,6 +58,7 @@ ftl_source_for() {
         die_base_sb) echo "conv_ftl_baseline_superblock.c" ;;
         die_latency1_sb|die_latency_sb_v1) echo "conv_ftl_latency1_superblock.c" ;;
         die_latency2_sb|die_latency_sb) echo "conv_ftl_latency2_superblock.c" ;;
+        die_latency3_sb) echo "conv_ftl_latency3_superblock.c" ;;
         die_all_sb) echo "conv_ftl_all_superblock.c" ;;
         die_no2_sb) echo "conv_ftl_no2_superblock.c" ;;
         die_base_lru) echo "conv_ftl_baseline_lru.c" ;;
@@ -171,7 +173,7 @@ build_one() {
 ABLATION_VARIANTS="die_i_base die_i_all die_i_no_chain die_i_no_hotcold die_i_no_repromote die_i_no_rebalance die_i_chain_only die_i_no2_only die_i_no3_only"
 
 if [[ "${1:-}" == "all" ]]; then
-    for v in die_base die_base_sb die_latency1_sb die_latency2_sb die_all_sb die_no2_sb die_base_lru die_no4 die_base2 die_base3 die_no1 die_no1_sb die_no2 die_no3 die_all $ABLATION_VARIANTS; do
+    for v in die_base die_base_sb die_latency1_sb die_latency2_sb die_latency3_sb die_all_sb die_no2_sb die_base_lru die_no4 die_base2 die_base3 die_no1 die_no1_sb die_no2 die_no3 die_all $ABLATION_VARIANTS; do
         build_one "$v"
     done
     echo ""
@@ -190,7 +192,7 @@ elif [[ "$#" -gt 1 ]]; then
         build_one "$v"
     done
 else
-    VARIANT="${1:?Usage: $0 die_all|die_all_sb|die_no1|die_no1_sb|die_no2|die_no2_sb|die_no3|die_no4|die_base|die_base_sb|die_latency1_sb|die_latency2_sb|die_latency_sb|die_latency_sb_v1|die_base_lru|die_base2|die_base3|die_i_base|die_i_all|die_i_no_chain|die_i_no_hotcold|die_i_no_repromote|die_i_no_rebalance|die_i_chain_only|die_i_no2_only|die_i_no3_only|all|ablations [more variants...]}"
+    VARIANT="${1:?Usage: $0 die_all|die_all_sb|die_no1|die_no1_sb|die_no2|die_no2_sb|die_no3|die_no4|die_base|die_base_sb|die_latency1_sb|die_latency2_sb|die_latency3_sb|die_latency_sb|die_latency_sb_v1|die_base_lru|die_base2|die_base3|die_i_base|die_i_all|die_i_no_chain|die_i_no_hotcold|die_i_no_repromote|die_i_no_rebalance|die_i_chain_only|die_i_no2_only|die_i_no3_only|all|ablations [more variants...]}"
     ftl_source_for "$VARIANT" >/dev/null || { echo "Unknown variant '$VARIANT'" >&2; exit 1; }
     build_one "$VARIANT"
 fi
