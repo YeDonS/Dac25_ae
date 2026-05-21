@@ -453,6 +453,11 @@ struct conv_ftl {
 	uint64_t slc_sb_gc_tier_pure_cold;
 	uint64_t slc_sb_gc_tier_mixed;
 	uint64_t slc_sb_gc_tier_fallback;
+	uint64_t hard_no_victim_count;
+	uint64_t active_sealed_for_hard;
+	uint64_t active_sealed_for_alloc_fail;
+	uint64_t active_seal_migrated_pages;
+	uint64_t active_seal_no_migrate;
 	uint64_t repromote_chain_alloc_pages;
 	uint64_t repromote_gc_pool_pages;
 	uint64_t repromote_skip_active_cap;
