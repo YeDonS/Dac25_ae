@@ -7,6 +7,7 @@
 #include <linux/spinlock.h>
 #include <linux/seqlock.h>
 #include <linux/atomic.h>
+#include <linux/workqueue.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "ssd.h"
@@ -328,10 +329,13 @@ struct conv_ftl {
 	struct workqueue_struct *bg_migration_wq;
 	struct work_struct repromotion_work;
 	struct work_struct qlc_rebalance_work;
+	struct delayed_work latency3_repromotion_delayed_work;
+	struct delayed_work latency3_qlc_rebalance_delayed_work;
 	/* SLC maintenance worker state. Baseline accounts foreground SLC
 	 * migration/GC in conv_write() completion time; latency uses these fields
 	 * for BG/URGENT async maintenance and accounts only foreground stalls. */
 	struct work_struct slc_maint_work;
+	struct delayed_work latency3_slc_maint_delayed_work;
 	uint64_t slc_maint_runs;
 	uint64_t slc_maint_pages;
 	uint64_t fg_maint_latest_ns;          /* foreground SLC maintenance completion time */
@@ -487,10 +491,14 @@ struct conv_ftl {
 	atomic64_t test_phase_recent_guard_forced;    /* guarded pages migrated under SLC pressure */
 	atomic64_t test_phase_last_read_ktime_ns;     /* host read arrival wall-clock for read-priority bg yield */
 	atomic64_t test_phase_read_priority_yields;   /* bg workers yielded to foreground reads */
+	atomic64_t test_phase_read_priority_delayed_requeues; /* latency3: yielded work was delayed before retry */
+	atomic64_t test_phase_read_priority_forced_progress_runs; /* latency3: pressure forced one bg maintenance run */
 	atomic_t test_phase_active_reads;       /* currently active host reads */
 	atomic_t test_phase_active_overwrites;  /* currently active overwrite writes */
 	atomic_t test_phase_active_bg_ops;      /* currently active bg migration ops */
 	atomic_t latency3_bg_read_priority_gate; /* only latency3: enable bg read-priority checks */
+	atomic_t latency3_read_priority_yield_streak; /* only latency3: consecutive bg read-priority yields */
+	atomic_t latency3_read_priority_force_active; /* only latency3: suppress nested yield checks during forced run */
 	uint64_t test_phase_host_writes_start;
 	uint64_t test_phase_slc_sb_migration_pages_start;
 	uint64_t test_phase_slc_sb_gc_valid_pages_start;

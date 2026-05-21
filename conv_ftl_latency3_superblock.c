@@ -20,6 +20,7 @@
 #include <linux/spinlock.h>
 #include <linux/moduleparam.h>
 #include <linux/workqueue.h>
+#include <linux/jiffies.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -93,6 +94,12 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #ifndef NVMEV_LATENCY3_READ_QUIET_NS
 #define NVMEV_LATENCY3_READ_QUIET_NS 50000ULL
 #endif
+#ifndef NVMEV_LATENCY3_REQUEUE_DELAY_US
+#define NVMEV_LATENCY3_REQUEUE_DELAY_US 50U
+#endif
+#ifndef NVMEV_LATENCY3_FORCE_AFTER_YIELDS
+#define NVMEV_LATENCY3_FORCE_AFTER_YIELDS 64U
+#endif
 /* Variant: baseline with host append/overwrite die hint retained; other optional mechanisms disabled.
  * Superblock variant: free-line accounting is reported and thresholded at one
  * block-id stripe across all dies, rather than at one physical block per die.
@@ -111,6 +118,7 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define SLC_HARD_GC_FREE_PCT 10U
 #define SLC_MIGRATION_VICTIM_CAP_PCT 5U
 #define SLC_MIGRATION_SCAN_SB_BUDGET 64U
+#define SLC_MIGRATION_NO_PROGRESS_COOLDOWN_CALLS 64U
 #define REPROMOTE_READ_TRIGGER 32U
 #define REPROMOTE_BATCH_PAGES 512U
 #define REPROMOTE_HEAT_FLOOR 4U
@@ -952,8 +960,11 @@ static uint64_t baseline_repromote_hot_threshold(uint64_t avg_reads);
 static uint32_t migrate_hot_from_closed_qlc(struct conv_ftl *conv_ftl);
 static void bg_repromotion_worker(struct work_struct *work);
 static void bg_qlc_rebalance_worker(struct work_struct *work);
+static void bg_repromotion_delayed_worker(struct work_struct *work);
+static void bg_qlc_rebalance_delayed_worker(struct work_struct *work);
 /* [LATENCY v1] 见 conv_ftl.h slc_maint_work 字段说明 */
 static void bg_slc_maint_worker(struct work_struct *work);
+static void bg_slc_maint_delayed_worker(struct work_struct *work);
 enum slc_pressure_level {
 	SLC_LEVEL_IDLE_ONLY = 0,   /* SLC free > 10%: 不在 host 写路径做维护 */
 	SLC_LEVEL_BG       = 1,    /* 5%-10%: enqueue 小预算, 不阻塞 host */
@@ -963,8 +974,11 @@ enum slc_pressure_level {
 static enum slc_pressure_level slc_pressure_level(struct conv_ftl *conv_ftl,
 						  const struct line_pool_stats *slc_st);
 static void slc_maint_kick(struct conv_ftl *conv_ftl);
+static bool latency3_read_priority_read_window_active(struct conv_ftl *conv_ftl);
 static bool latency3_read_priority_should_yield(struct conv_ftl *conv_ftl);
 static void latency3_read_priority_note_yield(struct conv_ftl *conv_ftl);
+static void latency3_repromotion_delayed_requeue(struct conv_ftl *conv_ftl);
+static void latency3_qlc_rebalance_delayed_requeue(struct conv_ftl *conv_ftl);
 
 /* latency3 keeps latency1's global worker and cold-page migration core, but
  * adds a foreground-read priority gate to all background workers. */
@@ -1819,14 +1833,14 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 	guard_disabled = slc_stats.free <= conv_ftl->slc_gc_free_thres_high;
 
 	if (conv_ftl->slc_migration_no_progress_active) {
-		if (guard_disabled ||
-		    conv_ftl->slc_migration_no_progress_epoch != heat_epoch ||
-		    conv_ftl->slc_migration_no_progress_victim_q != victim_q ||
-		    conv_ftl->slc_migration_no_progress_cold_thresh_x10 != cold_thresh_x10) {
+		if (conv_ftl->slc_migration_no_progress_victim_q != victim_q ||
+		    conv_ftl->slc_migration_no_progress_scan_visits >=
+			    SLC_MIGRATION_NO_PROGRESS_COOLDOWN_CALLS) {
 			conv_ftl->slc_migration_no_progress_active = false;
 			conv_ftl->slc_migration_no_progress_scan_visits = 0;
 			conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
 		} else {
+			conv_ftl->slc_migration_no_progress_scan_visits++;
 			cooldown_blocked = true;
 		}
 	}
@@ -1851,18 +1865,17 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 			conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
 		} else if (stats.scanned_sbs) {
 			if (conv_ftl->slc_migration_no_progress_scan_visits == 0 ||
-			    conv_ftl->slc_migration_no_progress_epoch != heat_epoch ||
-			    conv_ftl->slc_migration_no_progress_victim_q != victim_q ||
-			    conv_ftl->slc_migration_no_progress_cold_thresh_x10 != cold_thresh_x10) {
+			    conv_ftl->slc_migration_no_progress_victim_q != victim_q) {
 				conv_ftl->slc_migration_no_progress_epoch = heat_epoch;
 				conv_ftl->slc_migration_no_progress_victim_q = victim_q;
 				conv_ftl->slc_migration_no_progress_cold_thresh_x10 = cold_thresh_x10;
 				conv_ftl->slc_migration_no_progress_scan_visits = 0;
 			}
 			conv_ftl->slc_migration_no_progress_scan_visits += stats.scanned_sbs;
-			if (!guard_disabled &&
-			    conv_ftl->slc_migration_no_progress_scan_visits >= total_sbs)
+			if (conv_ftl->slc_migration_no_progress_scan_visits >= total_sbs) {
 				conv_ftl->slc_migration_no_progress_active = true;
+				conv_ftl->slc_migration_no_progress_scan_visits = 0;
+			}
 		}
 	}
 
@@ -2733,10 +2746,14 @@ static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
 	atomic64_set(&conv_ftl->test_phase_recent_guard_forced, 0);
 	atomic64_set(&conv_ftl->test_phase_last_read_ktime_ns, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_yields, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_delayed_requeues, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_forced_progress_runs, 0);
 	atomic_set(&conv_ftl->test_phase_active_reads, 0);
 	atomic_set(&conv_ftl->test_phase_active_overwrites, 0);
 	atomic_set(&conv_ftl->test_phase_active_bg_ops, 0);
 	atomic_set(&conv_ftl->latency3_bg_read_priority_gate, 0);
+	atomic_set(&conv_ftl->latency3_read_priority_yield_streak, 0);
+	atomic_set(&conv_ftl->latency3_read_priority_force_active, 0);
 	conv_ftl->test_phase_host_writes_start = conv_ftl->total_host_writes;
 	conv_ftl->test_phase_slc_sb_migration_pages_start =
 		conv_ftl->slc_sb_migration_pages;
@@ -2849,14 +2866,12 @@ static void test_phase_note_bg_end(struct conv_ftl *conv_ftl, bool tracked)
 	atomic_dec_if_positive(&conv_ftl->test_phase_active_bg_ops);
 }
 
-static bool latency3_read_priority_should_yield(struct conv_ftl *conv_ftl)
+static bool latency3_read_priority_read_window_active(struct conv_ftl *conv_ftl)
 {
 	uint64_t last_read_ns;
 	uint64_t now_ns;
 
 	if (!test_phase_enabled(conv_ftl))
-		return false;
-	if (atomic_read(&conv_ftl->latency3_bg_read_priority_gate) <= 0)
 		return false;
 	if (atomic_read(&conv_ftl->test_phase_active_reads) > 0)
 		return true;
@@ -2869,12 +2884,31 @@ static bool latency3_read_priority_should_yield(struct conv_ftl *conv_ftl)
 	       now_ns - last_read_ns < NVMEV_LATENCY3_READ_QUIET_NS;
 }
 
+static bool latency3_read_priority_should_yield(struct conv_ftl *conv_ftl)
+{
+	if (!test_phase_enabled(conv_ftl))
+		return false;
+	if (atomic_read(&conv_ftl->latency3_read_priority_force_active) > 0)
+		return false;
+	if (atomic_read(&conv_ftl->latency3_bg_read_priority_gate) <= 0)
+		return false;
+
+	return latency3_read_priority_read_window_active(conv_ftl);
+}
+
 static void latency3_read_priority_note_yield(struct conv_ftl *conv_ftl)
 {
 	if (conv_ftl) {
 		atomic64_inc(&conv_ftl->test_phase_read_priority_yields);
+		atomic_inc(&conv_ftl->latency3_read_priority_yield_streak);
 		conv_ftl->slc_sb_fold_yield_read_prio++;
 	}
+}
+
+static void latency3_read_priority_note_progress(struct conv_ftl *conv_ftl)
+{
+	if (conv_ftl)
+		atomic_set(&conv_ftl->latency3_read_priority_yield_streak, 0);
 }
 
 static void test_phase_note_host_read_nand(struct conv_ftl *stats_ftl, bool from_slc)
@@ -3064,6 +3098,10 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   atomic64_read(&conv_ftl->test_phase_read_bg_conflicts));
 	seq_printf(m, "read_priority_yields %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_priority_yields));
+	seq_printf(m, "read_priority_delayed_requeues %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_delayed_requeues));
+	seq_printf(m, "read_priority_forced_progress_runs %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_forced_progress_runs));
 	seq_printf(m, "read_overwrite_conflicts %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_overwrite_conflicts));
 	seq_printf(m, "read_die_conflicts %lld\n",
@@ -5150,11 +5188,21 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 						     WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
 	INIT_WORK(&conv_ftl->repromotion_work, bg_repromotion_worker);
 	INIT_WORK(&conv_ftl->qlc_rebalance_work, bg_qlc_rebalance_worker);
+	INIT_DELAYED_WORK(&conv_ftl->latency3_repromotion_delayed_work,
+			  bg_repromotion_delayed_worker);
+	INIT_DELAYED_WORK(&conv_ftl->latency3_qlc_rebalance_delayed_work,
+			  bg_qlc_rebalance_delayed_worker);
 	/* [LATENCY v1] 注册 SLC 维护 worker, 用于异步消化 migrate/GC 任务,
 	 * 避免 conv_write() 在 BG/URGENT 压力档同步阻塞。 */
 	INIT_WORK(&conv_ftl->slc_maint_work, bg_slc_maint_worker);
+	INIT_DELAYED_WORK(&conv_ftl->latency3_slc_maint_delayed_work,
+			  bg_slc_maint_delayed_worker);
 	conv_ftl->slc_maint_runs = 0;
 	conv_ftl->slc_maint_pages = 0;
+	atomic64_set(&conv_ftl->test_phase_read_priority_delayed_requeues, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_forced_progress_runs, 0);
+	atomic_set(&conv_ftl->latency3_read_priority_yield_streak, 0);
+	atomic_set(&conv_ftl->latency3_read_priority_force_active, 0);
 	atomic64_set(&conv_ftl->total_host_reads, 0);
 	spin_lock_init(&conv_ftl->repromote_queue_lock);
 	conv_ftl->repromote_head = 0;
@@ -5251,7 +5299,10 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 	if (conv_ftl->bg_migration_wq) {
 		/* [LATENCY v1] flush_workqueue 已经覆盖 slc_maint_work, 但保险起见
 		 * 在 destroy 前显式 cancel_work_sync, 防止 worker 还在跑就释放 ftl。 */
+		cancel_delayed_work_sync(&conv_ftl->latency3_repromotion_delayed_work);
+		cancel_delayed_work_sync(&conv_ftl->latency3_qlc_rebalance_delayed_work);
 		cancel_work_sync(&conv_ftl->slc_maint_work);
+		cancel_delayed_work_sync(&conv_ftl->latency3_slc_maint_delayed_work);
 		flush_workqueue(conv_ftl->bg_migration_wq);
 		destroy_workqueue(conv_ftl->bg_migration_wq);
 		conv_ftl->bg_migration_wq = NULL;
@@ -6203,6 +6254,7 @@ static bool select_sb_victim_slc_locked(struct conv_ftl *conv_ftl,
 					struct sb_gc_victim *out, bool force)
 {
 	uint32_t line_cnt, i;
+	uint32_t min_invalid;
 	struct baseline_sb_summary best;
 	bool have_best = false;
 
@@ -6212,6 +6264,7 @@ static bool select_sb_victim_slc_locked(struct conv_ftl *conv_ftl,
 	line_cnt = conv_ftl->slc_blks_per_pl;
 	if (!line_cnt)
 		return false;
+	min_invalid = max_t(uint32_t, 1, slc_pages_per_superblock(conv_ftl) / 8);
 
 	memset(&best, 0, sizeof(best));
 	for (i = 0; i < line_cnt; i++) {
@@ -6231,7 +6284,9 @@ static bool select_sb_victim_slc_locked(struct conv_ftl *conv_ftl,
 			conv_ftl->slc_sb_migration_victim_stale++;
 			continue;
 		}
-		if (!force && cand.total_ipc == 0)
+		if (cand.total_ipc == 0)
+			continue;
+		if (!force && cand.total_ipc < min_invalid)
 			continue;
 
 		if (slc_gc_sb_better(&cand, have_best ? &best : NULL, have_best)) {
@@ -6486,7 +6541,8 @@ static bool maintain_slc_one_step(struct conv_ftl *conv_ftl, int32_t target_die,
 	    (slc_stats.free < conv_ftl->slc_high_watermark ||
 	     conv_ftl->slc_sb_migrated_victim_count >= slc_migrated_victim_cap(conv_ftl)) &&
 	    slc_has_any_victim(conv_ftl)) {
-		if (do_gc_superblock_slc(conv_ftl, false) == 0)
+		if (do_gc_superblock_slc(conv_ftl,
+					slc_stats.free <= conv_ftl->slc_gc_free_thres_high) == 0)
 			progressed = true;
 		collect_slc_stats(conv_ftl, &slc_stats);
 		if (slc_stats.free >= conv_ftl->slc_high_watermark &&
@@ -6815,13 +6871,14 @@ static void forground_gc(struct conv_ftl *conv_ftl, enum foreground_gc_mode mode
 
 	fgc_calls++;
 
-	/* Soft GC 只挑便宜 victim；Hard GC 才允许强制推进。 */
+	/* Foreground pressure GC consumes queued SLC victims; the 1/8 invalid
+	 * gate only applies to non-forced, roomy background GC. */
 	if ((force && should_gc_slc_hard(conv_ftl)) ||
 	    (!force && should_gc_slc_soft(conv_ftl))) {
 		slc_victim_ready = slc_has_any_victim(conv_ftl);
 		if (slc_victim_ready) {
 			fgc_triggered++;
-			do_gc(conv_ftl, force, 1);
+			do_gc(conv_ftl, true, 1);
 			return;
 		}
 	}
@@ -8644,6 +8701,7 @@ static void bg_repromotion_worker(struct work_struct *work)
 	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
 	if (latency3_read_priority_should_yield(conv_ftl)) {
 		latency3_read_priority_note_yield(conv_ftl);
+		latency3_repromotion_delayed_requeue(conv_ftl);
 		atomic_dec_if_positive(&conv_ftl->latency3_bg_read_priority_gate);
 		return;
 	}
@@ -8696,6 +8754,7 @@ static void bg_repromotion_worker(struct work_struct *work)
 
 			if (latency3_read_priority_should_yield(conv_ftl)) {
 				latency3_read_priority_note_yield(conv_ftl);
+				latency3_repromotion_delayed_requeue(conv_ftl);
 				goto repromote_out;
 			}
 			if (consumed[idx])
@@ -8729,6 +8788,7 @@ static void bg_qlc_rebalance_worker(struct work_struct *work)
 	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
 	if (latency3_read_priority_should_yield(conv_ftl)) {
 		latency3_read_priority_note_yield(conv_ftl);
+		latency3_qlc_rebalance_delayed_requeue(conv_ftl);
 		atomic_dec_if_positive(&conv_ftl->latency3_bg_read_priority_gate);
 		return;
 	}
@@ -8737,6 +8797,24 @@ static void bg_qlc_rebalance_worker(struct work_struct *work)
 #else
 	(void)work;
 #endif
+}
+
+static void bg_repromotion_delayed_worker(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct conv_ftl *conv_ftl =
+		container_of(dwork, struct conv_ftl, latency3_repromotion_delayed_work);
+
+	bg_repromotion_worker(&conv_ftl->repromotion_work);
+}
+
+static void bg_qlc_rebalance_delayed_worker(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct conv_ftl *conv_ftl =
+		container_of(dwork, struct conv_ftl, latency3_qlc_rebalance_delayed_work);
+
+	bg_qlc_rebalance_worker(&conv_ftl->qlc_rebalance_work);
 }
 
 /* ============================================================================
@@ -8771,13 +8849,77 @@ static enum slc_pressure_level slc_pressure_level(struct conv_ftl *conv_ftl,
 	return SLC_LEVEL_IDLE_ONLY;
 }
 
+static unsigned long latency3_requeue_delay_jiffies(void)
+{
+	unsigned long delay = usecs_to_jiffies(NVMEV_LATENCY3_REQUEUE_DELAY_US);
+
+	return delay ? delay : 1;
+}
+
+static bool latency3_queue_read_priority_delayed_work(struct conv_ftl *conv_ftl,
+						      struct delayed_work *dwork)
+{
+	if (!conv_ftl || !conv_ftl->bg_migration_wq || !dwork)
+		return false;
+	if (!test_phase_enabled(conv_ftl))
+		return false;
+	return queue_delayed_work(conv_ftl->bg_migration_wq, dwork,
+				  latency3_requeue_delay_jiffies());
+}
+
+static void latency3_slc_maint_delayed_requeue(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+	if (latency3_queue_read_priority_delayed_work(
+		    conv_ftl, &conv_ftl->latency3_slc_maint_delayed_work))
+		atomic64_inc(&conv_ftl->test_phase_read_priority_delayed_requeues);
+}
+
+static void latency3_repromotion_delayed_requeue(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+	if (latency3_queue_read_priority_delayed_work(
+		    conv_ftl, &conv_ftl->latency3_repromotion_delayed_work))
+		atomic64_inc(&conv_ftl->test_phase_read_priority_delayed_requeues);
+}
+
+static void latency3_qlc_rebalance_delayed_requeue(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+	if (latency3_queue_read_priority_delayed_work(
+		    conv_ftl, &conv_ftl->latency3_qlc_rebalance_delayed_work))
+		atomic64_inc(&conv_ftl->test_phase_read_priority_delayed_requeues);
+}
+
+static bool latency3_read_priority_should_force_progress(struct conv_ftl *conv_ftl,
+							 enum slc_pressure_level level)
+{
+	if (!conv_ftl || !test_phase_enabled(conv_ftl))
+		return false;
+	if (level < SLC_LEVEL_URGENT)
+		return false;
+	if (atomic_read(&conv_ftl->latency3_read_priority_yield_streak) <
+	    NVMEV_LATENCY3_FORCE_AFTER_YIELDS)
+		return false;
+
+	atomic64_inc(&conv_ftl->test_phase_read_priority_forced_progress_runs);
+	atomic_set(&conv_ftl->latency3_read_priority_yield_streak, 0);
+	return true;
+}
+
 static void slc_maint_kick(struct conv_ftl *conv_ftl)
 {
 	if (!conv_ftl || !conv_ftl->bg_migration_wq)
 		return;
 	if (!test_phase_enabled(conv_ftl))
 		return;
-	queue_work(conv_ftl->bg_migration_wq, &conv_ftl->slc_maint_work);
+	if (latency3_read_priority_read_window_active(conv_ftl))
+		latency3_slc_maint_delayed_requeue(conv_ftl);
+	else
+		queue_work(conv_ftl->bg_migration_wq, &conv_ftl->slc_maint_work);
 }
 
 /* worker 端: 按当前压力档决定预算, 跑一轮 SB-level migration + 必要时一次 GC。
@@ -8791,28 +8933,38 @@ static void slc_maint_kick(struct conv_ftl *conv_ftl)
  *     正在写的 die;
  *   - GC 只在 migrated_victim 队列非空时跑, 不重复扫盘。
  */
-static void bg_slc_maint_worker(struct work_struct *work)
+static void latency3_bg_slc_maint_run(struct conv_ftl *conv_ftl)
 {
-	struct conv_ftl *conv_ftl = container_of(work, struct conv_ftl, slc_maint_work);
 	struct line_pool_stats slc_st;
 	enum slc_pressure_level level;
 	uint32_t budget = 0;
 	uint32_t moved;
+	bool force_progress;
 
 	if (!conv_ftl || !conv_ftl->ssd)
 		return;
 	if (!test_phase_enabled(conv_ftl))
 		return;
-	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
-	if (latency3_read_priority_should_yield(conv_ftl)) {
-		latency3_read_priority_note_yield(conv_ftl);
-		atomic_dec_if_positive(&conv_ftl->latency3_bg_read_priority_gate);
-		return;
-	}
 
 	collect_slc_stats(conv_ftl, &slc_st);
 	level = slc_pressure_level(conv_ftl, &slc_st);
+	if (level < SLC_LEVEL_BG) {
+		latency3_read_priority_note_progress(conv_ftl);
+		return;
+	}
+	force_progress = latency3_read_priority_should_force_progress(conv_ftl, level);
+
+	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
+	if (!force_progress && latency3_read_priority_should_yield(conv_ftl)) {
+		latency3_read_priority_note_yield(conv_ftl);
+		latency3_slc_maint_delayed_requeue(conv_ftl);
+		atomic_dec_if_positive(&conv_ftl->latency3_bg_read_priority_gate);
+		return;
+	}
+	if (force_progress)
+		atomic_inc(&conv_ftl->latency3_read_priority_force_active);
 	conv_ftl->slc_maint_runs++;
+	latency3_read_priority_note_progress(conv_ftl);
 
 	switch (level) {
 	case SLC_LEVEL_IDLE_ONLY:
@@ -8840,17 +8992,40 @@ static void bg_slc_maint_worker(struct work_struct *work)
 	/* 如果 migrated_victim 队列非空, 顺手做一次 SLC GC: 这是异步路径上的 GC,
 	 * 不影响 host I/O 的 nsecs_target。 */
 	if (conv_ftl->slc_sb_migrated_victim_count) {
-		(void)do_gc_superblock_slc(conv_ftl, false);
+		(void)do_gc_superblock_slc(conv_ftl, level >= SLC_LEVEL_URGENT);
 	}
+	if (force_progress)
+		atomic_dec_if_positive(&conv_ftl->latency3_read_priority_force_active);
 
 	/* 若仍处于 BG/URGENT 档, 让自己再跑一次, 直到 IDLE_ONLY 才退出。 */
 	collect_slc_stats(conv_ftl, &slc_st);
 	level = slc_pressure_level(conv_ftl, &slc_st);
 	if (level >= SLC_LEVEL_BG && conv_ftl->bg_migration_wq &&
 	    test_phase_enabled(conv_ftl)) {
-		queue_work(conv_ftl->bg_migration_wq, &conv_ftl->slc_maint_work);
+		if (latency3_read_priority_should_yield(conv_ftl)) {
+			latency3_read_priority_note_yield(conv_ftl);
+			latency3_slc_maint_delayed_requeue(conv_ftl);
+		} else {
+			queue_work(conv_ftl->bg_migration_wq, &conv_ftl->slc_maint_work);
+		}
 	}
 	atomic_dec_if_positive(&conv_ftl->latency3_bg_read_priority_gate);
+}
+
+static void bg_slc_maint_worker(struct work_struct *work)
+{
+	struct conv_ftl *conv_ftl = container_of(work, struct conv_ftl, slc_maint_work);
+
+	latency3_bg_slc_maint_run(conv_ftl);
+}
+
+static void bg_slc_maint_delayed_worker(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct conv_ftl *conv_ftl =
+		container_of(dwork, struct conv_ftl, latency3_slc_maint_delayed_work);
+
+	latency3_bg_slc_maint_run(conv_ftl);
 }
 
 static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
