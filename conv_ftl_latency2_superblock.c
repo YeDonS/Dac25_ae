@@ -947,6 +947,7 @@ static bool baseline_seal_max_fill_active_sb_locked(struct conv_ftl *conv_ftl,
 						    uint32_t *blk_out,
 						    uint32_t *fill_out);
 static uint32_t baseline_active_valid_pages(struct conv_ftl *conv_ftl);
+static void slc_sb_fold_reset_locked(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
 static void qlc_maybe_rebalance_internal(struct conv_ftl *conv_ftl);
@@ -1382,6 +1383,16 @@ static void slc_note_active_seal_result(struct conv_ftl *conv_ftl,
 	if (!migrated &&
 	    conv_ftl->slc_sb_migrated_victim_count == before_victim_q)
 		conv_ftl->active_seal_no_migrate++;
+}
+
+static void slc_sb_fold_reset_locked(struct conv_ftl *conv_ftl, uint32_t blk_id)
+{
+	if (!conv_ftl || blk_id >= conv_ftl->slc_blks_per_pl)
+		return;
+	if (conv_ftl->slc_sb_fold_state)
+		conv_ftl->slc_sb_fold_state[blk_id] = NVMEV_SLC_FOLD_IDLE;
+	if (conv_ftl->slc_sb_fold_next_idx)
+		conv_ftl->slc_sb_fold_next_idx[blk_id] = 0;
 }
 
 static bool slc_sb_try_begin_migration(struct conv_ftl *conv_ftl, uint32_t blk_id)
