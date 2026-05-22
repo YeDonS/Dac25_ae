@@ -947,6 +947,7 @@ static bool baseline_seal_max_fill_active_sb_locked(struct conv_ftl *conv_ftl,
 						    uint32_t *blk_out,
 						    uint32_t *fill_out);
 static uint32_t baseline_active_valid_pages(struct conv_ftl *conv_ftl);
+static bool baseline_has_writable_slc_capacity_locked(struct conv_ftl *conv_ftl);
 static void slc_sb_fold_reset_locked(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
@@ -2002,7 +2003,7 @@ static inline bool should_gc_slc_hard(struct conv_ftl *conv_ftl)
 {
 	struct line_pool_stats slc_stats;
 	collect_slc_stats(conv_ftl, &slc_stats);
-	return slc_stats.free < conv_ftl->slc_gc_free_thres_low;
+	return slc_stats.free <= conv_ftl->slc_gc_free_thres_low;
 }
 
 static inline bool should_gc_qlc_high(struct conv_ftl *conv_ftl)
@@ -6473,11 +6474,15 @@ static bool maintain_slc_free_to_target(struct conv_ftl *conv_ftl, int32_t targe
 			uint32_t before_victim_q;
 			uint32_t sealed_blk, sealed_fill;
 			bool sealed_this_step = false;
+			bool has_writable_capacity;
 
 			conv_ftl->hard_no_victim_count++;
 			before_victim_q = conv_ftl->slc_sb_migrated_victim_count;
 			spin_lock(&conv_ftl->slc_lock);
-			if (baseline_seal_max_fill_active_sb_locked(conv_ftl,
+			has_writable_capacity =
+				baseline_has_writable_slc_capacity_locked(conv_ftl);
+			if (!has_writable_capacity &&
+			    baseline_seal_max_fill_active_sb_locked(conv_ftl,
 								    &sealed_blk,
 								    &sealed_fill)) {
 				conv_ftl->slc_migration_no_progress_active = false;
@@ -6552,10 +6557,14 @@ static bool maintain_slc_one_step(struct conv_ftl *conv_ftl, int32_t target_die,
 		if (!sealed_active && slc_stats.free <= conv_ftl->slc_gc_free_thres_low &&
 		    !slc_has_any_victim(conv_ftl)) {
 			uint32_t sealed_blk, sealed_fill;
+			bool has_writable_capacity;
 
 			conv_ftl->hard_no_victim_count++;
 			spin_lock(&conv_ftl->slc_lock);
-			if (baseline_seal_max_fill_active_sb_locked(conv_ftl,
+			has_writable_capacity =
+				baseline_has_writable_slc_capacity_locked(conv_ftl);
+			if (!has_writable_capacity &&
+			    baseline_seal_max_fill_active_sb_locked(conv_ftl,
 								    &sealed_blk,
 								    &sealed_fill)) {
 				conv_ftl->slc_migration_no_progress_active = false;
@@ -7152,6 +7161,78 @@ static uint32_t baseline_slot_fill_pages_locked(struct conv_ftl *conv_ftl,
 			fill += wp->pg;
 	}
 	return fill;
+}
+
+static bool baseline_has_openable_free_sb_locked(struct conv_ftl *conv_ftl)
+{
+	struct line_mgmt *lm0;
+	struct line *line0;
+	uint32_t die_count;
+	uint32_t die;
+
+	if (!conv_ftl || !conv_ftl->baseline_active_sb_blk ||
+	    conv_ftl->active_sb_count >= NVMEV_SUPERBLOCK_ACTIVE_LIMIT)
+		return false;
+
+	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	lm0 = get_slc_die_lm(conv_ftl, 0);
+	if (!lm0)
+		return false;
+
+	list_for_each_entry(line0, &lm0->free_line_list, entry) {
+		uint32_t blk = line0->id;
+		bool all_free = true;
+
+		if (conv_ftl->is_slc_block && !conv_ftl->is_slc_block[blk])
+			continue;
+
+		for (die = 1; die < die_count && all_free; die++) {
+			struct line_mgmt *lm = get_slc_die_lm(conv_ftl, die);
+			struct line *l;
+			bool found = false;
+
+			if (!lm) {
+				all_free = false;
+				break;
+			}
+			list_for_each_entry(l, &lm->free_line_list, entry) {
+				if (l->id == blk) {
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				all_free = false;
+		}
+
+		if (all_free)
+			return true;
+	}
+
+	return false;
+}
+
+static bool baseline_has_writable_slc_capacity_locked(struct conv_ftl *conv_ftl)
+{
+	uint32_t die_count;
+	uint32_t slot;
+	uint32_t die;
+
+	if (!conv_ftl || !conv_ftl->baseline_active_sb_blk)
+		return false;
+
+	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
+	for (slot = 0; slot < NVMEV_SUPERBLOCK_ACTIVE_LIMIT; slot++) {
+		if (!baseline_slot_is_active_locked(conv_ftl, slot))
+			continue;
+		for (die = 0; die < die_count; die++) {
+			if (baseline_wp_has_space(conv_ftl,
+						  baseline_active_wp(conv_ftl, slot, die)))
+				return true;
+		}
+	}
+
+	return baseline_has_openable_free_sb_locked(conv_ftl);
 }
 
 static uint32_t baseline_active_valid_pages(struct conv_ftl *conv_ftl)
