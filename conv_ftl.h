@@ -458,6 +458,10 @@ struct conv_ftl {
 	uint64_t active_sealed_for_alloc_fail;
 	uint64_t active_seal_migrated_pages;
 	uint64_t active_seal_no_migrate;
+	uint64_t victim_pq_insert_fail;
+	uint64_t victim_pq_duplicate_avoided;
+	uint64_t victim_pq_corrupt_pos;
+	uint64_t victim_pq_max_size;
 	uint64_t repromote_chain_alloc_pages;
 	uint64_t repromote_gc_pool_pages;
 	uint64_t repromote_skip_active_cap;

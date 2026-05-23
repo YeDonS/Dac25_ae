@@ -949,6 +949,7 @@ static int qlc_get_new_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zo
 			    struct ppa *ppa_out);
 static int qlc_get_new_gc_page(struct conv_ftl *conv_ftl, uint32_t die, uint32_t zone_hint,
 			       struct ppa *ppa_out);
+static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool);
 static void advance_slc_write_pointer(struct conv_ftl *conv_ftl, const struct ppa *ppa);
 static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl, uint32_t preferred_blk);
 /* 新增：GC 专用 SLC 写指针函数声明（仅在本文件使用） */
@@ -1843,6 +1844,14 @@ static bool slc_hard_make_victim(struct conv_ftl *conv_ftl,
 		return true;
 	if (slc_queue_closed_dirty_victim(conv_ftl))
 		return true;
+	{
+		struct line_pool_stats qlc_stats;
+
+		collect_qlc_stats(conv_ftl, &qlc_stats);
+		if (qlc_stats.free <= conv_ftl->qlc_gc_free_thres_high &&
+		    qlc_has_any_victim(conv_ftl))
+			(void)do_gc(conv_ftl, true, 2);
+	}
 
 	if (slc_select_emergency_fold_sb(conv_ftl, preferred_blk, &blk_id)) {
 		moved = slc_migrate_sb_pages_to_qlc(conv_ftl, blk_id, max_pages, false);
@@ -3521,6 +3530,14 @@ static int baseline_superblock_stats_show(struct seq_file *m, void *v)
 		   (unsigned long long)conv_ftl->active_sealed_for_hard);
 	seq_printf(m, "active_sealed_for_alloc_fail %llu\n",
 		   (unsigned long long)conv_ftl->active_sealed_for_alloc_fail);
+	seq_printf(m, "victim_pq_insert_fail %llu\n",
+		   (unsigned long long)conv_ftl->victim_pq_insert_fail);
+	seq_printf(m, "victim_pq_duplicate_avoided %llu\n",
+		   (unsigned long long)conv_ftl->victim_pq_duplicate_avoided);
+	seq_printf(m, "victim_pq_corrupt_pos %llu\n",
+		   (unsigned long long)conv_ftl->victim_pq_corrupt_pos);
+	seq_printf(m, "victim_pq_max_size %llu\n",
+		   (unsigned long long)conv_ftl->victim_pq_max_size);
 	seq_printf(m, "active_seal_migrated_pages %llu\n",
 		   (unsigned long long)conv_ftl->active_seal_migrated_pages);
 	seq_printf(m, "active_seal_no_migrate %llu\n",
@@ -4239,6 +4256,49 @@ static inline void victim_line_set_pos(void *a, size_t pos)
 	((struct line *)a)->pos = pos;
 }
 
+static bool victim_line_enqueue_locked(struct conv_ftl *conv_ftl,
+				       struct line_mgmt *lm,
+				       struct line *line)
+{
+	pqueue_t *q;
+	size_t pos, scan;
+	size_t qsz;
+
+	if (!conv_ftl || !lm || !line || !lm->victim_line_pq)
+		return false;
+
+	q = lm->victim_line_pq;
+	pos = line->pos;
+	if (pos) {
+		if (pos < q->size && q->d[pos] == line) {
+			pqueue_change_priority(q, line->vpc, line);
+			conv_ftl->victim_pq_duplicate_avoided++;
+			return true;
+		}
+		for (scan = 1; scan < q->size; scan++) {
+			if (q->d[scan] == line) {
+				line->pos = scan;
+				pqueue_change_priority(q, line->vpc, line);
+				conv_ftl->victim_pq_duplicate_avoided++;
+				return true;
+			}
+		}
+		conv_ftl->victim_pq_corrupt_pos++;
+		line->pos = 0;
+	}
+
+	if (pqueue_insert(q, line) != 0) {
+		conv_ftl->victim_pq_insert_fail++;
+		return false;
+	}
+
+	lm->victim_line_cnt++;
+	qsz = pqueue_size(q);
+	if (qsz > conv_ftl->victim_pq_max_size)
+		conv_ftl->victim_pq_max_size = qsz;
+	return true;
+}
+
 static inline void consume_write_credit(struct conv_ftl *conv_ftl)
 {
 	conv_ftl->wfc.write_credits--;
@@ -4533,6 +4593,10 @@ static void init_maptbl(struct conv_ftl *conv_ftl)
 	conv_ftl->active_sealed_for_alloc_fail = 0;
 	conv_ftl->active_seal_migrated_pages = 0;
 	conv_ftl->active_seal_no_migrate = 0;
+	conv_ftl->victim_pq_insert_fail = 0;
+	conv_ftl->victim_pq_duplicate_avoided = 0;
+	conv_ftl->victim_pq_corrupt_pos = 0;
+	conv_ftl->victim_pq_max_size = 0;
 	conv_ftl->repromote_chain_alloc_pages = 0;
 	conv_ftl->repromote_gc_pool_pages = 0;
 	conv_ftl->repromote_skip_active_cap = 0;
@@ -5918,22 +5982,20 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
 	        line = &lm->lines[idx];
         
-        if (line->vpc == conv_ftl->qlc_pgs_per_blk) {
+        if (line->vpc > 0 && line->pos == 0 && !list_empty(&line->entry)) {
             was_full_line = true;
         }
         line->ipc++;
 
-        if (line->pos) { // 如果在victim队列中
-            pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
-        } else {
-            if (line->vpc > 0) line->vpc--;
-        }
+        if (line->vpc > 0)
+            line->vpc--;
+        if (line->pos)
+            victim_line_enqueue_locked(conv_ftl, lm, line);
 
         if (was_full_line) {
             list_del_init(&line->entry);
             lm->full_line_cnt--;
-            pqueue_insert(lm->victim_line_pq, line);
-            lm->victim_line_cnt++;
+            victim_line_enqueue_locked(conv_ftl, lm, line);
         }
 
 		block_meta_note_invalid(conv_ftl, ppa, lpn);
@@ -6782,7 +6844,7 @@ static bool maintain_slc_one_step(struct conv_ftl *conv_ftl, int32_t target_die,
 	     conv_ftl->slc_sb_migrated_victim_count >= slc_migrated_victim_cap(conv_ftl)) &&
 	    slc_has_any_victim(conv_ftl)) {
 		if (do_gc_superblock_slc(conv_ftl,
-					slc_stats.free <= conv_ftl->slc_gc_free_thres_high) == 0)
+					slc_stats.free <= conv_ftl->slc_gc_free_thres_low) == 0)
 			progressed = true;
 		collect_slc_stats(conv_ftl, &slc_stats);
 		if (slc_stats.free >= conv_ftl->slc_high_watermark &&
@@ -6858,11 +6920,8 @@ static bool maintain_slc_one_step(struct conv_ftl *conv_ftl, int32_t target_die,
 				progressed = true;
 		}
 	}
-	if (slc_stats.free < conv_ftl->slc_gc_free_thres_low) {
+	if (slc_stats.free <= conv_ftl->slc_gc_free_thres_low) {
 		forground_gc(conv_ftl, FGC_MODE_HARD);
-		progressed = true;
-	} else if (slc_stats.free <= conv_ftl->slc_gc_free_thres_high) {
-		forground_gc(conv_ftl, FGC_MODE_SOFT);
 		progressed = true;
 	}
 
@@ -7054,8 +7113,7 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force, int target_pool)
 				struct line_mgmt *lm = get_qlc_die_lm(conv_ftl, victim.die);
 				if (lm) {
 					spin_lock(&conv_ftl->qlc_lock);
-					pqueue_insert(lm->victim_line_pq, victim.line);
-					lm->victim_line_cnt++;
+					victim_line_enqueue_locked(conv_ftl, lm, victim.line);
 					spin_unlock(&conv_ftl->qlc_lock);
 				}
 			}
@@ -7188,8 +7246,7 @@ static int do_gc_for_die(struct conv_ftl *conv_ftl, uint32_t target_die, bool is
 			if (is_slc) {
 				victim_line->pos = 0;
 			} else {
-				pqueue_insert(lm->victim_line_pq, victim_line);
-				lm->victim_line_cnt++;
+				victim_line_enqueue_locked(conv_ftl, lm, victim_line);
 			}
 			spin_unlock(lock);
 			return -1;
@@ -7228,8 +7285,7 @@ static void forground_gc(struct conv_ftl *conv_ftl, enum foreground_gc_mode mode
 
 	/* Foreground pressure GC consumes queued SLC victims; the 1/8 invalid
 	 * gate only applies to non-forced, roomy background GC. */
-	if ((force && should_gc_slc_hard(conv_ftl)) ||
-	    (!force && should_gc_slc_soft(conv_ftl))) {
+	if (force && should_gc_slc_hard(conv_ftl)) {
 		slc_victim_ready = slc_has_any_victim(conv_ftl);
 		if (slc_victim_ready) {
 			fgc_triggered++;
@@ -8620,9 +8676,12 @@ static void qlc_close_active_line(struct conv_ftl *conv_ftl, struct write_pointe
 	if (written_pages >= full_threshold && line->vpc >= full_threshold) {
 		list_add_tail(&line->entry, &lm->full_line_list);
 		lm->full_line_cnt++;
+	} else if (line->ipc > 0 ||
+		   line->vpc <= max_t(uint32_t, 1, conv_ftl->qlc_pgs_per_blk / 8)) {
+		victim_line_enqueue_locked(conv_ftl, lm, line);
 	} else {
-		pqueue_insert(lm->victim_line_pq, line);
-		lm->victim_line_cnt++;
+		list_add_tail(&line->entry, &lm->full_line_list);
+		lm->full_line_cnt++;
 	}
 	kick_repromote = qlc_sb_note_die_closed_locked(conv_ftl, wp->blk, die,
 						       written_pages || line->vpc || line->ipc);
@@ -9401,10 +9460,8 @@ static enum slc_pressure_level slc_pressure_level(struct conv_ftl *conv_ftl,
 	if (!total)
 		return SLC_LEVEL_IDLE_ONLY;
 
-	if (free_lines < conv_ftl->slc_gc_free_thres_low)
+	if (free_lines <= conv_ftl->slc_gc_free_thres_low)
 		return SLC_LEVEL_EMERGENCY;
-	if (free_lines <= conv_ftl->slc_gc_free_thres_high)
-		return SLC_LEVEL_URGENT;
 	if (free_lines < conv_ftl->slc_high_watermark ||
 	    conv_ftl->slc_sb_migrated_victim_count >= slc_migrated_victim_cap(conv_ftl))
 		return SLC_LEVEL_BG;
@@ -9563,7 +9620,7 @@ static void latency3_bg_slc_maint_run(struct conv_ftl *conv_ftl)
 	/* 如果 migrated_victim 队列非空, 顺手做一次 SLC GC: 这是异步路径上的 GC,
 	 * 不影响 host I/O 的 nsecs_target。 */
 	if (conv_ftl->slc_sb_migrated_victim_count) {
-		(void)do_gc_superblock_slc(conv_ftl, level >= SLC_LEVEL_URGENT);
+		(void)do_gc_superblock_slc(conv_ftl, level >= SLC_LEVEL_EMERGENCY);
 	}
 	if (force_progress)
 		atomic_dec_if_positive(&conv_ftl->latency3_read_priority_force_active);
