@@ -597,6 +597,7 @@ struct conv_ftl {
 	uint64_t maint_v2_tasks_yielded;
 	uint64_t maint_v2_stale_tasks;
 	uint64_t maint_v2_no_progress_runs;
+	uint32_t maint_v2_hard_skip_count;
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,

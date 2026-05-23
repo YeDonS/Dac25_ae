@@ -947,7 +947,7 @@ static bool baseline_seal_max_fill_active_sb_locked(struct conv_ftl *conv_ftl,
 						    uint32_t *blk_out,
 						    uint32_t *fill_out);
 static uint32_t baseline_active_valid_pages(struct conv_ftl *conv_ftl);
-static bool baseline_has_writable_slc_capacity_locked(struct conv_ftl *conv_ftl);
+static bool __maybe_unused baseline_has_writable_slc_capacity_locked(struct conv_ftl *conv_ftl);
 static void slc_sb_fold_reset_locked(struct conv_ftl *conv_ftl, uint32_t blk_id);
 static struct ppa get_new_gc_slc_page(struct conv_ftl *conv_ftl, uint32_t die);
 static uint64_t get_dynamic_cold_threshold(struct conv_ftl *conv_ftl);
@@ -1513,6 +1513,71 @@ static bool slc_gc_sb_better(const struct baseline_sb_summary *cand,
 	if (cand->avg_heat != best->avg_heat)
 		return cand->avg_heat < best->avg_heat;
 	return hweight16(cand->eligible_mask) > hweight16(best->eligible_mask);
+}
+
+static bool slc_dirty_closed_sb_better(const struct baseline_sb_summary *cand,
+				       const struct baseline_sb_summary *best,
+				       bool have_best)
+{
+	if (!cand)
+		return false;
+	if (!have_best || !best)
+		return true;
+	if (cand->total_ipc != best->total_ipc)
+		return cand->total_ipc > best->total_ipc;
+	if (cand->total_vpc != best->total_vpc)
+		return cand->total_vpc < best->total_vpc;
+	return cand->blk_id < best->blk_id;
+}
+
+static bool slc_queue_closed_dirty_victim(struct conv_ftl *conv_ftl)
+{
+	struct baseline_sb_summary best = { 0 };
+	bool have_best = false;
+	bool queued = false;
+	uint32_t total;
+	uint32_t i;
+
+	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->slc_sb_migrated_victim)
+		return false;
+	total = conv_ftl->slc_blks_per_pl;
+	if (!total)
+		return false;
+
+	for (i = 0; i < total; i++) {
+		struct baseline_sb_summary cand;
+
+		if (conv_ftl->slc_sb_migrated_victim[i])
+			continue;
+		if (!slc_sb_collect_summary(conv_ftl, i, &cand))
+			continue;
+		if (cand.active || cand.open_writer)
+			continue;
+		if (cand.total_ipc == 0)
+			continue;
+		if (slc_dirty_closed_sb_better(&cand, &best, have_best)) {
+			best = cand;
+			have_best = true;
+		}
+	}
+
+	if (have_best) {
+		struct baseline_sb_summary check;
+
+		spin_lock(&conv_ftl->slc_lock);
+		if (!conv_ftl->slc_sb_migrated_victim[best.blk_id] &&
+		    slc_sb_collect_summary(conv_ftl, best.blk_id, &check) &&
+		    !check.active && !check.open_writer && check.total_ipc > 0)
+			queued = slc_migrated_victim_enqueue_locked(conv_ftl, best.blk_id);
+		spin_unlock(&conv_ftl->slc_lock);
+	}
+
+	if (queued) {
+		conv_ftl->slc_migration_no_progress_active = false;
+		conv_ftl->slc_migration_no_progress_scan_visits = 0;
+		conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
+	}
+	return queued;
 }
 
 /* [SB-QUEUE GC v1] latency follows baseline page-granular demotion:
@@ -6374,30 +6439,33 @@ static bool maintain_slc_free_to_target(struct conv_ftl *conv_ftl, int32_t targe
 			progressed = true;
 		} else {
 			uint32_t migrated;
-			uint32_t before_victim_q;
-			uint32_t sealed_blk, sealed_fill;
-			bool sealed_this_step = false;
-			bool has_writable_capacity;
+				uint32_t before_victim_q;
+				uint32_t sealed_blk, sealed_fill;
+				bool sealed_this_step = false;
 
-			conv_ftl->hard_no_victim_count++;
-			before_victim_q = conv_ftl->slc_sb_migrated_victim_count;
-			spin_lock(&conv_ftl->slc_lock);
-			has_writable_capacity =
-				baseline_has_writable_slc_capacity_locked(conv_ftl);
-			if (!has_writable_capacity &&
-			    baseline_seal_max_fill_active_sb_locked(conv_ftl,
-								    &sealed_blk,
-								    &sealed_fill)) {
-				conv_ftl->slc_migration_no_progress_active = false;
-				conv_ftl->slc_migration_no_progress_scan_visits = 0;
-				conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
-				conv_ftl->active_sealed_for_hard++;
-				sealed_this_step = true;
-				progressed = true;
-				NVMEV_DEBUG("sealed active SLC SB blk=%u fill=%u while refilling SLC\n",
-					    sealed_blk, sealed_fill);
-			}
-			spin_unlock(&conv_ftl->slc_lock);
+				conv_ftl->hard_no_victim_count++;
+				before_victim_q = conv_ftl->slc_sb_migrated_victim_count;
+				if (slc_queue_closed_dirty_victim(conv_ftl)) {
+					progressed = true;
+				} else {
+					spin_lock(&conv_ftl->slc_lock);
+					if (baseline_seal_max_fill_active_sb_locked(conv_ftl,
+										    &sealed_blk,
+										    &sealed_fill)) {
+						conv_ftl->slc_migration_no_progress_active = false;
+						conv_ftl->slc_migration_no_progress_scan_visits = 0;
+						conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
+						if (conv_ftl->slc_blks_per_pl)
+							conv_ftl->slc_migration_scan_cursor =
+								sealed_blk % conv_ftl->slc_blks_per_pl;
+						conv_ftl->active_sealed_for_hard++;
+						sealed_this_step = true;
+						progressed = true;
+						NVMEV_DEBUG("sealed active SLC SB blk=%u fill=%u while refilling SLC\n",
+							    sealed_blk, sealed_fill);
+					}
+					spin_unlock(&conv_ftl->slc_lock);
+				}
 
 			migrated = migrate_some_cold_from_slc(conv_ftl, max_pages,
 							      target_die);
@@ -6457,31 +6525,34 @@ static bool maintain_slc_one_step(struct conv_ftl *conv_ftl, int32_t target_die,
 		uint32_t before_victim_q = conv_ftl->slc_sb_migrated_victim_count;
 		bool sealed_this_step = false;
 
-		if (!sealed_active && slc_stats.free <= conv_ftl->slc_gc_free_thres_low &&
-		    !slc_has_any_victim(conv_ftl)) {
-			uint32_t sealed_blk, sealed_fill;
-			bool has_writable_capacity;
+			if (!sealed_active && slc_stats.free <= conv_ftl->slc_gc_free_thres_low &&
+			    !slc_has_any_victim(conv_ftl)) {
+				uint32_t sealed_blk, sealed_fill;
 
-			conv_ftl->hard_no_victim_count++;
-			spin_lock(&conv_ftl->slc_lock);
-			has_writable_capacity =
-				baseline_has_writable_slc_capacity_locked(conv_ftl);
-			if (!has_writable_capacity &&
-			    baseline_seal_max_fill_active_sb_locked(conv_ftl,
-								    &sealed_blk,
-								    &sealed_fill)) {
-				conv_ftl->slc_migration_no_progress_active = false;
-				conv_ftl->slc_migration_no_progress_scan_visits = 0;
-				conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
-				sealed_active = true;
-				sealed_this_step = true;
-				conv_ftl->active_sealed_for_hard++;
-				progressed = true;
-				NVMEV_DEBUG("sealed active SLC SB blk=%u fill=%u under hard pressure\n",
-					    sealed_blk, sealed_fill);
+				conv_ftl->hard_no_victim_count++;
+				if (slc_queue_closed_dirty_victim(conv_ftl)) {
+					progressed = true;
+				} else {
+					spin_lock(&conv_ftl->slc_lock);
+					if (baseline_seal_max_fill_active_sb_locked(conv_ftl,
+										    &sealed_blk,
+										    &sealed_fill)) {
+						conv_ftl->slc_migration_no_progress_active = false;
+						conv_ftl->slc_migration_no_progress_scan_visits = 0;
+						conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
+						if (conv_ftl->slc_blks_per_pl)
+							conv_ftl->slc_migration_scan_cursor =
+								sealed_blk % conv_ftl->slc_blks_per_pl;
+						sealed_active = true;
+						sealed_this_step = true;
+						conv_ftl->active_sealed_for_hard++;
+						progressed = true;
+						NVMEV_DEBUG("sealed active SLC SB blk=%u fill=%u under hard pressure\n",
+							    sealed_blk, sealed_fill);
+					}
+					spin_unlock(&conv_ftl->slc_lock);
+				}
 			}
-			spin_unlock(&conv_ftl->slc_lock);
-		}
 		{
 			uint32_t migrated;
 
@@ -6533,27 +6604,34 @@ static bool maintain_slc_for_allocation_failure(struct conv_ftl *conv_ftl,
 
 	if (!sealed_active && !slc_has_any_victim(conv_ftl)) {
 		uint32_t before_victim_q = conv_ftl->slc_sb_migrated_victim_count;
-		uint32_t sealed_blk, sealed_fill;
-		bool sealed_this_step = false;
+			uint32_t sealed_blk, sealed_fill;
+			bool sealed_this_step = false;
 
-		spin_lock(&conv_ftl->slc_lock);
-		if (baseline_seal_max_fill_active_sb_locked(conv_ftl,
-							    &sealed_blk,
-							    &sealed_fill)) {
-			conv_ftl->slc_migration_no_progress_active = false;
-			conv_ftl->slc_migration_no_progress_scan_visits = 0;
-			conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
-			sealed_active = true;
-			sealed_this_step = true;
-			conv_ftl->active_sealed_for_alloc_fail++;
-			progressed = true;
-			NVMEV_DEBUG("sealed active SLC SB blk=%u fill=%u after allocation failure\n",
-				    sealed_blk, sealed_fill);
-		}
-		spin_unlock(&conv_ftl->slc_lock);
+			if (slc_queue_closed_dirty_victim(conv_ftl)) {
+				progressed = true;
+			} else {
+				spin_lock(&conv_ftl->slc_lock);
+				if (baseline_seal_max_fill_active_sb_locked(conv_ftl,
+									    &sealed_blk,
+									    &sealed_fill)) {
+					conv_ftl->slc_migration_no_progress_active = false;
+					conv_ftl->slc_migration_no_progress_scan_visits = 0;
+					conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
+					if (conv_ftl->slc_blks_per_pl)
+						conv_ftl->slc_migration_scan_cursor =
+							sealed_blk % conv_ftl->slc_blks_per_pl;
+					sealed_active = true;
+					sealed_this_step = true;
+					conv_ftl->active_sealed_for_alloc_fail++;
+					progressed = true;
+					NVMEV_DEBUG("sealed active SLC SB blk=%u fill=%u after allocation failure\n",
+						    sealed_blk, sealed_fill);
+				}
+				spin_unlock(&conv_ftl->slc_lock);
+			}
 
-		{
-			uint32_t migrated;
+			{
+				uint32_t migrated;
 
 			migrated = migrate_some_cold_from_slc(conv_ftl, max_pages, target_die);
 			if (sealed_this_step)
@@ -6894,7 +6972,7 @@ static void forground_gc(struct conv_ftl *conv_ftl, enum foreground_gc_mode mode
 			struct line_pool_stats slc_st, qlc_st;
 			collect_slc_stats(conv_ftl, &slc_st);
 			collect_qlc_stats(conv_ftl, &qlc_st);
-			NVMEV_ERROR("[FGC-MONITOR] mode=%s calls=%u triggered=%u | SLC free=%u QLC free=%u (no GC needed)\n",
+			NVMEV_ERROR("[FGC-MONITOR] mode=%s calls=%u triggered=%u | SLC free=%u QLC free=%u (no GC candidate)\n",
 				    force ? "hard" : "soft",
 				    fgc_calls, fgc_triggered, slc_st.free, qlc_st.free);
 			fgc_calls = 0;
@@ -7115,7 +7193,7 @@ static bool baseline_has_openable_free_sb_locked(struct conv_ftl *conv_ftl)
 	return false;
 }
 
-static bool baseline_has_writable_slc_capacity_locked(struct conv_ftl *conv_ftl)
+static bool __maybe_unused baseline_has_writable_slc_capacity_locked(struct conv_ftl *conv_ftl)
 {
 	uint32_t die_count;
 	uint32_t slot;
@@ -9043,6 +9121,9 @@ static void bg_slc_maint_worker(struct work_struct *work)
 		budget = slc_pages_per_superblock(conv_ftl) * 2;
 		break;
 	}
+
+	if (level >= SLC_LEVEL_EMERGENCY && !slc_has_any_victim(conv_ftl))
+		(void)slc_queue_closed_dirty_victim(conv_ftl);
 
 	moved = migrate_some_cold_from_slc(conv_ftl, budget, -1);
 	conv_ftl->slc_maint_pages += moved;
