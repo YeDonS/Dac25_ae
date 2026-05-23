@@ -9384,6 +9384,8 @@ static void bg_slc_maint_worker(struct work_struct *work)
 	collect_slc_stats(conv_ftl, &slc_st);
 	level = slc_pressure_level(conv_ftl, &slc_st);
 	conv_ftl->slc_maint_runs++;
+	if (level == SLC_LEVEL_EMERGENCY)
+		return;
 
 	switch (level) {
 	case SLC_LEVEL_IDLE_ONLY:
@@ -9423,13 +9425,7 @@ static void bg_slc_maint_worker(struct work_struct *work)
 		(void)do_gc_superblock_slc(conv_ftl, level >= SLC_LEVEL_EMERGENCY);
 	}
 
-	/* 若仍处于 BG/URGENT 档, 让自己再跑一次, 直到 IDLE_ONLY 才退出。 */
-	collect_slc_stats(conv_ftl, &slc_st);
-	level = slc_pressure_level(conv_ftl, &slc_st);
-	if (level >= SLC_LEVEL_BG && conv_ftl->bg_migration_wq &&
-	    test_phase_enabled(conv_ftl)) {
-		queue_work(conv_ftl->bg_migration_wq, &conv_ftl->slc_maint_work);
-	}
+	cond_resched();
 }
 
 static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)

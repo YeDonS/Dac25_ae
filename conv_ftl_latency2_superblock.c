@@ -10061,15 +10061,9 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 		return false;
 	total_dies = conv_ftl->die_count;
 	now = __get_ioclock(conv_ftl->ssd);
-	if (emergency) {
-		conv_ftl->maint_v2_hard_skip_count++;
-		if (conv_ftl->maint_v2_hard_skip_count < MAINT_V2_HARD_FORCE_INTERVAL)
-			force_hard_progress = false;
-		else
-			conv_ftl->maint_v2_hard_skip_count = 0;
-	} else {
-		conv_ftl->maint_v2_hard_skip_count = 0;
-	}
+	if (emergency)
+		return false;
+	conv_ftl->maint_v2_hard_skip_count = 0;
 	if (force_hard_progress) {
 		if (!slc_has_any_victim(conv_ftl)) {
 			uint32_t hard_moved = 0;
@@ -10282,19 +10276,14 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 
 	conv_ftl->maint_v2_runs++;
 
-	/* 4. 还有任务就 re-queue 自己 */
 	for (d = 0; d < total_dies; d++) {
 		if (conv_ftl->maint_die_qlen && conv_ftl->maint_die_qlen[d]) {
 			more_work = true;
 			break;
 		}
 	}
-	if (more_work && conv_ftl->bg_migration_wq && test_phase_enabled(conv_ftl)) {
-		if (force_hard_progress || executed > 0 || stale_dropped > 0)
-			queue_work(conv_ftl->bg_migration_wq, &conv_ftl->slc_maint_work);
-		else
-			conv_ftl->maint_v2_no_progress_runs++;
-	}
+	if (more_work && !executed && !stale_dropped)
+		conv_ftl->maint_v2_no_progress_runs++;
 
 	kfree(slack);
 	kfree(order);
@@ -10415,6 +10404,8 @@ static void bg_slc_maint_worker(struct work_struct *work)
 	collect_slc_stats(conv_ftl, &slc_st);
 	level = slc_pressure_level(conv_ftl, &slc_st);
 	conv_ftl->slc_maint_runs++;
+	if (level == SLC_LEVEL_EMERGENCY)
+		return;
 
 		/* [LATENCY v2] 如果 V2 数组已分配, 维护只走 idle-die dispatcher;
 		 * 否则才降级到 V1 行为。 */
@@ -10461,13 +10452,7 @@ static void bg_slc_maint_worker(struct work_struct *work)
 		(void)do_gc_superblock_slc(conv_ftl, level >= SLC_LEVEL_EMERGENCY);
 	}
 
-	/* 若仍处于 BG/URGENT 档, 让自己再跑一次, 直到 IDLE_ONLY 才退出。 */
-	collect_slc_stats(conv_ftl, &slc_st);
-	level = slc_pressure_level(conv_ftl, &slc_st);
-	if (level >= SLC_LEVEL_BG && conv_ftl->bg_migration_wq &&
-	    test_phase_enabled(conv_ftl)) {
-		queue_work(conv_ftl->bg_migration_wq, &conv_ftl->slc_maint_work);
-	}
+	cond_resched();
 }
 
 static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
