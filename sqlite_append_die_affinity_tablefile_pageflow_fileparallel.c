@@ -76,6 +76,7 @@
 #define DEFAULT_MAP_CACHE_STATS_PATH "/sys/kernel/debug/nvmev/ftl0/map_cache_stats"
 #define DEFAULT_FTL_HOST_PAGE_BYTES 4096ULL
 #define DEFAULT_TEST_PHASE_PATH "/sys/kernel/debug/nvmev/ftl0/test_phase"
+#define DEFAULT_TEST_PHASE_STATS_PATH "/sys/kernel/debug/nvmev/ftl0/test_phase_stats"
 #define DEFAULT_HEAT_EPOCH_PATH "/sys/kernel/debug/nvmev/ftl0/heat_epoch"
 #define DEFAULT_GC_NAND_TIMING_PATH "/sys/module/nvmev/parameters/gc_nand_timing"
 #define DEFAULT_BG_NAND_STATS_PATH "/sys/module/nvmev/parameters/bg_nand_stats"
@@ -134,6 +135,14 @@ struct bg_nand_stats {
 	unsigned long long read_ops;
 	unsigned long long write_ops;
 	unsigned long long erase_ops;
+	unsigned long long read_prio_bypass_ops;
+	unsigned long long read_prio_bypass_ns;
+	unsigned long long read_prio_ch_bypass_ops;
+	unsigned long long read_prio_ch_bypass_ns;
+	unsigned long long read_prio_pcie_bypass_ops;
+	unsigned long long read_prio_pcie_bypass_ns;
+	unsigned long long lp_host_write_ops;
+	unsigned long long lp_host_write_ns;
 };
 
 struct map_cache_stats {
@@ -217,6 +226,7 @@ struct workload_options {
 	unsigned long long refstyle_dummy_bytes;
 	unsigned int align_pages;
 	const char *test_phase_path;
+	const char *test_phase_stats_path;
 	const char *heat_epoch_path;
 	bool enable_gc_nand_timing;
 	const char *gc_nand_timing_path;
@@ -228,6 +238,12 @@ struct workload_options {
 	unsigned int cold_extra_sleep_us;
 	unsigned int cold_extra_read_sleep_every;
 	unsigned int cold_extra_write_sleep_every;
+};
+
+struct ftl_read_heat_stats {
+	unsigned long long global_read_sum;
+	unsigned long long global_valid_pg_cnt;
+	unsigned long long host_read_nand_ops;
 };
 
 struct refstyle_dummy_state {
@@ -360,6 +376,7 @@ static const struct option long_opts[] = {
 	{"cold-extra-sleep-us", required_argument, NULL, 1041},
 	{"cold-extra-read-sleep-every", required_argument, NULL, 1042},
 	{"cold-extra-write-sleep-every", required_argument, NULL, 1043},
+	{"test-phase-stats-path", required_argument, NULL, 1044},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -594,6 +611,57 @@ static int write_string_file(const char *path, const char *value)
 	if (fclose(fp) != 0)
 		return -errno;
 	return 0;
+}
+
+static int read_ftl_read_heat_stats(const char *path, struct ftl_read_heat_stats *stats)
+{
+	FILE *fp;
+	char line[160];
+
+	if (!path || !*path || !stats)
+		return -EINVAL;
+
+	memset(stats, 0, sizeof(*stats));
+	fp = fopen(path, "r");
+	if (!fp)
+		return -errno;
+
+	while (fgets(line, sizeof(line), fp)) {
+		char key[80];
+		unsigned long long value;
+
+		if (sscanf(line, "%79s %llu", key, &value) != 2)
+			continue;
+		if (strcmp(key, "global_read_sum") == 0)
+			stats->global_read_sum = value;
+		else if (strcmp(key, "global_valid_pg_cnt") == 0)
+			stats->global_valid_pg_cnt = value;
+		else if (strcmp(key, "host_read_nand_ops") == 0)
+			stats->host_read_nand_ops = value;
+	}
+
+	fclose(fp);
+	return 0;
+}
+
+static void print_ftl_read_event_delta(unsigned int event_id,
+				       const struct ftl_read_heat_stats *before,
+				       const struct ftl_read_heat_stats *after)
+{
+	if (!before || !after)
+		return;
+
+	printf("[sqlite_init] read_event=%u ftl_heat global_read_sum_delta=%llu "
+	       "host_read_nand_delta=%llu global_read_sum=%llu global_valid_pg_cnt=%llu "
+	       "host_read_nand_ops=%llu\n",
+	       event_id,
+	       after->global_read_sum >= before->global_read_sum ?
+		       after->global_read_sum - before->global_read_sum : 0ULL,
+	       after->host_read_nand_ops >= before->host_read_nand_ops ?
+		       after->host_read_nand_ops - before->host_read_nand_ops : 0ULL,
+	       after->global_read_sum,
+	       after->global_valid_pg_cnt,
+	       after->host_read_nand_ops);
 }
 
 static void set_gc_nand_timing_state(const struct workload_options *opts,
@@ -1056,7 +1124,7 @@ static int load_map_cache_stats(const char *path, struct map_cache_stats *stats)
 static int load_bg_nand_stats(const char *path, struct bg_nand_stats *stats)
 {
 	FILE *fp;
-	char line[256];
+	char line[1024];
 	struct bg_nand_stats tmp = {};
 
 	if (!stats)
@@ -1075,9 +1143,18 @@ static int load_bg_nand_stats(const char *path, struct bg_nand_stats *stats)
 	fclose(fp);
 
 	if (sscanf(line,
-		   "busy_ns=%llu read_ns=%llu write_ns=%llu erase_ns=%llu read_ops=%llu write_ops=%llu erase_ops=%llu",
+		   "busy_ns=%llu read_ns=%llu write_ns=%llu erase_ns=%llu "
+		   "read_ops=%llu write_ops=%llu erase_ops=%llu "
+		   "read_prio_bypass_ops=%llu read_prio_bypass_ns=%llu "
+		   "read_prio_ch_bypass_ops=%llu read_prio_ch_bypass_ns=%llu "
+		   "read_prio_pcie_bypass_ops=%llu read_prio_pcie_bypass_ns=%llu "
+		   "lp_host_write_ops=%llu lp_host_write_ns=%llu",
 		   &tmp.busy_ns, &tmp.read_ns, &tmp.write_ns, &tmp.erase_ns,
-		   &tmp.read_ops, &tmp.write_ops, &tmp.erase_ops) != 7)
+		   &tmp.read_ops, &tmp.write_ops, &tmp.erase_ops,
+		   &tmp.read_prio_bypass_ops, &tmp.read_prio_bypass_ns,
+		   &tmp.read_prio_ch_bypass_ops, &tmp.read_prio_ch_bypass_ns,
+		   &tmp.read_prio_pcie_bypass_ops, &tmp.read_prio_pcie_bypass_ns,
+		   &tmp.lp_host_write_ops, &tmp.lp_host_write_ns) < 7)
 		return -EINVAL;
 
 	*stats = tmp;
@@ -1193,6 +1270,22 @@ static void bg_nand_stats_delta(struct bg_nand_stats *dst,
 	dst->read_ops = diff_u64(after->read_ops, before->read_ops);
 	dst->write_ops = diff_u64(after->write_ops, before->write_ops);
 	dst->erase_ops = diff_u64(after->erase_ops, before->erase_ops);
+	dst->read_prio_bypass_ops = diff_u64(after->read_prio_bypass_ops,
+					     before->read_prio_bypass_ops);
+	dst->read_prio_bypass_ns = diff_u64(after->read_prio_bypass_ns,
+					    before->read_prio_bypass_ns);
+	dst->read_prio_ch_bypass_ops = diff_u64(after->read_prio_ch_bypass_ops,
+						before->read_prio_ch_bypass_ops);
+	dst->read_prio_ch_bypass_ns = diff_u64(after->read_prio_ch_bypass_ns,
+					       before->read_prio_ch_bypass_ns);
+	dst->read_prio_pcie_bypass_ops = diff_u64(after->read_prio_pcie_bypass_ops,
+						  before->read_prio_pcie_bypass_ops);
+	dst->read_prio_pcie_bypass_ns = diff_u64(after->read_prio_pcie_bypass_ns,
+						 before->read_prio_pcie_bypass_ns);
+	dst->lp_host_write_ops = diff_u64(after->lp_host_write_ops,
+					  before->lp_host_write_ops);
+	dst->lp_host_write_ns = diff_u64(after->lp_host_write_ns,
+					 before->lp_host_write_ns);
 }
 
 static void bg_nand_stats_sum(struct bg_nand_stats *dst,
@@ -1209,6 +1302,22 @@ static void bg_nand_stats_sum(struct bg_nand_stats *dst,
 	dst->read_ops = a->read_ops + b->read_ops;
 	dst->write_ops = a->write_ops + b->write_ops;
 	dst->erase_ops = a->erase_ops + b->erase_ops;
+	dst->read_prio_bypass_ops =
+		a->read_prio_bypass_ops + b->read_prio_bypass_ops;
+	dst->read_prio_bypass_ns =
+		a->read_prio_bypass_ns + b->read_prio_bypass_ns;
+	dst->read_prio_ch_bypass_ops =
+		a->read_prio_ch_bypass_ops + b->read_prio_ch_bypass_ops;
+	dst->read_prio_ch_bypass_ns =
+		a->read_prio_ch_bypass_ns + b->read_prio_ch_bypass_ns;
+	dst->read_prio_pcie_bypass_ops =
+		a->read_prio_pcie_bypass_ops + b->read_prio_pcie_bypass_ops;
+	dst->read_prio_pcie_bypass_ns =
+		a->read_prio_pcie_bypass_ns + b->read_prio_pcie_bypass_ns;
+	dst->lp_host_write_ops =
+		a->lp_host_write_ops + b->lp_host_write_ops;
+	dst->lp_host_write_ns =
+		a->lp_host_write_ns + b->lp_host_write_ns;
 }
 
 static void print_bg_nand_stats_line(const char *phase,
@@ -1218,10 +1327,18 @@ static void print_bg_nand_stats_line(const char *phase,
 		return;
 
 	printf("[sqlite_init] bg_nand phase=%s busy_ns=%llu read_ns=%llu write_ns=%llu "
-	       "erase_ns=%llu read_ops=%llu write_ops=%llu erase_ops=%llu\n",
+	       "erase_ns=%llu read_ops=%llu write_ops=%llu erase_ops=%llu "
+	       "read_prio_bypass_ops=%llu read_prio_bypass_ns=%llu "
+	       "read_prio_ch_bypass_ops=%llu read_prio_ch_bypass_ns=%llu "
+	       "read_prio_pcie_bypass_ops=%llu read_prio_pcie_bypass_ns=%llu "
+	       "lp_host_write_ops=%llu lp_host_write_ns=%llu\n",
 	       phase ? phase : "unknown",
 	       stats->busy_ns, stats->read_ns, stats->write_ns, stats->erase_ns,
-	       stats->read_ops, stats->write_ops, stats->erase_ops);
+	       stats->read_ops, stats->write_ops, stats->erase_ops,
+	       stats->read_prio_bypass_ops, stats->read_prio_bypass_ns,
+	       stats->read_prio_ch_bypass_ops, stats->read_prio_ch_bypass_ns,
+	       stats->read_prio_pcie_bypass_ops, stats->read_prio_pcie_bypass_ns,
+	       stats->lp_host_write_ops, stats->lp_host_write_ns);
 }
 
 static int write_bg_nand_phase_csv(const char *path,
@@ -1234,24 +1351,55 @@ static int write_bg_nand_phase_csv(const char *path,
 	if (!fp)
 		return -errno;
 
-	fprintf(fp, "phase,busy_ns,read_ns,write_ns,erase_ns,read_ops,write_ops,erase_ops\n");
+	fprintf(fp, "phase,busy_ns,read_ns,write_ns,erase_ns,read_ops,write_ops,erase_ops,"
+		"read_prio_bypass_ops,read_prio_bypass_ns,"
+		"read_prio_ch_bypass_ops,read_prio_ch_bypass_ns,"
+		"read_prio_pcie_bypass_ops,read_prio_pcie_bypass_ns,"
+		"lp_host_write_ops,lp_host_write_ns\n");
 	if (mixed_init) {
-		fprintf(fp, "mixed_init,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+		fprintf(fp, "mixed_init,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+			"%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
 			mixed_init->busy_ns, mixed_init->read_ns, mixed_init->write_ns,
 			mixed_init->erase_ns, mixed_init->read_ops, mixed_init->write_ops,
-			mixed_init->erase_ops);
+			mixed_init->erase_ops,
+			mixed_init->read_prio_bypass_ops,
+			mixed_init->read_prio_bypass_ns,
+			mixed_init->read_prio_ch_bypass_ops,
+			mixed_init->read_prio_ch_bypass_ns,
+			mixed_init->read_prio_pcie_bypass_ops,
+			mixed_init->read_prio_pcie_bypass_ns,
+			mixed_init->lp_host_write_ops,
+			mixed_init->lp_host_write_ns);
 	}
 	if (cold_read) {
-		fprintf(fp, "cold_read,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+		fprintf(fp, "cold_read,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+			"%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
 			cold_read->busy_ns, cold_read->read_ns, cold_read->write_ns,
 			cold_read->erase_ns, cold_read->read_ops, cold_read->write_ops,
-			cold_read->erase_ops);
+			cold_read->erase_ops,
+			cold_read->read_prio_bypass_ops,
+			cold_read->read_prio_bypass_ns,
+			cold_read->read_prio_ch_bypass_ops,
+			cold_read->read_prio_ch_bypass_ns,
+			cold_read->read_prio_pcie_bypass_ops,
+			cold_read->read_prio_pcie_bypass_ns,
+			cold_read->lp_host_write_ops,
+			cold_read->lp_host_write_ns);
 	}
 	if (total) {
-		fprintf(fp, "total,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+		fprintf(fp, "total,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+			"%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
 			total->busy_ns, total->read_ns, total->write_ns,
 			total->erase_ns, total->read_ops, total->write_ops,
-			total->erase_ops);
+			total->erase_ops,
+			total->read_prio_bypass_ops,
+			total->read_prio_bypass_ns,
+			total->read_prio_ch_bypass_ops,
+			total->read_prio_ch_bypass_ns,
+			total->read_prio_pcie_bypass_ops,
+			total->read_prio_pcie_bypass_ns,
+			total->lp_host_write_ops,
+			total->lp_host_write_ns);
 	}
 
 	fclose(fp);
@@ -2695,6 +2843,67 @@ static int build_table_read_plan(const struct dataset_layout *layout,
 	return 0;
 }
 
+struct read_plan_rank {
+	unsigned int table_id;
+	unsigned int reads;
+};
+
+static int compare_read_plan_rank(const void *a, const void *b)
+{
+	const struct read_plan_rank *ra = a;
+	const struct read_plan_rank *rb = b;
+
+	if (ra->reads < rb->reads)
+		return 1;
+	if (ra->reads > rb->reads)
+		return -1;
+	if (ra->table_id > rb->table_id)
+		return 1;
+	if (ra->table_id < rb->table_id)
+		return -1;
+	return 0;
+}
+
+static void print_read_plan_top_tables(const struct dataset_layout *layout,
+				       const unsigned int *read_plan,
+				       unsigned int limit)
+{
+	struct read_plan_rank *rank;
+	unsigned long long total_reads = 0;
+	unsigned int active_tables = 0;
+	unsigned int printed = 0;
+
+	if (!layout || !read_plan || layout->table_count == 0 || limit == 0)
+		return;
+
+	rank = calloc(layout->table_count, sizeof(*rank));
+	if (!rank)
+		return;
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		rank[tbl].table_id = tbl;
+		rank[tbl].reads = read_plan[tbl];
+		total_reads += read_plan[tbl];
+		if (read_plan[tbl] > 0)
+			active_tables++;
+	}
+
+	qsort(rank, layout->table_count, sizeof(*rank), compare_read_plan_rank);
+	printf("[sqlite_init] read_plan total_reads=%llu active_tables=%u top_tables=",
+	       total_reads, active_tables);
+	for (unsigned int i = 0; i < layout->table_count && printed < limit; ++i) {
+		if (rank[i].reads == 0)
+			break;
+		printf("%stable%u:%u", printed ? "," : "",
+		       rank[i].table_id, rank[i].reads);
+		printed++;
+	}
+	if (printed == 0)
+		printf("none");
+	printf("\n");
+	free(rank);
+}
+
 static void drop_page_cache(void)
 {
 	FILE *fp;
@@ -2726,11 +2935,18 @@ static int run_read_event(unsigned int event_id,
 			  const struct dataset_layout *layout,
 			  struct table_file_state *tables,
 			  const unsigned int *read_plan,
+			  const char *test_phase_stats_path,
 			  double *table_latency,
 			  unsigned long long *table_read_ops,
 			  double *elapsed_out)
 {
+	struct ftl_read_heat_stats before_stats;
+	struct ftl_read_heat_stats after_stats;
+	bool have_before_stats = false;
 	double start = monotonic_sec();
+
+	if (read_ftl_read_heat_stats(test_phase_stats_path, &before_stats) == 0)
+		have_before_stats = true;
 
 	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
 		unsigned int reads = read_plan ? read_plan[tbl] : 0U;
@@ -2769,6 +2985,9 @@ static int run_read_event(unsigned int event_id,
 	*elapsed_out = monotonic_sec() - start;
 	printf("[sqlite_init] read_event=%u completed tables=%u elapsed=%.6fs\n",
 	       event_id, layout->table_count, *elapsed_out);
+	if (have_before_stats &&
+	    read_ftl_read_heat_stats(test_phase_stats_path, &after_stats) == 0)
+		print_ftl_read_event_delta(event_id, &before_stats, &after_stats);
 	return 0;
 }
 
@@ -4322,6 +4541,7 @@ static int run_init_mode(const struct workload_options *opts)
 	rc = build_table_read_plan(&layout, opts, &read_plan);
 	if (rc != 0)
 		goto out;
+	print_read_plan_top_tables(&layout, read_plan, 10);
 	rc = open_refstyle_dummy_file(opts, &ref_dummy);
 	if (rc != 0) {
 		fprintf(stderr, "Failed to open refstyle dummy file (%d)\n", rc);
@@ -4464,6 +4684,7 @@ static int run_init_mode(const struct workload_options *opts)
 
 			read_events++;
 			rc = run_read_event(read_events, &layout, tables, read_plan,
+					    opts->test_phase_stats_path,
 					    table_latency, table_read_ops, &event_elapsed);
 			if (rc != 0)
 				goto out;
@@ -4830,6 +5051,7 @@ static void usage(const char *prog)
 		"  --page-die-transition-path PATH\n"
 				"  --enable-gc-nand-timing\n"
 				"  --heat-epoch-path PATH\n"
+				"  --test-phase-stats-path PATH\n"
 				"  --gc-nand-timing-path PATH\n"
 			"  --bg-nand-stats-path PATH\n"
 			"  --map-cache-stats-path PATH\n"
@@ -4876,6 +5098,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->refstyle_dummy_bytes = DEFAULT_REFSTYLE_DUMMY_BYTES;
 	opts->align_pages = 0;
 	opts->test_phase_path = DEFAULT_TEST_PHASE_PATH;
+	opts->test_phase_stats_path = DEFAULT_TEST_PHASE_STATS_PATH;
 	opts->heat_epoch_path = DEFAULT_HEAT_EPOCH_PATH;
 	opts->enable_gc_nand_timing = false;
 	opts->gc_nand_timing_path = DEFAULT_GC_NAND_TIMING_PATH;
@@ -5044,6 +5267,9 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 				case 1043:
 					opts->cold_extra_write_sleep_every =
 						(unsigned int)strtoul(optarg, NULL, 10);
+					break;
+				case 1044:
+					opts->test_phase_stats_path = optarg;
 					break;
 				case 'h':
 		default:
