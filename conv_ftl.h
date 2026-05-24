@@ -500,8 +500,8 @@ struct conv_ftl {
 	atomic64_t test_phase_recent_guard_forced;    /* guarded pages migrated under SLC pressure */
 	atomic64_t test_phase_last_read_ktime_ns;     /* host read arrival wall-clock for read-priority bg yield */
 	atomic64_t test_phase_read_priority_yields;   /* bg workers yielded to foreground reads */
-	atomic64_t test_phase_read_priority_delayed_requeues; /* latency3: yielded work was delayed before retry */
-	atomic64_t test_phase_read_priority_forced_progress_runs; /* latency3: pressure forced one bg maintenance run */
+	atomic64_t test_phase_read_priority_delayed_requeues; /* yielded work was delayed before retry */
+	atomic64_t test_phase_read_priority_forced_progress_runs; /* pressure forced one bg maintenance run */
 	atomic_t test_phase_active_reads;       /* currently active host reads */
 	atomic_t test_phase_active_overwrites;  /* currently active overwrite writes */
 	atomic_t test_phase_active_bg_ops;      /* currently active bg migration ops */

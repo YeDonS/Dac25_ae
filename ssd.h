@@ -119,6 +119,8 @@ struct nand_lun {
 	struct nand_plane *pl;
 	int npls;
 	uint64_t next_lun_avail_time;
+	uint64_t hp_next_lun_avail_time;
+	uint64_t lp_next_lun_avail_time;
 	bool busy;
 	uint64_t gc_endtime;
 };
@@ -126,11 +128,17 @@ struct nand_lun {
 struct ssd_channel {
 	struct nand_lun *lun;
 	int nluns;
+	uint64_t next_ch_avail_time;
+	uint64_t hp_next_ch_avail_time;
+	uint64_t lp_next_ch_avail_time;
 	uint64_t gc_endtime;
 	struct channel_model *perf_model;
 };
 
 struct ssd_pcie {
+	uint64_t next_pcie_avail_time;
+	uint64_t hp_next_pcie_avail_time;
+	uint64_t lp_next_pcie_avail_time;
 	struct channel_model *perf_model;
 };
 
@@ -313,9 +321,16 @@ void ssd_init(struct ssd *ssd, struct ssdparams *spp, uint32_t cpu_nr_dispatcher
 void ssd_remove(struct ssd *ssd);
 
 uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd);
+uint64_t ssd_advance_nand_read_priority(struct ssd *ssd, struct nand_cmd *ncmd);
+uint64_t ssd_advance_nand_low_priority(struct ssd *ssd, struct nand_cmd *ncmd);
 uint64_t ssd_advance_pcie(struct ssd *ssd, uint64_t request_time, uint64_t length);
 uint64_t ssd_advance_write_buffer(struct ssd *ssd, uint64_t request_time, uint64_t length);
+uint64_t ssd_advance_write_buffer_low_priority(struct ssd *ssd,
+					       uint64_t request_time,
+					       uint64_t length);
 uint64_t ssd_next_idle_time(struct ssd *ssd);
+uint64_t ssd_lun_next_idle_time(struct ssd *ssd, unsigned int ch, unsigned int lun);
+uint64_t ssd_pcie_next_idle_time(struct ssd *ssd);
 
 void buffer_init(struct buffer *buf, size_t size);
 uint32_t buffer_allocate(struct buffer *buf, size_t size);

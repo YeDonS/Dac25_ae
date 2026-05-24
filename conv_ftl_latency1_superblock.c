@@ -54,7 +54,7 @@ module_param_named(test_phase_recent_write_guard,
 MODULE_PARM_DESC(test_phase_recent_write_guard,
 		 "Protect pages written in the current test-phase read window from SLC->QLC migration");
 
-static unsigned int nvmev_test_phase_guard_read_reqs = 64;
+static unsigned int nvmev_test_phase_guard_read_reqs = 256;
 module_param_named(test_phase_guard_read_reqs,
 		   nvmev_test_phase_guard_read_reqs, uint, 0644);
 MODULE_PARM_DESC(test_phase_guard_read_reqs,
@@ -109,10 +109,9 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #define SLC_MIGRATION_VICTIM_CAP_PCT 5U
 #define SLC_MIGRATION_SCAN_SB_BUDGET 64U
 #define SLC_MIGRATION_NO_PROGRESS_COOLDOWN_CALLS 64U
-#define REPROMOTE_READ_TRIGGER 32U
+#define REPROMOTE_READ_TRIGGER 1024U
 #define REPROMOTE_BATCH_PAGES 512U
 #define REPROMOTE_HEAT_FLOOR 4U
-#define QLC_CLOSED_REPROMOTE_TRIGGER 10U
 #define SLC_REPROMOTE_GUARD_FREE_PCT 5U
 #define MIG_MONITOR_INTERVAL_NS 30000000000ULL
 #define QLC_GC_FREE_PCT 15U
@@ -1800,6 +1799,8 @@ static uint32_t slc_migrate_sb_pages_to_qlc(struct conv_ftl *conv_ftl,
 		if (!force_all && conv_ftl->heat_track.access_count &&
 		    conv_ftl->heat_track.access_count[lpn] * 10ULL > cold_thresh_x10)
 			continue;
+		if (!force_all && recent_write_guard_with_pressure(conv_ftl, lpn, false))
+			continue;
 		if (migrate_page_to_qlc(conv_ftl, lpn, &ppa) == 0)
 			moved++;
 		if ((idx & 0xff) == 0 && need_resched())
@@ -1973,7 +1974,7 @@ static uint32_t migrate_some_cold_from_slc(struct conv_ftl *conv_ftl, uint32_t m
 	victim_q = conv_ftl->slc_sb_migrated_victim_count;
 	total_sbs = conv_ftl->slc_blks_per_pl ? conv_ftl->slc_blks_per_pl : 1;
 	collect_slc_stats(conv_ftl, &slc_stats);
-	guard_disabled = slc_stats.free <= conv_ftl->slc_gc_free_thres_high;
+	guard_disabled = false;
 
 	if (conv_ftl->slc_migration_no_progress_active) {
 		if (conv_ftl->slc_migration_no_progress_victim_q != victim_q ||
@@ -2621,14 +2622,7 @@ static bool recent_write_guard_with_pressure(struct conv_ftl *conv_ftl, uint64_t
 
 static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn)
 {
-	struct line_pool_stats slc_stats;
-	bool slc_pressure = false;
-
-	if (conv_ftl) {
-		collect_slc_stats(conv_ftl, &slc_stats);
-		slc_pressure = slc_stats.free <= conv_ftl->slc_gc_free_thres_high;
-	}
-	return recent_write_guard_with_pressure(conv_ftl, lpn, slc_pressure);
+	return recent_write_guard_with_pressure(conv_ftl, lpn, false);
 }
 
 static void update_qlc_latency_zone(struct conv_ftl *conv_ftl, uint64_t lpn, struct ppa *ppa)
@@ -3224,6 +3218,10 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   atomic64_read(&conv_ftl->test_phase_read_die_wait_ns));
 	seq_printf(m, "host_read_nand_ops %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_host_read_nand_ops));
+	seq_printf(m, "global_read_sum %llu\n",
+		   (unsigned long long)conv_ftl->global_read_sum);
+	seq_printf(m, "global_valid_pg_cnt %llu\n",
+		   (unsigned long long)conv_ftl->global_valid_pg_cnt);
 	seq_printf(m, "host_read_slc_nand_ops %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_host_read_slc_ops));
 	seq_printf(m, "host_read_qlc_nand_ops %lld\n",
@@ -3435,14 +3433,6 @@ static int baseline_superblock_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "qlc_fast_page_pct %llu\n",
 		   (unsigned long long)baseline_pct_u64(conv_ftl->qlc_fast_count,
 							qlc_resident));
-	seq_printf(m, "qlc_closed_repromote_queued %u\n",
-		   conv_ftl->qlc_closed_repromote_count);
-	seq_printf(m, "qlc_closed_repromote_enqueues %llu\n",
-		   (unsigned long long)conv_ftl->qlc_closed_repromote_enqueues);
-	seq_printf(m, "qlc_closed_repromote_dequeues %llu\n",
-		   (unsigned long long)conv_ftl->qlc_closed_repromote_dequeues);
-	seq_printf(m, "qlc_closed_repromote_drops %llu\n",
-		   (unsigned long long)conv_ftl->qlc_closed_repromote_drops);
 	seq_printf(m, "qlc_closed_repromote_scans %llu\n",
 		   (unsigned long long)conv_ftl->qlc_closed_repromote_scans);
 	seq_printf(m, "qlc_closed_repromote_pages %llu\n",
@@ -5072,8 +5062,6 @@ static int init_qlc_closed_repromote_queue(struct conv_ftl *conv_ftl)
 
 	size = (conv_ftl->die_count ? conv_ftl->die_count : 1) *
 		(conv_ftl->qlc_blks_per_pl ? conv_ftl->qlc_blks_per_pl : 1);
-	if (size < QLC_CLOSED_REPROMOTE_TRIGGER)
-		size = QLC_CLOSED_REPROMOTE_TRIGGER;
 
 	conv_ftl->qlc_closed_repromote_blk =
 		vmalloc(sizeof(*conv_ftl->qlc_closed_repromote_blk) * size);
@@ -5100,7 +5088,6 @@ static int init_qlc_closed_repromote_queue(struct conv_ftl *conv_ftl)
 	conv_ftl->qlc_closed_repromote_tail = 0;
 	conv_ftl->qlc_closed_repromote_count = 0;
 	conv_ftl->qlc_closed_repromote_size = size;
-	conv_ftl->qlc_closed_repromote_since_scan = 0;
 	conv_ftl->qlc_closed_repromote_enqueues = 0;
 	conv_ftl->qlc_closed_repromote_dequeues = 0;
 	conv_ftl->qlc_closed_repromote_drops = 0;
@@ -5124,7 +5111,6 @@ static void remove_qlc_closed_repromote_queue(struct conv_ftl *conv_ftl)
 	conv_ftl->qlc_closed_repromote_tail = 0;
 	conv_ftl->qlc_closed_repromote_count = 0;
 	conv_ftl->qlc_closed_repromote_size = 0;
-	conv_ftl->qlc_closed_repromote_since_scan = 0;
 }
 
 /* 清理函数 */
@@ -6168,7 +6154,7 @@ static int gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 			uint64_t cold_thresh_x10 = get_dynamic_cold_threshold_x10(conv_ftl);
 			uint64_t acc = 0;
 			uint64_t acc_x10 = 0;
-			bool guard_disabled = slc_st.free <= conv_ftl->slc_gc_free_thres_low;
+			bool guard_disabled = false;
 
 			if (conv_ftl->heat_track.access_count && lpn < spp->tt_pgs)
 				acc = conv_ftl->heat_track.access_count[lpn];
@@ -8196,39 +8182,9 @@ static bool qlc_closed_repromote_note_die_closed_locked(struct conv_ftl *conv_ft
 	conv_ftl->qlc_closed_repromote_tail =
 		(slot + 1) % conv_ftl->qlc_closed_repromote_size;
 	conv_ftl->qlc_closed_repromote_count++;
-	conv_ftl->qlc_closed_repromote_since_scan++;
 	conv_ftl->qlc_closed_repromote_enqueues++;
 
-	if (conv_ftl->qlc_closed_repromote_since_scan >=
-	    QLC_CLOSED_REPROMOTE_TRIGGER)
-		return true;
 	return false;
-}
-
-static bool qlc_closed_repromote_take_trigger(struct conv_ftl *conv_ftl)
-{
-	bool ready = false;
-
-	if (!conv_ftl || !conv_ftl->qlc_closed_repromote_queued ||
-	    !conv_ftl->qlc_blks_per_pl)
-		return false;
-
-	spin_lock(&conv_ftl->qlc_lock);
-	if (conv_ftl->qlc_closed_repromote_since_scan >=
-	    QLC_CLOSED_REPROMOTE_TRIGGER) {
-		ready = true;
-		conv_ftl->qlc_closed_repromote_dequeues +=
-			conv_ftl->qlc_closed_repromote_count;
-		conv_ftl->qlc_closed_repromote_head = 0;
-		conv_ftl->qlc_closed_repromote_tail = 0;
-		conv_ftl->qlc_closed_repromote_count = 0;
-		conv_ftl->qlc_closed_repromote_since_scan = 0;
-		memset(conv_ftl->qlc_closed_repromote_queued, 0,
-		       sizeof(*conv_ftl->qlc_closed_repromote_queued) *
-		       conv_ftl->qlc_blks_per_pl);
-	}
-	spin_unlock(&conv_ftl->qlc_lock);
-	return ready;
 }
 
 static inline struct write_pointer *baseline_qlc_active_wp(struct conv_ftl *conv_ftl,
@@ -8688,37 +8644,39 @@ static int qlc_try_allocate_zone(struct conv_ftl *conv_ftl, struct write_pointer
 }
 
 static int qlc_do_allocate(struct conv_ftl *conv_ftl, struct write_pointer *wp,
-			   struct line_mgmt *lm, uint32_t die, uint32_t zone_hint,
+	struct line_mgmt *lm, uint32_t die, uint32_t zone_hint,
 			   struct ppa *ppa_out)
 {
 	uint32_t type_order[QLC_PAGE_PATTERN];
 	uint32_t type_idx;
-	uint32_t base_attempts = 0;
+	uint32_t attempts = 0;
 
 	if (!ppa_out || !lm)
 		return -EINVAL;
 
-	base_attempts = lm->free_line_cnt + (wp->curline ? 1 : 0);
-
 	qlc_build_type_priority(zone_hint, type_order);
+	attempts = lm->free_line_cnt + (wp->curline ? 1 : 0);
+	if (!attempts)
+		attempts = 1;
 
-	for (type_idx = 0; type_idx < QLC_PAGE_PATTERN; type_idx++) {
-		uint32_t type = type_order[type_idx];
-		uint32_t attempts = base_attempts ? base_attempts : 1;
+	while (attempts--) {
+		struct line *line = qlc_ensure_active_line(conv_ftl, wp, lm, die);
 
-		while (attempts--) {
-			struct line *line = qlc_ensure_active_line(conv_ftl, wp, lm, die);
+		if (!line)
+			break;
 
-			if (!line)
-				break;
-
-			if (qlc_try_allocate_zone(conv_ftl, wp, line, type, ppa_out) == 0) {
+		for (type_idx = 0; type_idx < QLC_PAGE_PATTERN; type_idx++) {
+			if (qlc_try_allocate_zone(conv_ftl, wp, line,
+						  type_order[type_idx], ppa_out) == 0) {
 				qlc_record_page_write(conv_ftl, wp, lm, die);
 				return 0;
 			}
-			if (READ_ONCE(wp->curline) == line)
-				qlc_close_active_line(conv_ftl, wp, lm, die);
+			if (READ_ONCE(wp->curline) != line)
+				break;
 		}
+
+		if (READ_ONCE(wp->curline) == line)
+			qlc_close_active_line(conv_ftl, wp, lm, die);
 	}
 
 	return -ENOSPC;
@@ -9987,8 +9945,6 @@ static uint32_t migrate_hot_from_closed_qlc(struct conv_ftl *conv_ftl)
 
 	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->qlc_closed_repromote_size)
 		return 0;
-
-	(void)qlc_closed_repromote_take_trigger(conv_ftl);
 
 	if (conv_ftl->slc_repromote_guard_lines) {
 		collect_slc_stats(conv_ftl, &slc_stats);

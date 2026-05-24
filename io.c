@@ -257,6 +257,12 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 	pi->proc_table[entry].next = -1;
 
 	pi->proc_table[entry].writeback_cmd = false;
+	pi->proc_table[entry].writeback_lun_guard = false;
+	pi->proc_table[entry].writeback_ssd = NULL;
+	pi->proc_table[entry].writeback_ch = 0;
+	pi->proc_table[entry].writeback_lun = 0;
+	pi->proc_table[entry].completion_pcie_guard = ret->completion_pcie_guard;
+	pi->proc_table[entry].completion_ssd = ret->completion_ssd;
 	mb(); /* IO worker shall see the updated pi at once */
 
 	// (END) -> (START) order, nsecs target ascending order
@@ -294,8 +300,13 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 	}
 }
 
-void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
-			      struct buffer *write_buffer, unsigned int buffs_to_release)
+static void __enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
+				       struct buffer *write_buffer,
+				       unsigned int buffs_to_release,
+				       void *writeback_ssd,
+				       unsigned int writeback_ch,
+				       unsigned int writeback_lun,
+				       bool writeback_lun_guard)
 {
 	unsigned int proc_turn = __get_io_worker(sqid);
 	struct nvmev_proc_info *pi = &nvmev_vdev->proc_info[proc_turn];
@@ -329,6 +340,12 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 	pi->proc_table[entry].writeback_cmd = true;
 	pi->proc_table[entry].buffs_to_release = buffs_to_release;
 	pi->proc_table[entry].write_buffer = (void *)write_buffer;
+	pi->proc_table[entry].writeback_lun_guard = writeback_lun_guard;
+	pi->proc_table[entry].writeback_ssd = writeback_ssd;
+	pi->proc_table[entry].writeback_ch = writeback_ch;
+	pi->proc_table[entry].writeback_lun = writeback_lun;
+	pi->proc_table[entry].completion_pcie_guard = false;
+	pi->proc_table[entry].completion_ssd = NULL;
 	mb(); /* IO worker shall see the updated pi at once */
 
 	// (END) -> (START) order, nsecs target ascending order
@@ -363,6 +380,80 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			pi->proc_table[pi->proc_table[entry].next].prev = entry;
 			pi->proc_table[curr].next = entry;
 		}
+	}
+}
+
+void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
+			      struct buffer *write_buffer, unsigned int buffs_to_release)
+{
+	__enqueue_writeback_io_req(sqid, nsecs_target, write_buffer,
+				   buffs_to_release, NULL, 0, 0, false);
+}
+
+void enqueue_writeback_io_req_lun_guarded(int sqid,
+					  unsigned long long nsecs_target,
+					  struct buffer *write_buffer,
+					  unsigned int buffs_to_release,
+					  void *writeback_ssd,
+					  unsigned int writeback_ch,
+					  unsigned int writeback_lun)
+{
+	__enqueue_writeback_io_req(sqid, nsecs_target, write_buffer,
+				   buffs_to_release, writeback_ssd,
+				   writeback_ch, writeback_lun, true);
+}
+
+static void __reschedule_proc_entry(struct nvmev_proc_info *pi,
+				    unsigned int entry,
+				    unsigned long long nsecs_target)
+{
+	struct nvmev_proc_table *pe = &pi->proc_table[entry];
+	unsigned int prev = pe->prev;
+	unsigned int next = pe->next;
+	unsigned int curr;
+
+	if (prev != -1)
+		pi->proc_table[prev].next = next;
+	else
+		pi->io_seq = next;
+
+	if (next != -1)
+		pi->proc_table[next].prev = prev;
+	else
+		pi->io_seq_end = prev;
+
+	pe->prev = -1;
+	pe->next = -1;
+	pe->nsecs_target = nsecs_target;
+
+	if (pi->io_seq == -1) {
+		pi->io_seq = entry;
+		pi->io_seq_end = entry;
+		return;
+	}
+
+	curr = pi->io_seq_end;
+	while (curr != -1) {
+		if (pi->proc_table[curr].nsecs_target <= pi->proc_io_nsecs)
+			break;
+		if (pi->proc_table[curr].nsecs_target <= nsecs_target)
+			break;
+		curr = pi->proc_table[curr].prev;
+	}
+
+	if (curr == -1) {
+		pi->proc_table[pi->io_seq].prev = entry;
+		pe->next = pi->io_seq;
+		pi->io_seq = entry;
+	} else if (pi->proc_table[curr].next == -1) {
+		pe->prev = curr;
+		pi->io_seq_end = entry;
+		pi->proc_table[curr].next = entry;
+	} else {
+		pe->prev = curr;
+		pe->next = pi->proc_table[curr].next;
+		pi->proc_table[pe->next].prev = entry;
+		pi->proc_table[curr].next = entry;
 	}
 }
 
@@ -725,15 +816,49 @@ static int nvmev_kthread_io(void *data)
 					    pe->sqid, pe->cqid, pe->sq_entry);
 			}
 
-			if (pe->nsecs_target <= curr_nsecs) {
-				if (pe->writeback_cmd) {
+				if (pe->nsecs_target <= curr_nsecs) {
+					if (pe->writeback_cmd) {
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS))
-					buffer_release((struct buffer *)pe->write_buffer,
-						       pe->buffs_to_release);
+						if (pe->writeback_lun_guard && pe->writeback_ssd) {
+							uint64_t lun_tail =
+								ssd_lun_next_idle_time((struct ssd *)pe->writeback_ssd,
+										       pe->writeback_ch,
+										       pe->writeback_lun);
+
+							if (lun_tail > curr_nsecs) {
+								unsigned int next = pe->next;
+								unsigned long long new_target =
+									max_t(unsigned long long,
+									      pe->nsecs_target,
+									      lun_tail);
+
+								__reschedule_proc_entry(pi, curr, new_target);
+								curr = next;
+								continue;
+							}
+						}
+							buffer_release((struct buffer *)pe->write_buffer,
+								       pe->buffs_to_release);
 #endif
-				} else {
-					__fill_cq_result(pe);
-				}
+						} else {
+							if (pe->completion_pcie_guard && pe->completion_ssd) {
+								uint64_t pcie_tail =
+									ssd_pcie_next_idle_time((struct ssd *)pe->completion_ssd);
+
+								if (pcie_tail > curr_nsecs) {
+									unsigned int next = pe->next;
+									unsigned long long new_target =
+										max_t(unsigned long long,
+										      pe->nsecs_target,
+										      pcie_tail);
+
+									__reschedule_proc_entry(pi, curr, new_target);
+									curr = next;
+									continue;
+								}
+							}
+							__fill_cq_result(pe);
+						}
 
 				NVMEV_DEBUG("%s: completed %u, %d %d %d\n", pi->thread_name, curr,
 					    pe->sqid, pe->cqid, pe->sq_entry);

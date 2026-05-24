@@ -171,6 +171,12 @@ struct nvmev_proc_table {
 	bool writeback_cmd;
 	void *write_buffer;
 	unsigned int buffs_to_release;
+	bool writeback_lun_guard;
+	void *writeback_ssd;
+	unsigned int writeback_ch;
+	unsigned int writeback_lun;
+	bool completion_pcie_guard;
+	void *completion_ssd;
 
 	unsigned int next, prev;
 };
@@ -275,6 +281,8 @@ struct nvmev_result {
 	uint64_t nsecs_target;
 	uint32_t early_completion;
 	uint64_t result;
+	bool completion_pcie_guard;
+	void *completion_ssd;
 };
 
 struct nvmev_ns {
