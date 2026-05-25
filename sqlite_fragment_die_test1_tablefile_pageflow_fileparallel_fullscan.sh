@@ -27,9 +27,10 @@ SQLITE_WINDOW_TABLES=${SQLITE_WINDOW_TABLES:-80}
 SQLITE_WINDOW_PAGES_PER_TABLE_LIST=${SQLITE_WINDOW_PAGES_PER_TABLE_LIST:-${SQLITE_WINDOW_PAGES_PER_TABLE:-"960 2048 2304"}}
 SQLITE_WINDOW_PAGES_PER_TABLE=${SQLITE_WINDOW_PAGES_PER_TABLE:-2304}
 SQLITE_WINDOW_PASSES_PER_ROUND=${SQLITE_WINDOW_PASSES_PER_ROUND:-1}
-# Empty means follow the current window_pages sweep value so init read heat is
-# established before SLC pressure starts bulk migration.
-SQLITE_INTERLEAVE_PAGES=${SQLITE_INTERLEAVE_PAGES:-}
+# Default matches the workload binary's coarse init-read interval (~10 events
+# for an 8GiB/4KiB run).  Set SQLITE_INTERLEAVE_PAGES=window only when an
+# intentionally dense preheat event after every window_pages is needed.
+SQLITE_INTERLEAVE_PAGES=${SQLITE_INTERLEAVE_PAGES:-209715}
 SQLITE_INTERLEAVE_READS=${SQLITE_INTERLEAVE_READS:-1000}
 SQLITE_INIT_DROP_CACHE_EACH_READ=${SQLITE_INIT_DROP_CACHE_EACH_READ:-0}
 SQLITE_ANALYZE_LATENCY_RUN=${SQLITE_ANALYZE_LATENCY_RUN:-1}
@@ -436,7 +437,11 @@ run_one_test() {
     mode_tag="$(printf '%s' "$cold_mode" | tr -c 'A-Za-z0-9' '_')"
     cmt_tag="$(size_tag "$cmt_label")"
     dist_tag="$(printf '%s' "$SQLITE_ACCESS_DIST" | tr -c 'A-Za-z0-9' '_')"
-    interleave_pages="${SQLITE_INTERLEAVE_PAGES:-$window_pages}"
+    if [[ "$SQLITE_INTERLEAVE_PAGES" == "window" || "$SQLITE_INTERLEAVE_PAGES" == "follow-window" ]]; then
+        interleave_pages="$window_pages"
+    else
+        interleave_pages="$SQLITE_INTERLEAVE_PAGES"
+    fi
     local wp_tag="wp${window_pages}"
     local tag="die_tablefile_pageflow_fileparallel_fullscan_${variant}_${mode_tag}_${dist_tag}_${wp_tag}_cmt_${cmt_tag}_t${threads}"
     local init_txt="${RESULT_FOLDER%/}/sqlite_die_tablefile_pageflow_fileparallel_fullscan_init_${variant}_${mode_tag}_${dist_tag}_${wp_tag}_cmt_${cmt_tag}_t${threads}.txt"
