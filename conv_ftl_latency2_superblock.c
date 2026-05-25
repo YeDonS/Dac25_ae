@@ -1050,6 +1050,7 @@ static int  maint_enqueue_task(struct conv_ftl *conv_ftl,
 static struct maint_task *maint_dequeue_task(struct conv_ftl *conv_ftl, uint32_t die);
 static void maint_drain_die(struct conv_ftl *conv_ftl, uint32_t die);
 static void maint_drain_all(struct conv_ftl *conv_ftl);
+static void maint_v2_emergency_abort_all(struct conv_ftl *conv_ftl);
 
 /* die/channel 状态查询 */
 static bool channel_busy_peek(struct conv_ftl *conv_ftl, uint32_t die, uint64_t now);
@@ -1074,6 +1075,8 @@ static bool maint_task_current(struct conv_ftl *conv_ftl, const struct maint_tas
 			       uint8_t expected_phase);
 static bool maint_task_is_stale(struct conv_ftl *conv_ftl,
 				const struct maint_task *t, uint64_t now);
+static void maint_abort_stale_task_if_current(struct conv_ftl *conv_ftl,
+					      const struct maint_task *t);
 static bool maint_finish_die_if_current(struct conv_ftl *conv_ftl,
 					const struct maint_task *t,
 					uint8_t expected_phase,
@@ -6892,6 +6895,11 @@ static bool maintain_slc_free_to_target(struct conv_ftl *conv_ftl, int32_t targe
 	collect_slc_stats(conv_ftl, &slc_stats);
 	if (slc_stats.free >= conv_ftl->slc_high_watermark)
 		return true;
+	if (slc_stats.free <= conv_ftl->slc_gc_free_thres_low) {
+		if (conv_ftl->bg_migration_wq)
+			flush_workqueue(conv_ftl->bg_migration_wq);
+		maint_v2_emergency_abort_all(conv_ftl);
+	}
 
 	target_lines = conv_ftl->slc_target_watermark;
 	if (!target_lines || target_lines >= slc_stats.total)
@@ -6990,6 +6998,11 @@ static bool maintain_slc_one_step(struct conv_ftl *conv_ftl, int32_t target_die,
 
 	conv_ftl->fg_maint_latest_ns = latest_ns ? *latest_ns : 0;
 	collect_slc_stats(conv_ftl, &slc_stats);
+	if (slc_stats.free <= conv_ftl->slc_gc_free_thres_low) {
+		if (conv_ftl->bg_migration_wq)
+			flush_workqueue(conv_ftl->bg_migration_wq);
+		maint_v2_emergency_abort_all(conv_ftl);
+	}
 	max_pages = slc_pages_per_superblock(conv_ftl);
 	if (max_pages < 8)
 		max_pages = 8;
@@ -7105,6 +7118,10 @@ static bool maintain_slc_for_allocation_failure(struct conv_ftl *conv_ftl,
 	conv_ftl->slc_migration_no_progress_active = false;
 	conv_ftl->slc_migration_no_progress_scan_visits = 0;
 	conv_ftl->slc_migration_no_progress_cold_thresh_x10 = 0;
+
+	if (conv_ftl->bg_migration_wq)
+		flush_workqueue(conv_ftl->bg_migration_wq);
+	maint_v2_emergency_abort_all(conv_ftl);
 
 	if (slc_has_any_victim(conv_ftl) &&
 	    do_gc_superblock_slc(conv_ftl, true) == 0)
@@ -8152,7 +8169,8 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl, uint32_t preferred
 		return ppa;
 	}
 
-	NVMEV_ERROR("No free SLC page in baseline host-active SB pool!\n");
+	printk_ratelimited(KERN_ERR
+			   "NVMeVirt: No free SLC page in baseline host-active SB pool!\n");
 	return (struct ppa){ .ppa = UNMAPPED_PPA };
 }
 
@@ -9786,6 +9804,22 @@ static bool maint_task_is_stale(struct conv_ftl *conv_ftl,
 	return false;
 }
 
+static void maint_abort_stale_task_if_current(struct conv_ftl *conv_ftl,
+					      const struct maint_task *t)
+{
+	uint8_t expected_phase;
+
+	if (!conv_ftl || !t)
+		return;
+	if (t->type == MAINT_TASK_MIG_DIE_PORTION)
+		expected_phase = MAINT_SB_PHASE_MIG;
+	else if (t->type == MAINT_TASK_GC_DIE_PORTION)
+		expected_phase = MAINT_SB_PHASE_GC;
+	else
+		return;
+	maint_abort_phase_if_current(conv_ftl, t, expected_phase);
+}
+
 static bool maint_finish_die_if_current(struct conv_ftl *conv_ftl,
 					const struct maint_task *t,
 					uint8_t expected_phase,
@@ -9906,6 +9940,27 @@ static void maint_drain_all(struct conv_ftl *conv_ftl)
 		return;
 	for (d = 0; d < conv_ftl->die_count; d++)
 		maint_drain_die(conv_ftl, d);
+}
+
+static void maint_v2_emergency_abort_all(struct conv_ftl *conv_ftl)
+{
+	uint32_t sb;
+
+	if (!maint_v2_enabled(conv_ftl))
+		return;
+
+	maint_drain_all(conv_ftl);
+
+	spin_lock(&conv_ftl->slc_lock);
+	for (sb = 0; sb < conv_ftl->slc_blks_per_pl; sb++) {
+		uint8_t phase = READ_ONCE(conv_ftl->maint_sb_phase[sb]);
+
+		if (phase == MAINT_SB_PHASE_IDLE)
+			continue;
+		conv_ftl->maint_sb_pending_dies[sb] = 0;
+		WRITE_ONCE(conv_ftl->maint_sb_phase[sb], MAINT_SB_PHASE_IDLE);
+	}
+	spin_unlock(&conv_ftl->slc_lock);
 }
 
 /* die slack: 已空闲多少 ns (正); 还要忙多少 ns (负)。
@@ -10311,6 +10366,7 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 	now = __get_ioclock(conv_ftl->ssd);
 	conv_ftl->maint_v2_hard_skip_count = 0;
 	if (force_hard_progress) {
+		maint_v2_emergency_abort_all(conv_ftl);
 		if (!slc_has_any_victim(conv_ftl)) {
 			uint32_t hard_moved = 0;
 
@@ -10390,7 +10446,7 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 
 	/* 3. 依序消费每个 die 的队列。流程:
 	 *    dequeue -> stale/gen+phase check -> MIG/GC -> phase advance/requeue.
-	 * stale task 只丢弃, 不修改 pending_dies, 避免旧 generation 污染新 SB。 */
+	 * stale task 若仍占着当前 phase, 必须 abort 回 IDLE, 避免 hard path 永久跳过该 SB。 */
 	{
 		const uint32_t MAINT_V2_MAX_TASKS_PER_RUN = 4;
 		uint32_t i;
@@ -10424,6 +10480,7 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 			processed++;
 
 			if (maint_task_is_stale(conv_ftl, t, ktime_get_ns())) {
+				maint_abort_stale_task_if_current(conv_ftl, t);
 				conv_ftl->maint_v2_stale_tasks++;
 				stale_dropped++;
 			} else if (t->type == MAINT_TASK_MIG_DIE_PORTION) {
@@ -10472,6 +10529,7 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 					}
 				} else {
 					if (status == MAINT_TASK_STALE) {
+						maint_abort_stale_task_if_current(conv_ftl, t);
 						conv_ftl->maint_v2_stale_tasks++;
 						stale_dropped++;
 					} else {
@@ -10484,6 +10542,7 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 							       t->sb_generation);
 
 				if (gc_ret == -ESTALE) {
+					maint_abort_stale_task_if_current(conv_ftl, t);
 					conv_ftl->maint_v2_stale_tasks++;
 					stale_dropped++;
 				} else if (gc_ret == -EBUSY) {
@@ -10651,7 +10710,8 @@ static void bg_slc_maint_worker(struct work_struct *work)
 	collect_slc_stats(conv_ftl, &slc_st);
 	level = slc_pressure_level(conv_ftl, &slc_st);
 	conv_ftl->slc_maint_runs++;
-	force_progress = latency2_read_priority_should_force_progress(conv_ftl, level);
+	force_progress = (level >= SLC_LEVEL_EMERGENCY) ||
+		latency2_read_priority_should_force_progress(conv_ftl, level);
 
 	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
 	if (!force_progress && latency2_read_priority_should_yield(conv_ftl)) {
@@ -11586,7 +11646,7 @@ retry_wb_alloc:
 
 		{
 			int slc_retry = 0;
-			const int SLC_MAX_RETRIES = 8;
+			const int SLC_INITIAL_RETRIES = 8;
 			uint32_t preferred_slc_blk = U32_MAX;
 
 			if (prev_link_lpn != INVALID_LPN &&
@@ -11610,26 +11670,36 @@ retry_wb_alloc:
 					slc_maint_kick(conv_ftl);
 			}
 
-				ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
-				while (!mapped_ppa(&ppa) && slc_retry < SLC_MAX_RETRIES) {
-					int32_t target_die = conv_ftl->die_count ?
-						(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
+			ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
+			while (!mapped_ppa(&ppa)) {
+				int32_t target_die = conv_ftl->die_count ?
+					(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
 
-					slc_retry++;
-					maintain_slc_for_allocation_failure(conv_ftl, target_die,
-									    &nsecs_latest);
-					swr.stime = max(swr.stime, nsecs_latest);
-					cond_resched();
-					ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
+				slc_retry++;
+				maintain_slc_for_allocation_failure(conv_ftl, target_die,
+								    &nsecs_latest);
+				swr.stime = max(swr.stime, nsecs_latest);
+				if (slc_retry == SLC_INITIAL_RETRIES ||
+				    (slc_retry > SLC_INITIAL_RETRIES &&
+				     (slc_retry % 100) == 0)) {
+					struct line_pool_stats slc_wait_stats;
+
+					collect_slc_stats(conv_ftl, &slc_wait_stats);
+					NVMEV_WARN("SLC allocation waiting retry=%d lpn=%llu free=%u/%u victim_q=%u active=%u\n",
+						   slc_retry,
+						   (unsigned long long)local_lpn,
+						   slc_wait_stats.free,
+						   slc_wait_stats.total,
+						   conv_ftl->slc_sb_migrated_victim_count,
+						   conv_ftl->active_sb_count);
 				}
+				if (slc_retry >= SLC_INITIAL_RETRIES)
+					msleep(1);
+				else
+					cond_resched();
+				ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
 			}
-
-        if (!mapped_ppa(&ppa)) {
-            NVMEV_ERROR("SLC exhausted, write failed for LPN %lld (after retries)\n", local_lpn);
-            ret->status = NVME_SC_WRITE_FAULT;
-            ret->nsecs_target = nsecs_latest;
-            goto slc_fail_release;
-        }
+		}
 
 		if (aff_target_valid) {
 			uint32_t actual_die = encode_die(spp, &ppa);
@@ -11800,15 +11870,6 @@ retry_wb_alloc:
 			   conv_ftl->slc_write_cnt, conv_ftl->qlc_write_cnt, conv_ftl->migration_cnt);
 	}
 
-	test_phase_note_overwrite_end(stats_ftl, test_phase_overwrite_tracked);
-	return true;
-
-slc_fail_release:
-	if (stripe_bytes > 0) {
-		enqueue_writeback_io_req(req->sq_id, nsecs_latest, wbuf,
-				(unsigned int)stripe_bytes);
-		stripe_bytes = 0;
-	}
 	test_phase_note_overwrite_end(stats_ftl, test_phase_overwrite_tracked);
 	return true;
 }

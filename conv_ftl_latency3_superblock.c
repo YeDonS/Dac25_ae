@@ -8031,7 +8031,8 @@ static struct ppa get_new_slc_page(struct conv_ftl *conv_ftl, uint32_t preferred
 		return ppa;
 	}
 
-	NVMEV_ERROR("No free SLC page in baseline host-active SB pool!\n");
+	printk_ratelimited(KERN_ERR
+			   "NVMeVirt: No free SLC page in baseline host-active SB pool!\n");
 	return (struct ppa){ .ppa = UNMAPPED_PPA };
 }
 
@@ -9612,7 +9613,8 @@ static void latency3_bg_slc_maint_run(struct conv_ftl *conv_ftl)
 		latency3_read_priority_note_progress(conv_ftl);
 		return;
 	}
-	force_progress = latency3_read_priority_should_force_progress(conv_ftl, level);
+	force_progress = (level >= SLC_LEVEL_EMERGENCY) ||
+		latency3_read_priority_should_force_progress(conv_ftl, level);
 
 	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
 	if (!force_progress && latency3_read_priority_should_yield(conv_ftl)) {
@@ -10544,7 +10546,7 @@ retry_wb_alloc:
 
 		{
 			int slc_retry = 0;
-			const int SLC_MAX_RETRIES = 8;
+			const int SLC_INITIAL_RETRIES = 8;
 			uint32_t preferred_slc_blk = U32_MAX;
 
 			if (prev_link_lpn != INVALID_LPN &&
@@ -10568,26 +10570,36 @@ retry_wb_alloc:
 					slc_maint_kick(conv_ftl);
 			}
 
-				ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
-				while (!mapped_ppa(&ppa) && slc_retry < SLC_MAX_RETRIES) {
-					int32_t target_die = conv_ftl->die_count ?
-						(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
+			ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
+			while (!mapped_ppa(&ppa)) {
+				int32_t target_die = conv_ftl->die_count ?
+					(int32_t)(conv_ftl->lunpointer % conv_ftl->die_count) : -1;
 
-					slc_retry++;
-					maintain_slc_for_allocation_failure(conv_ftl, target_die,
-									    &nsecs_latest);
-					swr.stime = max(swr.stime, nsecs_latest);
-					cond_resched();
-					ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
+				slc_retry++;
+				maintain_slc_for_allocation_failure(conv_ftl, target_die,
+								    &nsecs_latest);
+				swr.stime = max(swr.stime, nsecs_latest);
+				if (slc_retry == SLC_INITIAL_RETRIES ||
+				    (slc_retry > SLC_INITIAL_RETRIES &&
+				     (slc_retry % 100) == 0)) {
+					struct line_pool_stats slc_wait_stats;
+
+					collect_slc_stats(conv_ftl, &slc_wait_stats);
+					NVMEV_WARN("SLC allocation waiting retry=%d lpn=%llu free=%u/%u victim_q=%u active=%u\n",
+						   slc_retry,
+						   (unsigned long long)local_lpn,
+						   slc_wait_stats.free,
+						   slc_wait_stats.total,
+						   conv_ftl->slc_sb_migrated_victim_count,
+						   conv_ftl->active_sb_count);
 				}
+				if (slc_retry >= SLC_INITIAL_RETRIES)
+					msleep(1);
+				else
+					cond_resched();
+				ppa = get_new_slc_page(conv_ftl, preferred_slc_blk);
 			}
-
-        if (!mapped_ppa(&ppa)) {
-            NVMEV_ERROR("SLC exhausted, write failed for LPN %lld (after retries)\n", local_lpn);
-            ret->status = NVME_SC_WRITE_FAULT;
-            ret->nsecs_target = nsecs_latest;
-            goto slc_fail_release;
-        }
+		}
 
 		if (aff_target_valid) {
 			uint32_t actual_die = encode_die(spp, &ppa);
@@ -10752,15 +10764,6 @@ retry_wb_alloc:
 			   conv_ftl->slc_write_cnt, conv_ftl->qlc_write_cnt, conv_ftl->migration_cnt);
 	}
 
-	test_phase_note_overwrite_end(stats_ftl, test_phase_overwrite_tracked);
-	return true;
-
-slc_fail_release:
-	if (stripe_bytes > 0) {
-		enqueue_writeback_io_req(req->sq_id, nsecs_latest, wbuf,
-				(unsigned int)stripe_bytes);
-		stripe_bytes = 0;
-	}
 	test_phase_note_overwrite_end(stats_ftl, test_phase_overwrite_tracked);
 	return true;
 }
