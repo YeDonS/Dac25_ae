@@ -11418,10 +11418,10 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         ret->nsecs_target = req->nsecs_start;
         return true; /* Return completion with error to avoid host timeout */
     }
-    {		            /* 写缓冲不足时短暂重试，避免瞬间满导致失败 */
+    {		            /* 写缓冲不足时等待释放；不能把瞬时背压上报成介质写失败。 */
         uint64_t needed = LBA_TO_BYTE(nr_lba);
-        int wb_retry = 0;
-        const int WB_MAX_RETRIES = 100;    /* 最多重试 100 次 */
+        unsigned int wb_retry = 0;
+        const unsigned int WB_WARN_RETRIES = 1000; /* 每约 1s 告警一次 */
         const int WB_RETRY_US = 1000;      /* 每次等待 1ms */
 
 	if (spp->pgsz) {
@@ -11444,17 +11444,13 @@ retry_wb_alloc:
 	NVMEV_DEBUG("[DEBUG] conv_write: buffer alloc size = %u, needed = %llu\n",
 		    allocated_buf_size, needed);
 	if (allocated_buf_size < needed) {
-		if (wb_retry < WB_MAX_RETRIES) {
-			wb_retry++;
-			usleep_range(WB_RETRY_US, WB_RETRY_US + 100);
-			cond_resched();
-			goto retry_wb_alloc;
-		}
-		NVMEV_ERROR("write buffer allocation failed after %d retries (need=%llu)\n",
-			    WB_MAX_RETRIES, needed);
-		ret->status = NVME_SC_WRITE_FAULT;
-		ret->nsecs_target = req->nsecs_start;
-		return true; /* Complete with error */
+		wb_retry++;
+		if (wb_retry == 100 || (wb_retry % WB_WARN_RETRIES) == 0)
+			NVMEV_WARN("write buffer allocation waiting retry=%u need=%llu size=%zu\n",
+				   wb_retry, needed, wbuf->size);
+		usleep_range(WB_RETRY_US, WB_RETRY_US + 100);
+		cond_resched();
+		goto retry_wb_alloc;
 	}
    }
 	nsecs_latest = ssd_advance_write_buffer_low_priority(conv_ftl->ssd,
