@@ -39,6 +39,8 @@ struct buffer;
 
 extern bool io_using_dma;
 
+static void __fill_cq_result(struct nvmev_proc_table *proc_entry);
+
 static inline unsigned int __get_io_worker(int sqid)
 {
 #ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
@@ -228,6 +230,21 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 		if (printk_ratelimit())
 			NVMEV_ERROR("proc queue full sqid=%d entry=%u next=%u free_seq=%u\n",
 				    sqid, entry, pi->proc_table[entry].next, pi->free_seq);
+		{
+			struct nvmev_proc_table fallback = {
+				.sqid = sqid,
+				.cqid = cqid,
+				.sq_entry = sq_entry,
+				.command_id = sq_entry(sq_entry).common.command_id,
+				.status = ret->status,
+			};
+
+			if (io_using_dma)
+				__do_perform_io_using_dma(sqid, sq_entry);
+			else
+				__do_perform_io(sqid, sq_entry);
+			__fill_cq_result(&fallback);
+		}
 		pi->free_seq = entry;
 		return;
 	}
@@ -314,6 +331,17 @@ static void __enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target
 
 	if (pi->proc_table[entry].next >= NR_MAX_PARALLEL_IO) {
 		WARN_ON_ONCE("IO queue is almost full");
+#if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS))
+		if (write_buffer && buffs_to_release) {
+			if (printk_ratelimit())
+				NVMEV_ERROR("writeback proc queue full; releasing %u bytes immediately to avoid write-buffer leak\n",
+					    buffs_to_release);
+			buffer_release(write_buffer, buffs_to_release);
+		}
+#else
+		(void)write_buffer;
+		(void)buffs_to_release;
+#endif
 		pi->free_seq = entry;
 		return;
 	}

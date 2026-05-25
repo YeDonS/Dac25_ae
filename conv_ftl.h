@@ -358,7 +358,6 @@ struct conv_ftl {
 	uint32_t qlc_closed_repromote_tail;
 	uint32_t qlc_closed_repromote_count;
 	uint32_t qlc_closed_repromote_size;
-	uint32_t qlc_closed_repromote_since_scan;
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */

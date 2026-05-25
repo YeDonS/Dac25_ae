@@ -3148,7 +3148,7 @@ static void latency3_read_priority_note_progress(struct conv_ftl *conv_ftl)
 
 static void test_phase_note_host_read_nand(struct conv_ftl *stats_ftl, bool from_slc)
 {
-	if (!test_phase_enabled(stats_ftl))
+	if (!stats_ftl)
 		return;
 
 	atomic64_inc(&stats_ftl->test_phase_host_read_nand_ops);
@@ -3156,6 +3156,8 @@ static void test_phase_note_host_read_nand(struct conv_ftl *stats_ftl, bool from
 		atomic64_inc(&stats_ftl->test_phase_host_read_slc_ops);
 	else
 		atomic64_inc(&stats_ftl->test_phase_host_read_qlc_ops);
+	if (!test_phase_enabled(stats_ftl))
+		return;
 	if (atomic_read(&stats_ftl->test_phase_active_bg_ops) > 0)
 		atomic64_inc(&stats_ftl->test_phase_read_nand_bg_overlap_ops);
 }
@@ -9318,9 +9320,43 @@ static int migrate_page_to_qlc(struct conv_ftl *conv_ftl, uint64_t lpn, struct p
 
     conv_ftl->migration_cnt++;
     
-    NVMEV_DEBUG("Migrated LPN %llu from SLC to QLC (zone_hint=%u)\n", lpn, zone_hint);
-    return 0;
+	    NVMEV_DEBUG("Migrated LPN %llu from SLC to QLC (zone_hint=%u)\n", lpn, zone_hint);
+	    return 0;
 }
+
+#if NVMEV_ENABLE_READ_REPROMOTION && NVMEV_ENABLE_DIE_BATCHED_REPROMOTION
+static void repromote_requeue_unconsumed(struct conv_ftl *conv_ftl,
+					 const uint64_t *lpns,
+					 const struct ppa *ppas,
+					 const bool *consumed,
+					 uint32_t pulled)
+{
+	uint32_t n;
+
+	if (!conv_ftl || !lpns || !ppas || !consumed)
+		return;
+
+	spin_lock(&conv_ftl->repromote_queue_lock);
+	for (n = pulled; n > 0; n--) {
+		uint32_t idx = n - 1;
+		uint32_t new_head;
+
+		if (consumed[idx])
+			continue;
+		new_head = (conv_ftl->repromote_head + REPROMOTE_QUEUE_SIZE - 1) %
+			   REPROMOTE_QUEUE_SIZE;
+		if (new_head == conv_ftl->repromote_tail) {
+			if (printk_ratelimit())
+				NVMEV_WARN("repromote queue full while restoring yielded work\n");
+			break;
+		}
+		conv_ftl->repromote_head = new_head;
+		conv_ftl->repromote_lpns[new_head] = lpns[idx];
+		conv_ftl->repromote_ppas[new_head] = ppas[idx];
+	}
+	spin_unlock(&conv_ftl->repromote_queue_lock);
+}
+#endif
 
 static void bg_repromotion_worker(struct work_struct *work)
 {
@@ -9381,11 +9417,13 @@ static void bg_repromotion_worker(struct work_struct *work)
 			uint32_t idx = (anchor + i) % pulled;
 			uint32_t cur_chain;
 
-			if (latency3_read_priority_should_yield(conv_ftl)) {
-				latency3_read_priority_note_yield(conv_ftl);
-				latency3_repromotion_delayed_requeue(conv_ftl);
-				goto repromote_out;
-			}
+				if (latency3_read_priority_should_yield(conv_ftl)) {
+					latency3_read_priority_note_yield(conv_ftl);
+					repromote_requeue_unconsumed(conv_ftl, lpns, ppas,
+								    consumed, pulled);
+					latency3_repromotion_delayed_requeue(conv_ftl);
+					goto repromote_out;
+				}
 			if (consumed[idx])
 				continue;
 			cur_chain = chain_id_for_lpn(conv_ftl, lpns[idx]);
@@ -9810,40 +9848,19 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 					}
 				}
 
-				/* 根据页面位置调整读延迟 */
-				uint64_t original_stime = srd.stime;
-				
-				if (issue_prev) {
-					bool from_slc;
-					/* 检查页面是否在 SLC 或 QLC 中 */
-					from_slc = is_slc_block(conv_ftl, prev_ppa.g.blk);
-					if (from_slc) {
-						/* SLC 读延迟 - 使用原有的延迟参数 */
-						if (xfer_size == 4096) {
-							srd.stime += spp->pg_4kb_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-						} else {
-							srd.stime += spp->pg_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-						}
-					} else {
-						/* QLC 读延迟 - 使用动态区域 */
-						uint8_t zone = get_qlc_zone_for_read(conv_ftl, &prev_ppa);
-						if (xfer_size == 4096) {
-							srd.stime += spp->qlc_pg_4kb_rd_lat[zone];
-						} else {
-							srd.stime += spp->qlc_pg_rd_lat[zone];
-						}
-					}
-					
-					srd.xfer_size = xfer_size;
-					srd.ppa = &prev_ppa;
+					if (issue_prev) {
+						bool from_slc;
+
+						from_slc = is_slc_block(conv_ftl, prev_ppa.g.blk);
+						
+						srd.xfer_size = xfer_size;
+						srd.ppa = &prev_ppa;
 					nsecs_completed =
 						ssd_advance_nand_read_priority(conv_ftl->ssd, &srd);
-					test_phase_note_host_read_nand(stats_ftl, from_slc);
-					nsecs_latest = max(nsecs_completed, nsecs_latest);
+						test_phase_note_host_read_nand(stats_ftl, from_slc);
+						nsecs_latest = max(nsecs_completed, nsecs_latest);
+					}
 				}
-
-				srd.stime = original_stime;  /* 恢复原始时间 */
-			}
 
 			xfer_size = spp->pgsz;
 			prev_ppa = cur_ppa;
@@ -9866,30 +9883,13 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 				}
 			}
 
-			/* 根据页面位置调整读延迟 */
-			if (issue_prev) {
-				bool from_slc;
+				if (issue_prev) {
+					bool from_slc;
 
-				from_slc = is_slc_block(conv_ftl, prev_ppa.g.blk);
-				if (from_slc) {
-					/* SLC 读延迟 */
-					if (xfer_size == 4096) {
-						srd.stime += spp->pg_4kb_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-					} else {
-						srd.stime += spp->pg_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-					}
-				} else {
-					/* QLC 读延迟 */
-					uint8_t zone = get_qlc_zone_for_read(conv_ftl, &prev_ppa);
-					if (xfer_size == 4096) {
-						srd.stime += spp->qlc_pg_4kb_rd_lat[zone];
-					} else {
-						srd.stime += spp->qlc_pg_rd_lat[zone];
-					}
-				}
-				
-				srd.xfer_size = xfer_size;
-				srd.ppa = &prev_ppa;
+					from_slc = is_slc_block(conv_ftl, prev_ppa.g.blk);
+					
+					srd.xfer_size = xfer_size;
+					srd.ppa = &prev_ppa;
 				nsecs_completed =
 					ssd_advance_nand_read_priority(conv_ftl->ssd, &srd);
 				test_phase_note_host_read_nand(stats_ftl, from_slc);
@@ -10131,7 +10131,8 @@ static bool qlc_closed_line_candidate(struct conv_ftl *conv_ftl,
 static uint32_t migrate_hot_closed_qlc_line_to_slc(struct conv_ftl *conv_ftl,
 						   uint32_t die, uint32_t blk,
 						   uint64_t hot_th,
-						   uint32_t budget)
+						   uint32_t budget,
+						   bool *yielded)
 {
 	struct heat_tracking *ht = &conv_ftl->heat_track;
 	struct ssdparams *spp;
@@ -10140,6 +10141,8 @@ static uint32_t migrate_hot_closed_qlc_line_to_slc(struct conv_ftl *conv_ftl,
 	uint32_t pg_idx;
 
 	if (!conv_ftl || !conv_ftl->ssd || !ht || !ht->access_count || !budget)
+		return 0;
+	if (yielded && *yielded)
 		return 0;
 	if (!qlc_closed_line_candidate(conv_ftl, die, blk))
 		return 0;
@@ -10153,6 +10156,12 @@ static uint32_t migrate_hot_closed_qlc_line_to_slc(struct conv_ftl *conv_ftl,
 		struct ppa cur;
 		uint64_t lpn;
 		uint64_t acc;
+
+		if (latency3_read_priority_should_yield(conv_ftl)) {
+			if (yielded)
+				*yielded = true;
+			break;
+		}
 
 		ppa.g.ch = ch;
 		ppa.g.lun = lun;
@@ -10190,7 +10199,8 @@ static uint32_t migrate_hot_closed_qlc_line_to_slc(struct conv_ftl *conv_ftl,
 static uint32_t migrate_hot_closed_qlc_sb_to_slc(struct conv_ftl *conv_ftl,
 						 uint32_t blk,
 						 uint64_t hot_th,
-						 uint32_t budget)
+						 uint32_t budget,
+						 bool *yielded)
 {
 	uint32_t die;
 	uint32_t moved = 0;
@@ -10200,10 +10210,14 @@ static uint32_t migrate_hot_closed_qlc_sb_to_slc(struct conv_ftl *conv_ftl,
 		return 0;
 
 	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
-	for (die = 0; die < die_count && moved < budget; die++)
+	for (die = 0; die < die_count && moved < budget; die++) {
+		if (yielded && *yielded)
+			break;
 		moved += migrate_hot_closed_qlc_line_to_slc(conv_ftl, die, blk,
 							    hot_th,
-							    budget - moved);
+							    budget - moved,
+							    yielded);
+	}
 	return moved;
 }
 
@@ -10215,6 +10229,7 @@ static uint32_t migrate_hot_from_closed_qlc(struct conv_ftl *conv_ftl)
 	uint32_t budget;
 	uint32_t scanned = 0;
 	uint32_t moved = 0;
+	bool yielded = false;
 
 	if (!conv_ftl || !conv_ftl->ssd || !conv_ftl->qlc_closed_repromote_size)
 		return 0;
@@ -10231,12 +10246,14 @@ static uint32_t migrate_hot_from_closed_qlc(struct conv_ftl *conv_ftl)
 	if (hot_th < REPROMOTE_HEAT_FLOOR)
 		hot_th = REPROMOTE_HEAT_FLOOR;
 
-	budget = qlc_pages_per_superblock(conv_ftl);
+	budget = conv_ftl->repromote_budget_per_run ?
+		conv_ftl->repromote_budget_per_run : qlc_pages_per_superblock(conv_ftl);
+	if (qlc_pages_per_superblock(conv_ftl))
+		budget = min_t(uint32_t, budget, qlc_pages_per_superblock(conv_ftl));
 	if (!budget)
-		budget = conv_ftl->repromote_budget_per_run ?
-			conv_ftl->repromote_budget_per_run : 1;
+		budget = 1;
 
-	while (scanned < conv_ftl->qlc_blks_per_pl && moved < budget) {
+	while (scanned < conv_ftl->qlc_blks_per_pl && moved < budget && !yielded) {
 		uint32_t blk = conv_ftl->slc_blks_per_pl + scanned;
 		uint32_t one_moved;
 
@@ -10245,15 +10262,21 @@ static uint32_t migrate_hot_from_closed_qlc(struct conv_ftl *conv_ftl)
 			continue;
 		one_moved = migrate_hot_closed_qlc_sb_to_slc(conv_ftl, blk,
 							     hot_th,
-							     budget - moved);
+							     budget - moved,
+							     &yielded);
 		moved += one_moved;
+	}
+
+	if (yielded) {
+		latency3_read_priority_note_yield(conv_ftl);
+		latency3_repromotion_delayed_requeue(conv_ftl);
 	}
 
 	if (scanned) {
 		conv_ftl->qlc_closed_repromote_scans++;
 		conv_ftl->qlc_closed_repromote_pages += moved;
-		NVMEV_DEBUG("[REPROMOTE-BASELINE-CLOSED] hot_th=%llu scanned_sb=%u migrated=%u budget=%u\n",
-			    hot_th, scanned, moved, budget);
+		NVMEV_DEBUG("[REPROMOTE-BASELINE-CLOSED] hot_th=%llu scanned_sb=%u migrated=%u budget=%u yielded=%u\n",
+			    hot_th, scanned, moved, budget, yielded ? 1U : 0U);
 	}
 	return moved;
 }
@@ -10353,22 +10376,11 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         ret->nsecs_target = req->nsecs_start;
         return true; /* Return completion with error to avoid host timeout */
     }
-/*
-    allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
-	NVMEV_DEBUG("[DEBUG] conv_write: buffer alloc size = %u, needed = %llu\n", allocated_buf_size, LBA_TO_BYTE(nr_lba));
-    if (allocated_buf_size < LBA_TO_BYTE(nr_lba)) {
-        NVMEV_DEBUG("[DEBUG] conv_write: BUFFER ALLOCATION FAILED - insufficient write buffer (%u < %llu)\n",
-                    allocated_buf_size, LBA_TO_BYTE(nr_lba));
-        ret->status = NVME_SC_WRITE_FAULT;
-        ret->nsecs_target = req->nsecs_start;
-        return true;  Complete with error */
-    
-          
     {		            /* 写缓冲不足时短暂重试，避免瞬间满导致失败 */
         uint64_t needed = LBA_TO_BYTE(nr_lba);
         int wb_retry = 0;
         const int WB_MAX_RETRIES = 100;    /* 最多重试 100 次 */
-        const int WB_RETRY_US = 1000000;      /* 每次等待 1ms */
+        const int WB_RETRY_US = 1000;      /* 每次等待 1ms */
 
 	if (spp->pgsz) {
 		uint64_t remainder = needed % spp->pgsz;

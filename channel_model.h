@@ -10,6 +10,7 @@
 #define UNIT_TIME_INTERVAL (2000ULL) //ns
 #define UNIT_XFER_SIZE (128ULL) //bytes
 #define UNIT_XFER_CREDITS (1) //credits needed to transfer data(UNIT_XFER_SIZE)
+#define CHMODEL_SCAN_LIMIT (4096U)
 
 #define SIZE_OF_CREDIT_T 1
 
@@ -35,6 +36,7 @@ struct channel_model {
 	uint32_t max_credits;
 	uint32_t command_credits;
 	uint32_t xfer_lat; /*XKB NAND CH transfer time in nanoseconds*/
+	uint64_t overflow_tail; /* serialized tail for requests beyond credit-ring horizon */
 	credit_t *avail_credits;
 	spinlock_t lock;
 };

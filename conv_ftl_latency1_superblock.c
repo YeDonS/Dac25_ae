@@ -3027,7 +3027,7 @@ static void test_phase_note_bg_end(struct conv_ftl *conv_ftl, bool tracked)
 
 static void test_phase_note_host_read_nand(struct conv_ftl *stats_ftl, bool from_slc)
 {
-	if (!test_phase_enabled(stats_ftl))
+	if (!stats_ftl)
 		return;
 
 	atomic64_inc(&stats_ftl->test_phase_host_read_nand_ops);
@@ -3035,6 +3035,8 @@ static void test_phase_note_host_read_nand(struct conv_ftl *stats_ftl, bool from
 		atomic64_inc(&stats_ftl->test_phase_host_read_slc_ops);
 	else
 		atomic64_inc(&stats_ftl->test_phase_host_read_qlc_ops);
+	if (!test_phase_enabled(stats_ftl))
+		return;
 	if (atomic_read(&stats_ftl->test_phase_active_bg_ops) > 0)
 		atomic64_inc(&stats_ftl->test_phase_read_nand_bg_overlap_ops);
 }
@@ -9541,39 +9543,18 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 					}
 				}
 
-				/* 根据页面位置调整读延迟 */
-				uint64_t original_stime = srd.stime;
-				
-				if (issue_prev) {
-					bool from_slc;
-					/* 检查页面是否在 SLC 或 QLC 中 */
-					from_slc = is_slc_block(conv_ftl, prev_ppa.g.blk);
-					if (from_slc) {
-						/* SLC 读延迟 - 使用原有的延迟参数 */
-						if (xfer_size == 4096) {
-							srd.stime += spp->pg_4kb_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-						} else {
-							srd.stime += spp->pg_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-						}
-					} else {
-						/* QLC 读延迟 - 使用动态区域 */
-						uint8_t zone = get_qlc_zone_for_read(conv_ftl, &prev_ppa);
-						if (xfer_size == 4096) {
-							srd.stime += spp->qlc_pg_4kb_rd_lat[zone];
-						} else {
-							srd.stime += spp->qlc_pg_rd_lat[zone];
-						}
-					}
-					
-					srd.xfer_size = xfer_size;
-					srd.ppa = &prev_ppa;
-					nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
-					test_phase_note_host_read_nand(stats_ftl, from_slc);
-					nsecs_latest = max(nsecs_completed, nsecs_latest);
-				}
+					if (issue_prev) {
+						bool from_slc;
 
-				srd.stime = original_stime;  /* 恢复原始时间 */
-			}
+						from_slc = is_slc_block(conv_ftl, prev_ppa.g.blk);
+						
+						srd.xfer_size = xfer_size;
+						srd.ppa = &prev_ppa;
+					nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
+						test_phase_note_host_read_nand(stats_ftl, from_slc);
+						nsecs_latest = max(nsecs_completed, nsecs_latest);
+					}
+				}
 
 			xfer_size = spp->pgsz;
 			prev_ppa = cur_ppa;
@@ -9596,30 +9577,13 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 				}
 			}
 
-			/* 根据页面位置调整读延迟 */
-			if (issue_prev) {
-				bool from_slc;
+				if (issue_prev) {
+					bool from_slc;
 
-				from_slc = is_slc_block(conv_ftl, prev_ppa.g.blk);
-				if (from_slc) {
-					/* SLC 读延迟 */
-					if (xfer_size == 4096) {
-						srd.stime += spp->pg_4kb_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-					} else {
-						srd.stime += spp->pg_rd_lat[get_cell(conv_ftl->ssd, &prev_ppa)];
-					}
-				} else {
-					/* QLC 读延迟 */
-					uint8_t zone = get_qlc_zone_for_read(conv_ftl, &prev_ppa);
-					if (xfer_size == 4096) {
-						srd.stime += spp->qlc_pg_4kb_rd_lat[zone];
-					} else {
-						srd.stime += spp->qlc_pg_rd_lat[zone];
-					}
-				}
-				
-				srd.xfer_size = xfer_size;
-				srd.ppa = &prev_ppa;
+					from_slc = is_slc_block(conv_ftl, prev_ppa.g.blk);
+					
+					srd.xfer_size = xfer_size;
+					srd.ppa = &prev_ppa;
 				nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
 				test_phase_note_host_read_nand(stats_ftl, from_slc);
 				nsecs_latest = max(nsecs_completed, nsecs_latest);
@@ -10080,22 +10044,11 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
         ret->nsecs_target = req->nsecs_start;
         return true; /* Return completion with error to avoid host timeout */
     }
-/*
-    allocated_buf_size = buffer_allocate(wbuf, LBA_TO_BYTE(nr_lba));
-	NVMEV_DEBUG("[DEBUG] conv_write: buffer alloc size = %u, needed = %llu\n", allocated_buf_size, LBA_TO_BYTE(nr_lba));
-    if (allocated_buf_size < LBA_TO_BYTE(nr_lba)) {
-        NVMEV_DEBUG("[DEBUG] conv_write: BUFFER ALLOCATION FAILED - insufficient write buffer (%u < %llu)\n",
-                    allocated_buf_size, LBA_TO_BYTE(nr_lba));
-        ret->status = NVME_SC_WRITE_FAULT;
-        ret->nsecs_target = req->nsecs_start;
-        return true;  Complete with error */
-    
-          
     {		            /* 写缓冲不足时短暂重试，避免瞬间满导致失败 */
         uint64_t needed = LBA_TO_BYTE(nr_lba);
         int wb_retry = 0;
         const int WB_MAX_RETRIES = 100;    /* 最多重试 100 次 */
-        const int WB_RETRY_US = 1000000;      /* 每次等待 1ms */
+        const int WB_RETRY_US = 1000;      /* 每次等待 1ms */
 
 	if (spp->pgsz) {
 		uint64_t remainder = needed % spp->pgsz;
