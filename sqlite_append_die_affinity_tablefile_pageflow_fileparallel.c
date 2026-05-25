@@ -202,6 +202,7 @@ struct workload_options {
 	unsigned int window_passes_per_round;
 	unsigned int interleave_pages;
 	unsigned int interleave_reads;
+	bool init_drop_cache_each_read;
 	unsigned int cold_concurrent_threads;
 	enum cold_full_read_mode cold_full_read_mode;
 	unsigned int cold_full_read_iters;
@@ -340,6 +341,7 @@ static const struct option long_opts[] = {
 	{"window-passes-per-round", required_argument, NULL, 1028},
 	{"interleave-pages", required_argument, NULL, 1006},
 	{"interleave-reads", required_argument, NULL, 1007},
+	{"init-drop-cache-each-read", no_argument, NULL, 1045},
 	{"cold-concurrent-threads", required_argument, NULL, 1008},
 	{"ftl-host-page-bytes", required_argument, NULL, 1009},
 	{"page-die-path", required_argument, NULL, 1010},
@@ -613,7 +615,18 @@ static int write_string_file(const char *path, const char *value)
 	return 0;
 }
 
-static int read_ftl_read_heat_stats(const char *path, struct ftl_read_heat_stats *stats)
+static void add_ftl_read_heat_stats(struct ftl_read_heat_stats *dst,
+				    const struct ftl_read_heat_stats *src)
+{
+	if (!dst || !src)
+		return;
+	dst->global_read_sum += src->global_read_sum;
+	dst->global_valid_pg_cnt += src->global_valid_pg_cnt;
+	dst->host_read_nand_ops += src->host_read_nand_ops;
+}
+
+static int read_ftl_read_heat_stats_file(const char *path,
+					 struct ftl_read_heat_stats *stats)
 {
 	FILE *fp;
 	char line[160];
@@ -641,6 +654,105 @@ static int read_ftl_read_heat_stats(const char *path, struct ftl_read_heat_stats
 	}
 
 	fclose(fp);
+	return 0;
+}
+
+static int make_ftl_stats_sibling_path(const char *path, unsigned int ftl_idx,
+				       char *out, size_t out_sz)
+{
+	const char *tail;
+	const char *dir_start;
+	const char *p;
+	int written;
+
+	if (!path || !out || out_sz == 0)
+		return -EINVAL;
+
+	tail = strrchr(path, '/');
+	if (!tail || strcmp(tail + 1, "test_phase_stats") != 0)
+		return -EINVAL;
+
+	dir_start = tail;
+	while (dir_start > path && dir_start[-1] != '/')
+		dir_start--;
+	if (tail - dir_start < 4 || strncmp(dir_start, "ftl", 3) != 0)
+		return -EINVAL;
+	for (p = dir_start + 3; p < tail; p++) {
+		if (*p < '0' || *p > '9')
+			return -EINVAL;
+	}
+
+	written = snprintf(out, out_sz, "%.*sftl%u%s",
+			   (int)(dir_start - path), path, ftl_idx, tail);
+	if (written < 0 || (size_t)written >= out_sz)
+		return -ENAMETOOLONG;
+	return 0;
+}
+
+static int make_ftl_debugfs_sibling_path(const char *path, const char *leaf,
+					 unsigned int ftl_idx, char *out,
+					 size_t out_sz)
+{
+	const char *tail;
+	const char *dir_start;
+	const char *p;
+	int written;
+
+	if (!path || !leaf || !out || out_sz == 0)
+		return -EINVAL;
+
+	tail = strrchr(path, '/');
+	if (!tail || strcmp(tail + 1, leaf) != 0)
+		return -EINVAL;
+
+	dir_start = tail;
+	while (dir_start > path && dir_start[-1] != '/')
+		dir_start--;
+	if (tail - dir_start < 4 || strncmp(dir_start, "ftl", 3) != 0)
+		return -EINVAL;
+	for (p = dir_start + 3; p < tail; p++) {
+		if (*p < '0' || *p > '9')
+			return -EINVAL;
+	}
+
+	written = snprintf(out, out_sz, "%.*sftl%u%s",
+			   (int)(dir_start - path), path, ftl_idx, tail);
+	if (written < 0 || (size_t)written >= out_sz)
+		return -ENAMETOOLONG;
+	return 0;
+}
+
+static int read_ftl_read_heat_stats(const char *path, struct ftl_read_heat_stats *stats)
+{
+	struct ftl_read_heat_stats total;
+	unsigned int found = 0;
+	char sibling[PATH_MAX];
+
+	if (!path || !*path || !stats)
+		return -EINVAL;
+
+	memset(stats, 0, sizeof(*stats));
+	if (make_ftl_stats_sibling_path(path, 0, sibling, sizeof(sibling)) != 0)
+		return read_ftl_read_heat_stats_file(path, stats);
+
+	memset(&total, 0, sizeof(total));
+	for (unsigned int i = 0; i < 256; i++) {
+		struct ftl_read_heat_stats one;
+
+		if (make_ftl_stats_sibling_path(path, i, sibling, sizeof(sibling)) != 0)
+			break;
+		if (read_ftl_read_heat_stats_file(sibling, &one) != 0) {
+			if (found)
+				break;
+			return read_ftl_read_heat_stats_file(path, stats);
+		}
+		add_ftl_read_heat_stats(&total, &one);
+		found++;
+	}
+
+	if (!found)
+		return read_ftl_read_heat_stats_file(path, stats);
+	*stats = total;
 	return 0;
 }
 
@@ -698,10 +810,39 @@ static int set_test_phase_state(const struct workload_options *opts,
 {
 	const char *value = enabled ? "1" : "0";
 	int rc;
+	unsigned int siblings_set = 0;
+	char sibling[PATH_MAX];
 
 	if (!opts || !opts->test_phase_path || !opts->test_phase_path[0])
 		return -EINVAL;
 
+	if (make_ftl_debugfs_sibling_path(opts->test_phase_path, "test_phase", 0,
+					  sibling, sizeof(sibling)) == 0) {
+		for (unsigned int i = 0; i < 256; i++) {
+			if (make_ftl_debugfs_sibling_path(opts->test_phase_path,
+							 "test_phase", i,
+							 sibling,
+							 sizeof(sibling)) != 0)
+				break;
+			rc = write_string_file(sibling, value);
+			if (rc != 0) {
+				if (siblings_set)
+					break;
+				goto single_path;
+			}
+			siblings_set++;
+		}
+		if (siblings_set) {
+			printf("[sqlite_init] test_phase=%s phase=%s paths=%u first=%s\n",
+			       enabled ? "on" : "off",
+			       phase ? phase : "phase",
+			       siblings_set,
+			       opts->test_phase_path);
+			return 0;
+		}
+	}
+
+single_path:
 	rc = write_string_file(opts->test_phase_path, value);
 	if (rc != 0) {
 		fprintf(stderr,
@@ -723,10 +864,38 @@ static int set_test_phase_state(const struct workload_options *opts,
 static int advance_heat_epoch(const struct workload_options *opts, const char *phase)
 {
 	int rc;
+	unsigned int siblings_set = 0;
+	char sibling[PATH_MAX];
 
 	if (!opts || !opts->heat_epoch_path || !opts->heat_epoch_path[0])
 		return 0;
 
+	if (make_ftl_debugfs_sibling_path(opts->heat_epoch_path, "heat_epoch", 0,
+					  sibling, sizeof(sibling)) == 0) {
+		for (unsigned int i = 0; i < 256; i++) {
+			if (make_ftl_debugfs_sibling_path(opts->heat_epoch_path,
+							 "heat_epoch", i,
+							 sibling,
+							 sizeof(sibling)) != 0)
+				break;
+			rc = write_string_file(sibling, "1");
+			if (rc != 0) {
+				if (siblings_set)
+					break;
+				goto single_path;
+			}
+			siblings_set++;
+		}
+		if (siblings_set) {
+			printf("[sqlite_init] heat_epoch_advance phase=%s paths=%u first=%s\n",
+			       phase ? phase : "phase",
+			       siblings_set,
+			       opts->heat_epoch_path);
+			return 0;
+		}
+	}
+
+single_path:
 	rc = write_string_file(opts->heat_epoch_path, "1");
 	if (rc != 0) {
 		fprintf(stderr,
@@ -2931,9 +3100,56 @@ static void drop_file_cache(const char *path)
 #endif
 }
 
+static int scan_table_file_lower_bound_once(const char *db_path, int lower_bound,
+					    unsigned long long *rows_read)
+{
+	sqlite3 *db = NULL;
+	sqlite3_stmt *stmt = NULL;
+	const char *sql =
+		"SELECT str1,str2,str3,str4 FROM DB1 WHERE id >= ? ORDER BY id;";
+	unsigned long long rows = 0;
+	int rc;
+	int ret = 0;
+
+	if (!db_path || !*db_path)
+		return -EINVAL;
+
+	rc = sqlite3_open_v2(db_path, &db,
+			     SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+	if (rc != SQLITE_OK) {
+		if (db)
+			sqlite3_close(db);
+		return -EIO;
+	}
+	sqlite3_busy_timeout(db, 30000);
+	sqlite3_exec(db, "PRAGMA query_only = ON;", NULL, NULL, NULL);
+	sqlite3_exec(db, "PRAGMA cache_size = -64;", NULL, NULL, NULL);
+
+	rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		ret = -EIO;
+		goto out;
+	}
+	sqlite3_bind_int(stmt, 1, lower_bound);
+	while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
+		rows++;
+	if (rc != SQLITE_DONE)
+		ret = -EIO;
+	else if (rows_read)
+		*rows_read = rows;
+
+out:
+	if (stmt)
+		sqlite3_finalize(stmt);
+	if (db)
+		sqlite3_close(db);
+	return ret;
+}
+
 static int run_read_event(unsigned int event_id,
 			  const struct dataset_layout *layout,
 			  struct table_file_state *tables,
+			  const struct workload_options *opts,
 			  const unsigned int *read_plan,
 			  const char *test_phase_stats_path,
 			  double *table_latency,
@@ -2944,6 +3160,8 @@ static int run_read_event(unsigned int event_id,
 	struct ftl_read_heat_stats after_stats;
 	bool have_before_stats = false;
 	double start = monotonic_sec();
+	unsigned long long sqlite_rows_seen = 0;
+	unsigned long long sqlite_scan_ops = 0;
 
 	if (read_ftl_read_heat_stats(test_phase_stats_path, &before_stats) == 0)
 		have_before_stats = true;
@@ -2958,20 +3176,34 @@ static int run_read_event(unsigned int event_id,
 			continue;
 
 		lower_bound = table->next_record_id + 1;
-		drop_file_cache(table->db_path);
+		if (!opts || !opts->init_drop_cache_each_read)
+			drop_file_cache(table->db_path);
 
 		for (unsigned int iter = 0; iter < reads; ++iter) {
 			double t0 = monotonic_sec();
+			unsigned long long rows_this_scan = 0;
 			int rc;
 
-			sqlite3_reset(table->scan_stmt);
-			sqlite3_clear_bindings(table->scan_stmt);
-			sqlite3_bind_int(table->scan_stmt, 1, lower_bound);
-			while ((rc = sqlite3_step(table->scan_stmt)) == SQLITE_ROW)
-				;
-			if (rc != SQLITE_DONE)
-				return -EIO;
+			if (opts && opts->init_drop_cache_each_read)
+				drop_file_cache(table->db_path);
+			if (opts && opts->init_drop_cache_each_read) {
+				rc = scan_table_file_lower_bound_once(table->db_path,
+								      lower_bound,
+								      &rows_this_scan);
+				if (rc != 0)
+					return rc;
+			} else {
+				sqlite3_reset(table->scan_stmt);
+				sqlite3_clear_bindings(table->scan_stmt);
+				sqlite3_bind_int(table->scan_stmt, 1, lower_bound);
+				while ((rc = sqlite3_step(table->scan_stmt)) == SQLITE_ROW)
+					rows_this_scan++;
+				if (rc != SQLITE_DONE)
+					return -EIO;
+			}
 			event_latency += monotonic_sec() - t0;
+			sqlite_rows_seen += rows_this_scan;
+			sqlite_scan_ops++;
 			table_read_ops[tbl]++;
 		}
 
@@ -2983,8 +3215,11 @@ static int run_read_event(unsigned int event_id,
 	}
 
 	*elapsed_out = monotonic_sec() - start;
-	printf("[sqlite_init] read_event=%u completed tables=%u elapsed=%.6fs\n",
-	       event_id, layout->table_count, *elapsed_out);
+	printf("[sqlite_init] read_event=%u completed tables=%u scan_ops=%llu "
+	       "sqlite_rows_seen=%llu drop_cache_each_read=%u elapsed=%.6fs\n",
+	       event_id, layout->table_count, sqlite_scan_ops, sqlite_rows_seen,
+	       opts && opts->init_drop_cache_each_read ? 1U : 0U,
+	       *elapsed_out);
 	if (have_before_stats &&
 	    read_ftl_read_heat_stats(test_phase_stats_path, &after_stats) == 0)
 		print_ftl_read_event_delta(event_id, &before_stats, &after_stats);
@@ -4575,11 +4810,13 @@ static int run_init_mode(const struct workload_options *opts)
 	}
 
 	printf("[sqlite_init] config tables=%u total_rows=%llu logical_row_bytes=%llu est_row_pages=%u interleave_pages=%u "
-	       "window_tables=%u window_pages_per_table=%u window_passes_per_round=%u read_ops_per_event=%u direct_io=%u multifile=1\n",
+	       "window_tables=%u window_pages_per_table=%u window_passes_per_round=%u read_ops_per_event=%u "
+	       "direct_io_page_fd=%u init_drop_cache_each_read=%u multifile=1\n",
 	       layout.table_count, total_rows, (unsigned long long)ROW_PAYLOAD_BYTES,
 	       ROW_EST_PAGES, opts->interleave_pages, opts->window_tables,
 	       opts->window_pages_per_table, opts->window_passes_per_round, opts->interleave_reads,
-	       opts->direct_io ? 1U : 0U);
+	       opts->direct_io ? 1U : 0U,
+	       opts->init_drop_cache_each_read ? 1U : 0U);
 	printf("[sqlite_init] tablefile_pageflow=1 table_files=%u target=%llu rows_per_table=%u\n",
 	       layout.table_count,
 	       opts->target_bytes ? opts->target_bytes : DEFAULT_TARGET_BYTES,
@@ -4683,7 +4920,7 @@ static int run_init_mode(const struct workload_options *opts)
 			double event_elapsed = 0.0;
 
 			read_events++;
-			rc = run_read_event(read_events, &layout, tables, read_plan,
+			rc = run_read_event(read_events, &layout, tables, opts, read_plan,
 					    opts->test_phase_stats_path,
 					    table_latency, table_read_ops, &event_elapsed);
 			if (rc != 0)
@@ -5044,6 +5281,7 @@ static void usage(const char *prog)
 		"  --window-passes-per-round N\n"
 		"  --interleave-pages N\n"
 		"  --interleave-reads N\n"
+		"  --init-drop-cache-each-read\n"
 			"  --cold-concurrent-threads N\n"
 				"  --cold-full-read-mode full-scan-concurrent|random-chunk-concurrent|random-row-concurrent|quota-row-grouped|quota-row-shuffled|quota-page-shuffled\n"
 			"  --cold-full-read-iters N\n"
@@ -5078,6 +5316,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->window_passes_per_round = DEFAULT_WINDOW_PASSES_PER_ROUND;
 	opts->interleave_pages = DEFAULT_INTERLEAVE_PAGES;
 	opts->interleave_reads = DEFAULT_INTERLEAVE_READS;
+	opts->init_drop_cache_each_read = false;
 	opts->cold_concurrent_threads = 1U;
 	opts->ftl_host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
 	opts->tag = DEFAULT_TAG;
@@ -5154,6 +5393,9 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 			break;
 		case 1007:
 			opts->interleave_reads = (unsigned int)strtoul(optarg, NULL, 10);
+			break;
+		case 1045:
+			opts->init_drop_cache_each_read = true;
 			break;
 		case 1008:
 			opts->cold_concurrent_threads = (unsigned int)strtoul(optarg, NULL, 10);
