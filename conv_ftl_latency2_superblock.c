@@ -60,13 +60,8 @@ module_param_named(test_phase_guard_read_reqs,
 MODULE_PARM_DESC(test_phase_guard_read_reqs,
 		 "Number of test-phase read requests per recent-write guard epoch");
 
-void enqueue_writeback_io_req_lun_guarded(int sqid,
-					  unsigned long long nsecs_target,
-					  struct buffer *write_buffer,
-					  unsigned int buffs_to_release,
-					  void *writeback_ssd,
-					  unsigned int writeback_ch,
-					  unsigned int writeback_lun);
+void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
+			      struct buffer *write_buffer, unsigned int buffs_to_release);
 
 #ifndef NVMEV_ENABLE_CHAIN_AGGREGATION
 #define NVMEV_ENABLE_CHAIN_AGGREGATION 0
@@ -11714,9 +11709,8 @@ retry_wb_alloc:
 			}
 			test_phase_note_host_write_nand(stats_ftl);
 			/* 异步释放写缓冲，交给 IO worker 归还 */
-			enqueue_writeback_io_req_lun_guarded(req->sq_id, nsecs_completed,
-				       wbuf, (unsigned int)transfer_bytes,
-				       conv_ftl->ssd, ppa.g.ch, ppa.g.lun);
+			enqueue_writeback_io_req(req->sq_id, nsecs_completed,
+				       wbuf, (unsigned int)transfer_bytes);
 			stripe_bytes = 0;
 			swr.stime = nsecs_completed;
 		}
@@ -11786,9 +11780,8 @@ retry_wb_alloc:
 	}
 	if (stripe_bytes > 0) {
 		uint64_t flush_time = nsecs_latest;
-		enqueue_writeback_io_req_lun_guarded(req->sq_id, flush_time, wbuf,
-			       (unsigned int)stripe_bytes, conv_ftl->ssd,
-			       ppa.g.ch, ppa.g.lun);
+		enqueue_writeback_io_req(req->sq_id, flush_time, wbuf,
+			       (unsigned int)stripe_bytes);
 		stripe_bytes = 0;
 	}
 
@@ -11796,8 +11789,6 @@ retry_wb_alloc:
 		    ret->nsecs_target = nsecs_latest;
 	} else {
 		    ret->nsecs_target = nsecs_xfer_completed;
-		    ret->completion_pcie_guard = true;
-		    ret->completion_ssd = conv_ftl->ssd;
 		    if (test_phase_enabled(stats_ftl))
 			    atomic64_inc(&stats_ftl->test_phase_write_early_completion_reqs);
 	}
@@ -11814,9 +11805,8 @@ retry_wb_alloc:
 
 slc_fail_release:
 	if (stripe_bytes > 0) {
-		enqueue_writeback_io_req_lun_guarded(req->sq_id, nsecs_latest, wbuf,
-				(unsigned int)stripe_bytes, conv_ftl->ssd,
-				ppa.g.ch, ppa.g.lun);
+		enqueue_writeback_io_req(req->sq_id, nsecs_latest, wbuf,
+				(unsigned int)stripe_bytes);
 		stripe_bytes = 0;
 	}
 	test_phase_note_overwrite_end(stats_ftl, test_phase_overwrite_tracked);
