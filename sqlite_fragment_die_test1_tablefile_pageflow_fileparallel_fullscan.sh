@@ -32,7 +32,7 @@ SQLITE_WINDOW_PASSES_PER_ROUND=${SQLITE_WINDOW_PASSES_PER_ROUND:-1}
 # intentionally dense preheat event after every window_pages is needed.
 SQLITE_INTERLEAVE_PAGES=${SQLITE_INTERLEAVE_PAGES:-209715}
 SQLITE_INTERLEAVE_READS=${SQLITE_INTERLEAVE_READS:-1000}
-SQLITE_INIT_DROP_CACHE_EACH_READ=${SQLITE_INIT_DROP_CACHE_EACH_READ:-0}
+SQLITE_INIT_DROP_CACHE_EACH_READ=${SQLITE_INIT_DROP_CACHE_EACH_READ:-1}
 SQLITE_ANALYZE_LATENCY_RUN=${SQLITE_ANALYZE_LATENCY_RUN:-1}
 SQLITE_CAPTURE_DMESG_TAIL=${SQLITE_CAPTURE_DMESG_TAIL:-1}
 SQLITE_DMESG_TAIL_LINES=${SQLITE_DMESG_TAIL_LINES:-2000}
@@ -78,7 +78,7 @@ NORMAL_STDDEV=${NORMAL_STDDEV:-400}
 NORMAL_SEED=${NORMAL_SEED:-314159}
 ZIPF_SEED=${ZIPF_SEED:-42}
 EXP_SEED=${EXP_SEED:-4242}
-ZIPF_ALPHA=${ZIPF_ALPHA:-1.8}
+ZIPF_ALPHA=${ZIPF_ALPHA:-0.75}
 EXP_LAMBDA=${EXP_LAMBDA:-0.0008}
 # ---------- end tunables ----------
 
@@ -625,9 +625,12 @@ run_one_test() {
                 echo "[latency_summary]"
                 cat "$summary_file"
             } >>"$init_txt" 2>/dev/null || true
+            echo "[latency_summary] $tag"
+            cat "$summary_file"
             cp "$summary_file" "${out_dir}/" 2>/dev/null || true
         else
             echo "[latency_summary] failed to analyze $init_txt" >>"$init_txt" 2>/dev/null || true
+            echo "[latency_summary] failed to analyze $init_txt"
         fi
     fi
     cp "$init_txt" "${out_dir}/" 2>/dev/null || true

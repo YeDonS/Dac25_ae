@@ -9634,6 +9634,7 @@ static void latency3_bg_slc_maint_run(struct conv_ftl *conv_ftl)
 	uint32_t budget = 0;
 	uint32_t moved;
 	bool force_progress;
+	bool force_after_yields;
 
 	if (!conv_ftl || !conv_ftl->ssd)
 		return;
@@ -9646,8 +9647,9 @@ static void latency3_bg_slc_maint_run(struct conv_ftl *conv_ftl)
 		latency3_read_priority_note_progress(conv_ftl);
 		return;
 	}
-	force_progress = (level >= SLC_LEVEL_EMERGENCY) ||
+	force_after_yields =
 		latency3_read_priority_should_force_progress(conv_ftl, level);
+	force_progress = (level >= SLC_LEVEL_EMERGENCY) || force_after_yields;
 
 	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
 	if (!force_progress && latency3_read_priority_should_yield(conv_ftl)) {

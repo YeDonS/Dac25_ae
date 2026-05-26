@@ -2566,6 +2566,7 @@ static void *append_tables_round_robin_worker(void *arg)
 static unsigned int pick_table(unsigned int table_count, const struct workload_options *opts,
 			       unsigned int *state);
 static void drop_file_cache(const char *path);
+static void drop_table_cache(struct table_file_state *table);
 
 static int latency_vec_push(struct latency_sample_vec *vec, double value)
 {
@@ -3039,8 +3040,11 @@ static void print_read_plan_top_tables(const struct dataset_layout *layout,
 {
 	struct read_plan_rank *rank;
 	unsigned long long total_reads = 0;
+	unsigned long long top10_reads = 0;
+	unsigned long long top_half_reads = 0;
 	unsigned int active_tables = 0;
 	unsigned int printed = 0;
+	unsigned int top_half_limit;
 
 	if (!layout || !read_plan || layout->table_count == 0 || limit == 0)
 		return;
@@ -3058,6 +3062,15 @@ static void print_read_plan_top_tables(const struct dataset_layout *layout,
 	}
 
 	qsort(rank, layout->table_count, sizeof(*rank), compare_read_plan_rank);
+	top_half_limit = layout->table_count / 2U;
+	if (top_half_limit == 0)
+		top_half_limit = 1;
+	for (unsigned int i = 0; i < layout->table_count; ++i) {
+		if (i < 10U)
+			top10_reads += rank[i].reads;
+		if (i < top_half_limit)
+			top_half_reads += rank[i].reads;
+	}
 	printf("[sqlite_init] read_plan total_reads=%llu active_tables=%u top_tables=",
 	       total_reads, active_tables);
 	for (unsigned int i = 0; i < layout->table_count && printed < limit; ++i) {
@@ -3070,6 +3083,12 @@ static void print_read_plan_top_tables(const struct dataset_layout *layout,
 	if (printed == 0)
 		printf("none");
 	printf("\n");
+	printf("[sqlite_init] read_plan_concentration top10=%llu top10_pct=%.2f "
+	       "top_half=%llu top_half_pct=%.2f\n",
+	       top10_reads,
+	       total_reads ? (100.0 * (double)top10_reads / (double)total_reads) : 0.0,
+	       top_half_reads,
+	       total_reads ? (100.0 * (double)top_half_reads / (double)total_reads) : 0.0);
 	free(rank);
 }
 
@@ -3085,6 +3104,23 @@ static void drop_page_cache(void)
 	fclose(fp);
 }
 
+static void sync_file_to_storage(const char *path)
+{
+#if defined(__linux__)
+	int fd;
+
+	if (!path || !*path)
+		return;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return;
+	fsync(fd);
+	close(fd);
+#else
+	(void)path;
+#endif
+}
+
 static void drop_file_cache(const char *path)
 {
 #if defined(__linux__)
@@ -3098,6 +3134,18 @@ static void drop_file_cache(const char *path)
 #else
 	(void)path;
 #endif
+}
+
+static void drop_table_cache(struct table_file_state *table)
+{
+	if (!table)
+		return;
+	if (table->db) {
+		sqlite3_db_cacheflush(table->db);
+		sqlite3_db_release_memory(table->db);
+	}
+	sync_file_to_storage(table->db_path);
+	drop_file_cache(table->db_path);
 }
 
 static int scan_table_file_lower_bound_once(const char *db_path, int lower_bound,
@@ -3177,7 +3225,7 @@ static int run_read_event(unsigned int event_id,
 
 		lower_bound = table->next_record_id + 1;
 		if (!opts || !opts->init_drop_cache_each_read)
-			drop_file_cache(table->db_path);
+			drop_table_cache(table);
 
 		for (unsigned int iter = 0; iter < reads; ++iter) {
 			double t0 = monotonic_sec();
@@ -3185,7 +3233,7 @@ static int run_read_event(unsigned int event_id,
 			int rc;
 
 			if (opts && opts->init_drop_cache_each_read)
-				drop_file_cache(table->db_path);
+				drop_table_cache(table);
 			if (opts && opts->init_drop_cache_each_read) {
 				rc = scan_table_file_lower_bound_once(table->db_path,
 								      lower_bound,
@@ -5329,7 +5377,7 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->gc_victim_events_path = DEFAULT_GC_VICTIM_EVENTS_PATH;
 	opts->seed = 42U;
 	opts->dist_name = "normal";
-	opts->zipf_alpha = 1.2;
+	opts->zipf_alpha = 0.75;
 	opts->exp_lambda = 0.0008;
 	opts->normal_mean = -1.0;
 	opts->normal_stddev = 8.0;

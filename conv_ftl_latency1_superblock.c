@@ -60,6 +60,22 @@ module_param_named(test_phase_guard_read_reqs,
 MODULE_PARM_DESC(test_phase_guard_read_reqs,
 		 "Number of test-phase read requests per recent-write guard epoch");
 
+static inline bool page_reserved_for_new_write(const struct nand_page *pg)
+{
+	return pg && pg->status == PG_RESERVED;
+}
+
+static inline bool page_available_for_new_write(const struct nand_page *pg)
+{
+	return pg && pg->status == PG_FREE;
+}
+
+static inline void reserve_page_for_new_write(struct nand_page *pg)
+{
+	if (pg && pg->status == PG_FREE)
+		pg->status = PG_RESERVED;
+}
+
 void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			      struct buffer *write_buffer, unsigned int buffs_to_release);
 
@@ -5979,7 +5995,7 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
         return;
     }
     /* 4. 验证页面状态 */
-    if (pg->status != PG_FREE) {
+    if (pg->status != PG_FREE && !page_reserved_for_new_write(pg)) {
         NVMEV_WARN("[mark_page_valid] Page not FREE: status=%d at ch=%d,lun=%d,blk=%d,pg=%d\n",
                    pg->status, ppa->g.ch, ppa->g.lun, ppa->g.blk, ppa->g.pg);
         return;/* 根据实际需求决定是否继续 */
@@ -8614,8 +8630,11 @@ static int qlc_try_allocate_zone(struct conv_ftl *conv_ftl, struct write_pointer
 
 	if (!conv_ftl || !wp || !line || !ppa_out)
 		return -EINVAL;
-	if (READ_ONCE(wp->curline) != line)
+	spin_lock(&conv_ftl->qlc_lock);
+	if (READ_ONCE(wp->curline) != line) {
+		spin_unlock(&conv_ftl->qlc_lock);
 		return -EAGAIN;
+	}
 
 	for (pg_idx = type; pg_idx < conv_ftl->qlc_pgs_per_blk; pg_idx += step) {
 		struct ppa candidate;
@@ -8631,17 +8650,22 @@ static int qlc_try_allocate_zone(struct conv_ftl *conv_ftl, struct write_pointer
 		page = get_pg(conv_ftl->ssd, &candidate);
 		if (!page)
 			continue;
-		if (page->status == PG_FREE) {
-			if (READ_ONCE(wp->curline) != line)
+		if (page_available_for_new_write(page)) {
+			if (READ_ONCE(wp->curline) != line) {
+				spin_unlock(&conv_ftl->qlc_lock);
 				return -EAGAIN;
+			}
+			reserve_page_for_new_write(page);
 			*ppa_out = candidate;
 			if (zone < QLC_ZONE_COUNT)
 				line->zone_written[zone]++;
 			wp->pg = candidate.g.pg;
+			spin_unlock(&conv_ftl->qlc_lock);
 			return 0;
 		}
 	}
 
+	spin_unlock(&conv_ftl->qlc_lock);
 	return -ENOSPC;
 }
 
