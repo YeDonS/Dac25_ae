@@ -53,7 +53,8 @@ enum {
 
 	PG_FREE = 0,
 	PG_INVALID = 1,
-	PG_VALID = 2
+	PG_VALID = 2,
+	PG_RESERVED = 3
 };
 
 /* Cell type */
