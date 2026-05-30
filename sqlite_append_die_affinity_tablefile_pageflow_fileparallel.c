@@ -330,6 +330,8 @@ struct latency_sample_vec {
 	size_t cap;
 };
 
+static volatile unsigned long long payload_checksum_sink;
+
 static const struct option long_opts[] = {
 	{"mode", required_argument, NULL, 'm'},
 	{"tag", required_argument, NULL, 1000},
@@ -3277,6 +3279,7 @@ static int run_read_event(unsigned int event_id,
 static int scan_stmt_range(sqlite3_stmt *stmt, int begin, int end,
 			   unsigned long long *rows_read)
 {
+	unsigned long long checksum = 1469598103934665603ULL;
 	int rc;
 
 	sqlite3_reset(stmt);
@@ -3284,9 +3287,23 @@ static int scan_stmt_range(sqlite3_stmt *stmt, int begin, int end,
 	sqlite3_bind_int(stmt, 1, begin);
 	sqlite3_bind_int(stmt, 2, end);
 	while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+		for (int col = 0; col < 4; ++col) {
+			const unsigned char *data = sqlite3_column_text(stmt, col);
+			int bytes = sqlite3_column_bytes(stmt, col);
+
+			if (data && bytes > 0) {
+				checksum ^= (unsigned long long)data[0];
+				checksum *= 1099511628211ULL;
+				checksum ^= (unsigned long long)data[bytes - 1];
+				checksum *= 1099511628211ULL;
+				checksum ^= (unsigned long long)bytes;
+				checksum *= 1099511628211ULL;
+			}
+		}
 		if (rows_read)
 			(*rows_read)++;
 	}
+	payload_checksum_sink ^= checksum;
 	return rc;
 }
 
@@ -3509,12 +3526,17 @@ static void *full_scan_worker(void *arg)
 					int rc = scan_stmt_range(stmt, ctx->record_id_begin,
 						      ctx->record_id_end, &ctx->rows_read);
 					double dt = monotonic_sec() - t0;
-				if (rc != SQLITE_DONE)
-					break;
-				if (concurrent_read_push_latency(ctx, dt) != 0)
-					break;
+					if (rep + 1 < ctx->repeats) {
+						sqlite3_db_cacheflush(db);
+						sqlite3_db_release_memory(db);
+						drop_file_cache(ctx->db_path);
+					}
+					if (rc != SQLITE_DONE)
+						break;
+					if (concurrent_read_push_latency(ctx, dt) != 0)
+						break;
+				}
 			}
-		}
 
 	ctx->elapsed_sec = monotonic_sec() - start;
 	sqlite3_finalize(stmt);

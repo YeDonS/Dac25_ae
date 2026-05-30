@@ -320,7 +320,8 @@ struct conv_ftl {
 	uint32_t qlc_rebalance_period_writes;  /* 每多少次主机写触发一次内部重平衡 */
 	uint32_t qlc_rebalance_promote_budget; /* 每轮 slow->fast 预算页数 */
 	uint32_t qlc_rebalance_demote_budget;  /* 每轮 fast->slow 预算页数 */
-	bool qlc_fast_drain_active;            /* 快区超过高水位后持续降温到目标水位 */
+	bool qlc_fast_drain_active;            /* fast 区达到高水位时 slow-hot promotion 需要 swap */
+	uint64_t *qlc_rebalance_cooldown_until; /* LPN -> host-read seq before next QLC rebalance move */
 	uint64_t qlc_fast_count;              /* 当前在 fast zone (L/CL) 的 QLC 页数 */
 	uint64_t qlc_slow_count;              /* 当前在 slow zone (U/CU) 的 QLC 页数 */
 	bool enable_read_repromotion;         /* 是否允许读路径触发 QLC->SLC 回迁 */
