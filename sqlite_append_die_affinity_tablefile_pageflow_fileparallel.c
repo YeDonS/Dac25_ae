@@ -95,6 +95,7 @@ enum cold_extra_mode {
 
 enum cold_full_read_mode {
 	COLD_FULL_READ_FULL_SCAN = 0,
+	COLD_FULL_READ_FULL_SCAN_ALL,
 	COLD_FULL_READ_RANDOM_CHUNK,
 	COLD_FULL_READ_RANDOM_ROW,
 	COLD_FULL_READ_QUOTA_ROW_GROUPED,
@@ -474,6 +475,11 @@ static enum cold_full_read_mode parse_cold_full_read_mode(const char *arg)
 	    !strcasecmp(arg, "full-scan") ||
 	    !strcasecmp(arg, "full-scan-concurrent"))
 		return COLD_FULL_READ_FULL_SCAN;
+	if (!strcasecmp(arg, "full-scan-all") ||
+	    !strcasecmp(arg, "full-scan-all-concurrent") ||
+	    !strcasecmp(arg, "full-scan-once") ||
+	    !strcasecmp(arg, "full-scan-once-concurrent"))
+		return COLD_FULL_READ_FULL_SCAN_ALL;
 	if (!strcasecmp(arg, "random") ||
 	    !strcasecmp(arg, "random-read") ||
 	    !strcasecmp(arg, "cold-random-read") ||
@@ -505,6 +511,8 @@ static enum cold_full_read_mode parse_cold_full_read_mode(const char *arg)
 static const char *cold_full_read_mode_label(enum cold_full_read_mode mode)
 {
 	switch (mode) {
+	case COLD_FULL_READ_FULL_SCAN_ALL:
+		return "full-scan-all-concurrent";
 	case COLD_FULL_READ_RANDOM_CHUNK:
 		return "random-chunk-concurrent";
 	case COLD_FULL_READ_RANDOM_ROW:
@@ -3923,7 +3931,8 @@ static double run_cold_full_scan_concurrent(const struct dataset_layout *layout,
 			row_count = tables[tbl].max_record_id_exclusive > 0 ?
 				(unsigned int)tables[tbl].max_record_id_exclusive :
 				tables[tbl].rows_inserted;
-			reads = read_plan ? read_plan[tbl] : 1U;
+			reads = opts && opts->cold_full_read_mode == COLD_FULL_READ_FULL_SCAN_ALL ?
+				1U : (read_plan ? read_plan[tbl] : 1U);
 			if (row_count == 0 || reads == 0)
 				continue;
 
@@ -4495,6 +4504,77 @@ static int write_page_tier_csv(const char *path, const struct workload_options *
 
 	fclose(fp);
 	return 0;
+}
+
+static void print_cold_read_set_tier_summary(const struct workload_options *opts,
+					     const struct dataset_layout *layout,
+					     const struct table_file_state *tables,
+					     const unsigned int *read_plan,
+					     const struct page_tier_entry *tier_entries,
+					     size_t tier_count)
+{
+	unsigned long long file_slc = 0, file_qlc = 0, file_unknown = 0;
+	unsigned long long weighted_slc = 0, weighted_qlc = 0, weighted_unknown = 0;
+	unsigned int active_tables = 0;
+
+	if (!opts || !layout || !tables || !tier_entries || tier_count == 0)
+		return;
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		unsigned long long *lpns = NULL;
+		size_t lpn_count = 0;
+		unsigned int reads;
+		int rc;
+
+		reads = opts->cold_full_read_mode == COLD_FULL_READ_FULL_SCAN_ALL ?
+			1U : (read_plan ? read_plan[tbl] : 1U);
+		if (reads > 0)
+			active_tables++;
+
+		rc = collect_file_lpns(tables[tbl].db_path, opts->ftl_host_page_bytes,
+				       &lpns, &lpn_count);
+		if (rc != 0)
+			continue;
+
+		for (size_t i = 0; i < lpn_count; ++i) {
+			unsigned int in_slc = 0;
+			unsigned int qlc_zone = 0;
+			bool qlc_zone_known = false;
+			bool tier_known;
+
+			tier_known = lookup_page_tier(tier_entries, tier_count, lpns[i],
+						      &in_slc, &qlc_zone, &qlc_zone_known);
+			if (!tier_known) {
+				file_unknown++;
+				weighted_unknown += reads;
+			} else if (in_slc) {
+				file_slc++;
+				weighted_slc += reads;
+			} else {
+				file_qlc++;
+				weighted_qlc += reads;
+			}
+		}
+		free(lpns);
+	}
+
+	{
+		unsigned long long file_total = file_slc + file_qlc + file_unknown;
+		unsigned long long weighted_total = weighted_slc + weighted_qlc + weighted_unknown;
+		double file_qlc_pct = file_total ?
+			100.0 * (double)file_qlc / (double)file_total : 0.0;
+		double weighted_qlc_pct = weighted_total ?
+			100.0 * (double)weighted_qlc / (double)weighted_total : 0.0;
+
+		printf("[sqlite_init] cold_read_set_tier mode=%s active_tables=%u "
+		       "file_lpn_slc=%llu file_lpn_qlc=%llu file_lpn_unknown=%llu "
+		       "file_lpn_qlc_pct=%.2f weighted_slc=%llu weighted_qlc=%llu "
+		       "weighted_unknown=%llu weighted_qlc_pct=%.2f\n",
+		       cold_full_read_mode_label(opts->cold_full_read_mode),
+		       active_tables,
+		       file_slc, file_qlc, file_unknown, file_qlc_pct,
+		       weighted_slc, weighted_qlc, weighted_unknown, weighted_qlc_pct);
+	}
 }
 
 static int write_page_die_transition_csv(const char *path,
@@ -5167,6 +5247,8 @@ static int run_init_mode(const struct workload_options *opts)
 	write_page_tier_csv(page_tier_csv_path, opts, &layout, tables,
 			   page_tier_entries, page_tier_count,
 			   page_die_entries, page_die_count);
+	print_cold_read_set_tier_summary(opts, &layout, tables, read_plan,
+					 page_tier_entries, page_tier_count);
 	if (page_die_transition_entries && die_slots > 0)
 		write_table_die_transition_csv(table_die_transition_csv_path, opts, &layout, tables,
 					       page_die_transition_entries,
@@ -5353,7 +5435,7 @@ static void usage(const char *prog)
 		"  --interleave-reads N\n"
 		"  --init-drop-cache-each-read\n"
 			"  --cold-concurrent-threads N\n"
-				"  --cold-full-read-mode full-scan-concurrent|random-chunk-concurrent|random-row-concurrent|quota-row-grouped|quota-row-shuffled|quota-page-shuffled\n"
+				"  --cold-full-read-mode full-scan-concurrent|full-scan-all-concurrent|random-chunk-concurrent|random-row-concurrent|quota-row-grouped|quota-row-shuffled|quota-page-shuffled\n"
 			"  --cold-full-read-iters N\n"
 			"  --page-chain-path PATH\n"
 		"  --page-die-transition-path PATH\n"
