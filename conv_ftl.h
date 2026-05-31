@@ -486,6 +486,9 @@ struct conv_ftl {
 	atomic64_t test_phase_host_read_nand_ops;   /* foreground NAND reads issued by host reads */
 	atomic64_t test_phase_host_read_slc_ops;    /* host read NAND ops served from SLC */
 	atomic64_t test_phase_host_read_qlc_ops;    /* host read NAND ops served from QLC */
+	atomic64_t test_phase_host_read_phys_slc_ops; /* host read NAND ops whose NAND block is SLC */
+	atomic64_t test_phase_host_read_phys_qlc_ops; /* host read NAND ops whose NAND block is QLC */
+	atomic64_t test_phase_host_read_tier_mismatch_ops; /* is_slc_block disagrees with NAND block type */
 	atomic64_t test_phase_read_nand_bg_overlap_ops; /* foreground read NAND ops issued while bg active */
 	atomic64_t test_phase_host_write_pages;     /* host logical pages written during test phase */
 	atomic64_t test_phase_host_write_nand_ops;  /* foreground NAND writes issued by host writes */
@@ -532,7 +535,8 @@ struct conv_ftl {
 	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
 		struct dentry *debug_access_inject; /* debugfs entry for counter injection */
-		struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
+			struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
+			struct dentry *debug_page_tier_raw; /* debugfs entry for raw tier diagnostics */
 		struct dentry *debug_page_die;     /* debugfs entry for mapped page die */
 		struct dentry *debug_page_chain;   /* debugfs entry for mapped page chain */
 		struct dentry *debug_page_die_transition; /* debugfs entry for initial/current die transitions */

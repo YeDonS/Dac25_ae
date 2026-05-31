@@ -66,7 +66,7 @@
 #define DEFAULT_INTERLEAVE_READS 1000U
 #define DEFAULT_REFSTYLE_DUMMY_BYTES (0ULL)
 #define DEFAULT_TAG "default"
-#define DEFAULT_PAGE_TIER_PATH "/sys/kernel/debug/nvmev/ftl0/page_tier"
+#define DEFAULT_PAGE_TIER_PATH "/sys/kernel/debug/nvmev/ftl0/page_tier_raw"
 #define DEFAULT_PAGE_DIE_PATH "/sys/kernel/debug/nvmev/ftl0/page_die"
 #define DEFAULT_PAGE_CHAIN_PATH "/sys/kernel/debug/nvmev/ftl0/page_chain"
 #define DEFAULT_PAGE_DIE_TRANSITION_PATH "/sys/kernel/debug/nvmev/ftl0/page_die_transition"
@@ -115,9 +115,15 @@ struct page_chain_entry {
 
 struct page_tier_entry {
 	unsigned long long lpn;
+	unsigned long long local_lpn;
+	unsigned int ftl_part;
 	unsigned int in_slc;
+	unsigned int page_in_slc_flag;
+	unsigned int phys_in_slc;
 	unsigned int qlc_zone;
 	unsigned int qlc_zone_known;
+	unsigned int raw_known;
+	unsigned int tier_mismatch;
 };
 
 struct page_die_transition_entry {
@@ -1743,11 +1749,8 @@ static int load_page_die_entries(const char *path, struct page_die_entry **entri
 		return 0;
 
 	fp = fopen(path, "r");
-	if (!fp) {
-		if (errno == ENOENT)
-			return 0;
+	if (!fp)
 		return -errno;
-	}
 
 	while (fgets(line, sizeof(line), fp)) {
 		unsigned long long lpn;
@@ -1843,18 +1846,32 @@ static int load_page_chain_entries(const char *path, struct page_chain_entry **e
 	return 0;
 }
 
-static int load_page_tier_entries(const char *path, struct page_tier_entry **entries_out,
-				  size_t *count_out)
+static int append_page_tier_entry(struct page_tier_entry **entries, size_t *count,
+				  size_t *cap, const struct page_tier_entry *entry)
+{
+	if (!entries || !count || !cap || !entry)
+		return -EINVAL;
+	if (*count == *cap) {
+		size_t new_cap = *cap ? *cap * 2 : 4096;
+		struct page_tier_entry *tmp = realloc(*entries, new_cap * sizeof(**entries));
+
+		if (!tmp)
+			return -ENOMEM;
+		*entries = tmp;
+		*cap = new_cap;
+	}
+	(*entries)[(*count)++] = *entry;
+	return 0;
+}
+
+static int load_page_tier_entries_file(const char *path, unsigned int ftl_part,
+				       struct page_tier_entry **entries,
+				       size_t *count, size_t *cap)
 {
 	FILE *fp;
-	struct page_tier_entry *entries = NULL;
-	size_t count = 0;
-	size_t cap = 0;
-	char line[128];
+	char line[256];
 
-	*entries_out = NULL;
-	*count_out = 0;
-	if (!path || !*path)
+	if (!path || !*path || !entries || !count || !cap)
 		return 0;
 
 	fp = fopen(path, "r");
@@ -1865,43 +1882,163 @@ static int load_page_tier_entries(const char *path, struct page_tier_entry **ent
 	}
 
 	while (fgets(line, sizeof(line), fp)) {
-		unsigned long long lpn;
+		struct page_tier_entry entry;
+		unsigned long long local_lpn;
 		unsigned int in_slc;
+		unsigned int flag_in_slc;
+		unsigned int phys_in_slc;
+		unsigned int ch, lun, pl, blk, pg;
 		int qlc_zone = -1;
 		int scanned;
 
-		scanned = sscanf(line, "%llu %u %d", &lpn, &in_slc, &qlc_zone);
-		if (scanned < 2)
-			continue;
-		if (count == cap) {
-			size_t new_cap = cap ? cap * 2 : 4096;
-			struct page_tier_entry *tmp = realloc(entries, new_cap * sizeof(*entries));
-
-			if (!tmp) {
-				free(entries);
-				fclose(fp);
-				return -ENOMEM;
-			}
-			entries = tmp;
-			cap = new_cap;
-		}
-
-		entries[count].lpn = lpn;
-		entries[count].in_slc = in_slc ? 1U : 0U;
-		if (scanned >= 3 && qlc_zone >= 0 && qlc_zone < 4) {
-			entries[count].qlc_zone = (unsigned int)qlc_zone;
-			entries[count].qlc_zone_known = 1U;
+		memset(&entry, 0, sizeof(entry));
+		scanned = sscanf(line, "%llu %u %u %d %u %u %u %u %u",
+				 &local_lpn, &flag_in_slc, &phys_in_slc, &qlc_zone,
+				 &ch, &lun, &pl, &blk, &pg);
+		if (scanned >= 4) {
+			entry.local_lpn = local_lpn;
+			entry.lpn = local_lpn;
+			entry.ftl_part = ftl_part;
+			entry.in_slc = phys_in_slc ? 1U : 0U;
+			entry.page_in_slc_flag = flag_in_slc ? 1U : 0U;
+			entry.phys_in_slc = phys_in_slc ? 1U : 0U;
+			entry.raw_known = 1U;
+			entry.tier_mismatch = entry.page_in_slc_flag != entry.phys_in_slc;
 		} else {
-			entries[count].qlc_zone = 0U;
-			entries[count].qlc_zone_known = 0U;
+			scanned = sscanf(line, "%llu %u %d", &local_lpn, &in_slc, &qlc_zone);
+			if (scanned < 2)
+				continue;
+			entry.local_lpn = local_lpn;
+			entry.lpn = local_lpn;
+			entry.ftl_part = ftl_part;
+			entry.in_slc = in_slc ? 1U : 0U;
+			entry.page_in_slc_flag = entry.in_slc;
+			entry.phys_in_slc = entry.in_slc;
 		}
-		count++;
+
+		if (scanned >= 3 && qlc_zone >= 0 && qlc_zone < 4) {
+			entry.qlc_zone = (unsigned int)qlc_zone;
+			entry.qlc_zone_known = 1U;
+		} else {
+			entry.qlc_zone = 0U;
+			entry.qlc_zone_known = 0U;
+		}
+
+		scanned = append_page_tier_entry(entries, count, cap, &entry);
+		if (scanned != 0) {
+			fclose(fp);
+			return scanned;
+		}
 	}
 
 	fclose(fp);
+	return 0;
+}
+
+static int load_page_tier_entries_leaf(const char *path, const char *leaf,
+				       struct page_tier_entry **entries,
+				       size_t *count, size_t *cap,
+				       unsigned int *found_parts_out)
+{
+	unsigned int found_parts = 0;
+	char sibling[PATH_MAX];
+	int rc;
+
+	if (!path || !leaf || !entries || !count || !cap || !found_parts_out)
+		return -EINVAL;
+
+	for (unsigned int i = 0; i < 256; i++) {
+		if (make_ftl_debugfs_sibling_path(path, leaf, i, sibling,
+						 sizeof(sibling)) != 0)
+			break;
+		if (access(sibling, R_OK) != 0) {
+			if (errno == ENOENT || errno == ENOTDIR) {
+				if (found_parts)
+					break;
+				*found_parts_out = 0;
+				return -ENOENT;
+			}
+			return -errno;
+		}
+		rc = load_page_tier_entries_file(sibling, i, entries, count, cap);
+		if (rc != 0)
+			return rc;
+		found_parts++;
+	}
+
+	*found_parts_out = found_parts;
+	return found_parts ? 0 : -ENOENT;
+}
+
+static int load_page_tier_entries(const char *path, struct page_tier_entry **entries_out,
+				  size_t *count_out)
+{
+	struct page_tier_entry *entries = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+	unsigned int found_parts = 0;
+	char sibling[PATH_MAX];
+	const char *leaf;
+	int rc;
+
+	*entries_out = NULL;
+	*count_out = 0;
+	if (!path || !*path)
+		return 0;
+
+	if (make_ftl_debugfs_sibling_path(path, "page_tier", 0, sibling, sizeof(sibling)) == 0 ||
+	    make_ftl_debugfs_sibling_path(path, "page_tier_raw", 0, sibling, sizeof(sibling)) == 0) {
+		leaf = strrchr(path, '/');
+
+		leaf = leaf ? leaf + 1 : "page_tier";
+		if (strcmp(leaf, "page_tier_raw") == 0 || strcmp(leaf, "page_tier") == 0) {
+			rc = load_page_tier_entries_leaf(path, "page_tier_raw",
+							 &entries, &count, &cap,
+							 &found_parts);
+			if (rc == -ENOENT) {
+				free(entries);
+				entries = NULL;
+				count = 0;
+				cap = 0;
+				rc = load_page_tier_entries_leaf(path, "page_tier",
+								 &entries, &count, &cap,
+								 &found_parts);
+			}
+			if (rc == -ENOENT)
+				return 0;
+			if (rc != 0) {
+				free(entries);
+				return rc;
+			}
+		} else {
+			rc = load_page_tier_entries_leaf(path, leaf, &entries, &count,
+							 &cap, &found_parts);
+			if (rc == -ENOENT)
+				return 0;
+			if (rc != 0) {
+				free(entries);
+				return rc;
+			}
+		}
+	} else {
+		rc = load_page_tier_entries_file(path, 0, &entries, &count, &cap);
+		if (rc == -ENOENT)
+			return 0;
+		if (rc != 0) {
+			free(entries);
+			return rc;
+		}
+		found_parts = count ? 1U : 0U;
+	}
+
 	if (!count) {
 		free(entries);
 		return 0;
+	}
+
+	if (found_parts > 1) {
+		for (size_t i = 0; i < count; ++i)
+			entries[i].lpn = entries[i].local_lpn * found_parts + entries[i].ftl_part;
 	}
 
 	qsort(entries, count, sizeof(*entries), cmp_tier_entry_lpn);
@@ -2046,8 +2183,10 @@ static bool lookup_page_chain(const struct page_chain_entry *entries, size_t cou
 }
 
 static bool lookup_page_tier(const struct page_tier_entry *entries, size_t count,
-			     unsigned long long lpn, unsigned int *in_slc_out,
-			     unsigned int *qlc_zone_out, bool *qlc_zone_known_out)
+				     unsigned long long lpn, unsigned int *in_slc_out,
+				     unsigned int *qlc_zone_out, bool *qlc_zone_known_out,
+				     unsigned int *raw_known_out,
+				     unsigned int *tier_mismatch_out)
 {
 	size_t lo = 0;
 	size_t hi = count;
@@ -2067,6 +2206,10 @@ static bool lookup_page_tier(const struct page_tier_entry *entries, size_t count
 		*qlc_zone_out = entries[lo].qlc_zone;
 	if (qlc_zone_known_out)
 		*qlc_zone_known_out = entries[lo].qlc_zone_known != 0U;
+	if (raw_known_out)
+		*raw_known_out = entries[lo].raw_known;
+	if (tier_mismatch_out)
+		*tier_mismatch_out = entries[lo].tier_mismatch;
 	return true;
 }
 
@@ -4467,7 +4610,7 @@ static int write_page_tier_csv(const char *path, const struct workload_options *
 		return -errno;
 
 	fprintf(fp,
-		"table_id,table_name,lpn,die,die_known,in_slc,qlc_zone,qlc_zone_known,tier_label\n");
+		"table_id,table_name,lpn,die,die_known,in_slc,qlc_zone,qlc_zone_known,tier_label,raw_known,tier_mismatch\n");
 	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
 		unsigned long long *lpns = NULL;
 		size_t lpn_count = 0;
@@ -4481,22 +4624,27 @@ static int write_page_tier_csv(const char *path, const struct workload_options *
 		build_table_name(table_name, sizeof(table_name), tbl);
 		for (size_t i = 0; i < lpn_count; ++i) {
 			unsigned int die = 0;
-			unsigned int in_slc = 0;
-			unsigned int qlc_zone = 0;
-			bool die_known = false;
-			bool qlc_zone_known = false;
-			bool tier_known = false;
+				unsigned int in_slc = 0;
+				unsigned int qlc_zone = 0;
+				unsigned int raw_known = 0;
+				unsigned int tier_mismatch = 0;
+				bool die_known = false;
+				bool qlc_zone_known = false;
+				bool tier_known = false;
 
-			die_known = lookup_page_die(page_die_entries, page_die_count, lpns[i], &die);
-			tier_known = lookup_page_tier(tier_entries, tier_count, lpns[i],
-						      &in_slc, &qlc_zone, &qlc_zone_known);
-			fprintf(fp, "%u,%s,%llu,%d,%u,%u,%d,%u,%s\n",
-				tbl, table_name, lpns[i],
-				die_known ? (int)die : -1, die_known ? 1U : 0U,
-				tier_known ? in_slc : 0U,
-				(tier_known && !in_slc && qlc_zone_known) ? (int)qlc_zone : -1,
-				(tier_known && !in_slc && qlc_zone_known) ? 1U : 0U,
-				tier_known ? page_tier_label(in_slc, qlc_zone_known, qlc_zone) : "unknown");
+				die_known = lookup_page_die(page_die_entries, page_die_count, lpns[i], &die);
+				tier_known = lookup_page_tier(tier_entries, tier_count, lpns[i],
+							      &in_slc, &qlc_zone, &qlc_zone_known,
+							      &raw_known, &tier_mismatch);
+				fprintf(fp, "%u,%s,%llu,%d,%u,%u,%d,%u,%s,%u,%u\n",
+					tbl, table_name, lpns[i],
+					die_known ? (int)die : -1, die_known ? 1U : 0U,
+					tier_known ? in_slc : 0U,
+					(tier_known && !in_slc && qlc_zone_known) ? (int)qlc_zone : -1,
+					(tier_known && !in_slc && qlc_zone_known) ? 1U : 0U,
+					tier_known ? page_tier_label(in_slc, qlc_zone_known, qlc_zone) : "unknown",
+					tier_known ? raw_known : 0U,
+					tier_known ? tier_mismatch : 0U);
 		}
 
 		free(lpns);
@@ -4511,10 +4659,13 @@ static void print_cold_read_set_tier_summary(const struct workload_options *opts
 					     const struct table_file_state *tables,
 					     const unsigned int *read_plan,
 					     const struct page_tier_entry *tier_entries,
-					     size_t tier_count)
+					     size_t tier_count,
+					     const char *phase)
 {
 	unsigned long long file_slc = 0, file_qlc = 0, file_unknown = 0;
+	unsigned long long file_raw_known = 0, file_tier_mismatch = 0;
 	unsigned long long weighted_slc = 0, weighted_qlc = 0, weighted_unknown = 0;
+	unsigned long long weighted_tier_mismatch = 0;
 	unsigned int active_tables = 0;
 
 	if (!opts || !layout || !tables || !tier_entries || tier_count == 0)
@@ -4537,23 +4688,33 @@ static void print_cold_read_set_tier_summary(const struct workload_options *opts
 			continue;
 
 		for (size_t i = 0; i < lpn_count; ++i) {
-			unsigned int in_slc = 0;
-			unsigned int qlc_zone = 0;
-			bool qlc_zone_known = false;
-			bool tier_known;
+				unsigned int in_slc = 0;
+				unsigned int qlc_zone = 0;
+				unsigned int raw_known = 0;
+				unsigned int tier_mismatch = 0;
+				bool qlc_zone_known = false;
+				bool tier_known;
 
-			tier_known = lookup_page_tier(tier_entries, tier_count, lpns[i],
-						      &in_slc, &qlc_zone, &qlc_zone_known);
-			if (!tier_known) {
-				file_unknown++;
-				weighted_unknown += reads;
-			} else if (in_slc) {
-				file_slc++;
-				weighted_slc += reads;
-			} else {
-				file_qlc++;
-				weighted_qlc += reads;
-			}
+				tier_known = lookup_page_tier(tier_entries, tier_count, lpns[i],
+							      &in_slc, &qlc_zone, &qlc_zone_known,
+							      &raw_known, &tier_mismatch);
+				if (!tier_known) {
+					file_unknown++;
+					weighted_unknown += reads;
+				} else if (in_slc) {
+					file_slc++;
+					weighted_slc += reads;
+				} else {
+					file_qlc++;
+					weighted_qlc += reads;
+				}
+				if (tier_known && raw_known) {
+					file_raw_known++;
+					if (tier_mismatch) {
+						file_tier_mismatch++;
+						weighted_tier_mismatch += reads;
+					}
+				}
 		}
 		free(lpns);
 	}
@@ -4566,15 +4727,44 @@ static void print_cold_read_set_tier_summary(const struct workload_options *opts
 		double weighted_qlc_pct = weighted_total ?
 			100.0 * (double)weighted_qlc / (double)weighted_total : 0.0;
 
-		printf("[sqlite_init] cold_read_set_tier mode=%s active_tables=%u "
-		       "file_lpn_slc=%llu file_lpn_qlc=%llu file_lpn_unknown=%llu "
-		       "file_lpn_qlc_pct=%.2f weighted_slc=%llu weighted_qlc=%llu "
-		       "weighted_unknown=%llu weighted_qlc_pct=%.2f\n",
-		       cold_full_read_mode_label(opts->cold_full_read_mode),
-		       active_tables,
-		       file_slc, file_qlc, file_unknown, file_qlc_pct,
-		       weighted_slc, weighted_qlc, weighted_unknown, weighted_qlc_pct);
+			printf("[sqlite_init] cold_read_set_tier mode=%s phase=%s active_tables=%u "
+			       "file_lpn_slc=%llu file_lpn_qlc=%llu file_lpn_unknown=%llu "
+			       "file_lpn_qlc_pct=%.2f weighted_slc=%llu weighted_qlc=%llu "
+			       "weighted_unknown=%llu weighted_qlc_pct=%.2f "
+			       "file_lpn_raw_known=%llu file_lpn_tier_mismatch=%llu "
+			       "weighted_tier_mismatch=%llu\n",
+			       cold_full_read_mode_label(opts->cold_full_read_mode),
+			       phase ? phase : "unknown",
+			       active_tables,
+			       file_slc, file_qlc, file_unknown, file_qlc_pct,
+			       weighted_slc, weighted_qlc, weighted_unknown, weighted_qlc_pct,
+			       file_raw_known, file_tier_mismatch, weighted_tier_mismatch);
 	}
+}
+
+static void load_and_print_cold_read_set_tier_summary(const struct workload_options *opts,
+						      const struct dataset_layout *layout,
+						      const struct table_file_state *tables,
+						      const unsigned int *read_plan,
+						      const char *phase)
+{
+	struct page_tier_entry *tier_entries = NULL;
+	size_t tier_count = 0;
+	int rc;
+
+	if (!opts || !layout || !tables)
+		return;
+
+	rc = load_page_tier_entries(opts->page_tier_path, &tier_entries, &tier_count);
+	if (rc != 0) {
+		fprintf(stderr, "warning: failed to load page_tier entries for %s (%d)\n",
+			phase ? phase : "unknown", rc);
+		return;
+	}
+
+	print_cold_read_set_tier_summary(opts, layout, tables, read_plan,
+					 tier_entries, tier_count, phase);
+	free(tier_entries);
 }
 
 static int write_page_die_transition_csv(const char *path,
@@ -4616,9 +4806,10 @@ static int write_page_die_transition_csv(const char *path,
 
 			transition_known = lookup_page_die_transition(transition_entries, transition_count,
 							      lpns[i], &transition);
-			initial_known = transition_known && transition.initial_die >= 0;
-			tier_known = lookup_page_tier(tier_entries, tier_count, lpns[i],
-						      &in_slc, &qlc_zone, &qlc_zone_known);
+				initial_known = transition_known && transition.initial_die >= 0;
+				tier_known = lookup_page_tier(tier_entries, tier_count, lpns[i],
+							      &in_slc, &qlc_zone, &qlc_zone_known,
+							      NULL, NULL);
 			fprintf(fp, "%u,%s,%llu,%d,%u,%d,%u,%u,%u,%s,%u,%d,%u,%s\n",
 				tbl, table_name, lpns[i],
 				initial_known ? transition.initial_die : -1,
@@ -5103,6 +5294,9 @@ static int run_init_mode(const struct workload_options *opts)
 		       cold_extra_rows_each * layout.table_count);
 	}
 
+	load_and_print_cold_read_set_tier_summary(opts, &layout, tables, read_plan,
+						  "pre_cold");
+
 	rc = set_test_phase_state(opts, true, "cold-read-start");
 	if (rc != 0)
 		goto out;
@@ -5248,7 +5442,8 @@ static int run_init_mode(const struct workload_options *opts)
 			   page_tier_entries, page_tier_count,
 			   page_die_entries, page_die_count);
 	print_cold_read_set_tier_summary(opts, &layout, tables, read_plan,
-					 page_tier_entries, page_tier_count);
+					 page_tier_entries, page_tier_count,
+					 "post_cold");
 	if (page_die_transition_entries && die_slots > 0)
 		write_table_die_transition_csv(table_die_transition_csv_path, opts, &layout, tables,
 					       page_die_transition_entries,
