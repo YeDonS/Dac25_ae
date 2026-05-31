@@ -489,6 +489,11 @@ struct conv_ftl {
 	atomic64_t test_phase_host_read_phys_slc_ops; /* host read NAND ops whose NAND block is SLC */
 	atomic64_t test_phase_host_read_phys_qlc_ops; /* host read NAND ops whose NAND block is QLC */
 	atomic64_t test_phase_host_read_tier_mismatch_ops; /* is_slc_block disagrees with NAND block type */
+	atomic64_t test_phase_host_read_slc_pages;  /* active test-phase 4KB pages served from SLC */
+	atomic64_t test_phase_host_read_qlc_pages;  /* active test-phase 4KB pages served from QLC */
+	atomic64_t test_phase_host_read_phys_slc_pages; /* active test-phase 4KB pages whose NAND block is SLC */
+	atomic64_t test_phase_host_read_phys_qlc_pages; /* active test-phase 4KB pages whose NAND block is QLC */
+	atomic64_t test_phase_host_read_tier_mismatch_pages; /* active test-phase page-level tier mismatch */
 	atomic64_t test_phase_read_nand_bg_overlap_ops; /* foreground read NAND ops issued while bg active */
 	atomic64_t test_phase_host_write_pages;     /* host logical pages written during test phase */
 	atomic64_t test_phase_host_write_nand_ops;  /* foreground NAND writes issued by host writes */
