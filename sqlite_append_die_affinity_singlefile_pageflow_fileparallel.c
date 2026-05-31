@@ -754,6 +754,39 @@ static int write_string_file(const char *path, const char *value)
 	return 0;
 }
 
+static int make_ftl_debugfs_sibling_path(const char *path, const char *leaf,
+					 unsigned int ftl_idx, char *out,
+					 size_t out_sz)
+{
+	const char *tail;
+	const char *dir_start;
+	const char *p;
+	int written;
+
+	if (!path || !leaf || !out || out_sz == 0)
+		return -EINVAL;
+
+	tail = strrchr(path, '/');
+	if (!tail || strcmp(tail + 1, leaf) != 0)
+		return -EINVAL;
+
+	dir_start = tail;
+	while (dir_start > path && dir_start[-1] != '/')
+		dir_start--;
+	if (tail - dir_start < 4 || strncmp(dir_start, "ftl", 3) != 0)
+		return -EINVAL;
+	for (p = dir_start + 3; p < tail; p++) {
+		if (*p < '0' || *p > '9')
+			return -EINVAL;
+	}
+
+	written = snprintf(out, out_sz, "%.*sftl%u%s",
+			   (int)(dir_start - path), path, ftl_idx, tail);
+	if (written < 0 || (size_t)written >= out_sz)
+		return -ENAMETOOLONG;
+	return 0;
+}
+
 static const char *cold_full_read_mode_name(enum cold_full_read_mode mode)
 {
 	switch (mode) {
@@ -890,10 +923,39 @@ static int set_test_phase_state(const struct workload_options *opts,
 {
 	const char *value = enabled ? "1" : "0";
 	int rc;
+	unsigned int siblings_set = 0;
+	char sibling[PATH_MAX];
 
 	if (!opts || !opts->test_phase_path || !opts->test_phase_path[0])
 		return -EINVAL;
 
+	if (make_ftl_debugfs_sibling_path(opts->test_phase_path, "test_phase", 0,
+					  sibling, sizeof(sibling)) == 0) {
+		for (unsigned int i = 0; i < 256; i++) {
+			if (make_ftl_debugfs_sibling_path(opts->test_phase_path,
+							 "test_phase", i,
+							 sibling,
+							 sizeof(sibling)) != 0)
+				break;
+			rc = write_string_file(sibling, value);
+			if (rc != 0) {
+				if (siblings_set)
+					break;
+				goto single_path;
+			}
+			siblings_set++;
+		}
+		if (siblings_set) {
+			printf("[sqlite_init] test_phase=%s phase=%s paths=%u first=%s\n",
+			       enabled ? "on" : "off",
+			       phase ? phase : "phase",
+			       siblings_set,
+			       opts->test_phase_path);
+			return 0;
+		}
+	}
+
+single_path:
 	rc = write_string_file(opts->test_phase_path, value);
 	if (rc != 0) {
 		fprintf(stderr,
@@ -909,6 +971,54 @@ static int set_test_phase_state(const struct workload_options *opts,
 	       enabled ? "on" : "off",
 	       phase ? phase : "phase",
 	       opts->test_phase_path);
+	return 0;
+}
+
+static int advance_heat_epoch(const struct workload_options *opts, const char *phase)
+{
+	int rc;
+	unsigned int siblings_set = 0;
+	char sibling[PATH_MAX];
+
+	if (!opts || !opts->heat_epoch_path || !opts->heat_epoch_path[0])
+		return 0;
+
+	if (make_ftl_debugfs_sibling_path(opts->heat_epoch_path, "heat_epoch", 0,
+					  sibling, sizeof(sibling)) == 0) {
+		for (unsigned int i = 0; i < 256; i++) {
+			if (make_ftl_debugfs_sibling_path(opts->heat_epoch_path,
+							 "heat_epoch", i,
+							 sibling,
+							 sizeof(sibling)) != 0)
+				break;
+			rc = write_string_file(sibling, "1");
+			if (rc != 0) {
+				if (siblings_set)
+					break;
+				goto single_path;
+			}
+			siblings_set++;
+		}
+		if (siblings_set) {
+			printf("[sqlite_init] heat_epoch_advance phase=%s paths=%u first=%s\n",
+			       phase ? phase : "phase",
+			       siblings_set,
+			       opts->heat_epoch_path);
+			return 0;
+		}
+	}
+
+single_path:
+	rc = write_string_file(opts->heat_epoch_path, "1");
+	if (rc != 0) {
+		fprintf(stderr,
+			"[sqlite_init] failed to advance heat_epoch for %s via %s (%d)\n",
+			phase ? phase : "phase", opts->heat_epoch_path, rc);
+		return 0;
+	}
+
+	printf("[sqlite_init] heat_epoch_advance phase=%s path=%s\n",
+	       phase ? phase : "phase", opts->heat_epoch_path);
 	return 0;
 }
 
@@ -4432,6 +4542,9 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 					    opts->direct_io ? false : opts->strict_cold_per_select,
 					    read_plan,
 					    table_latency, table_read_ops, &event_elapsed);
+			if (rc != 0)
+				goto out;
+			rc = advance_heat_epoch(opts, "init-read-event");
 			if (rc != 0)
 				goto out;
 			total_read_time += event_elapsed;
