@@ -1,14 +1,19 @@
-; NVMeVirt latency-maintenance workload
-; Usage:
-;   sudo fio --filename=/dev/nvme0n1 evaluation/fio_latency_v2_mixed.fio \
-;     --output=result/latency_v2_mixed.json --output-format=json
+; NVMeVirt latency-maintenance mixed fio template.
 ;
-; Layout:
-;   0-8G  shared read/write measurement region
+; Intended runner:
+;   bash evaluation/fio_fragment_die_latency_mixed.sh
 ;
-; Init alternates 1G write + 10G normal-distribution read for 8 rounds:
-; total init write ~= 8G, total init read ~= 80G.  The final read/write jobs
-; run concurrently because there is no stonewall between them.
+; Workload shape:
+;   1. init_write_8g writes the whole 8 GiB measurement region.
+;   2. prewarm_seq_read reads that whole region once.
+;   3. prewarm_dist_read issues distribution-shaped random reads.
+;   4. measure_mixed is the only measured phase: randrw over the same
+;      initialized 8 GiB region, with the runner injecting read/write mix
+;      and random distribution.
+;
+; Standalone default is approximately read:write = 10:1 with normal reads.
+; The runner rewrites filename, random_distribution, rwmixread, sizes, job
+; counts, iodepths, logs, and test_phase hooks in a temporary jobfile.
 
 [global]
 ioengine=libaio
@@ -23,206 +28,59 @@ bs=4k
 iodepth=32
 filename=/dev/nvme0n1
 
-[init_write_0g_1g]
-description=Init round 1: write 1G before reading it.
+[init_write_8g]
+description=Init: sequentially write the entire 8 GiB mixed-test region.
 rw=write
 offset=0
-size=1G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_read_0g_1g]
-description=Init round 1: normal-distribution read 10G from the 1G just written.
-rw=randread
-random_distribution=normal
-offset=0
-size=1G
-io_size=10G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_write_1g_2g]
-description=Init round 2: write next 1G.
-rw=write
-offset=1G
-size=1G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_read_1g_2g]
-description=Init round 2: normal-distribution read 10G from the 1G just written.
-rw=randread
-random_distribution=normal
-offset=1G
-size=1G
-io_size=10G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_write_2g_3g]
-description=Init round 3: write next 1G.
-rw=write
-offset=2G
-size=1G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_read_2g_3g]
-description=Init round 3: normal-distribution read 10G from the 1G just written.
-rw=randread
-random_distribution=normal
-offset=2G
-size=1G
-io_size=10G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_write_3g_4g]
-description=Init round 4: write next 1G.
-rw=write
-offset=3G
-size=1G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_read_3g_4g]
-description=Init round 4: normal-distribution read 10G from the 1G just written.
-rw=randread
-random_distribution=normal
-offset=3G
-size=1G
-io_size=10G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_write_4g_5g]
-description=Init round 5: write next 1G.
-rw=write
-offset=4G
-size=1G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_read_4g_5g]
-description=Init round 5: normal-distribution read 10G from the 1G just written.
-rw=randread
-random_distribution=normal
-offset=4G
-size=1G
-io_size=10G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_write_5g_6g]
-description=Init round 6: write next 1G.
-rw=write
-offset=5G
-size=1G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_read_5g_6g]
-description=Init round 6: normal-distribution read 10G from the 1G just written.
-rw=randread
-random_distribution=normal
-offset=5G
-size=1G
-io_size=10G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_write_6g_7g]
-description=Init round 7: write next 1G.
-rw=write
-offset=6G
-size=1G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_read_6g_7g]
-description=Init round 7: normal-distribution read 10G from the 1G just written.
-rw=randread
-random_distribution=normal
-offset=6G
-size=1G
-io_size=10G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_write_7g_8g]
-description=Init round 8: write next 1G.
-rw=write
-offset=7G
-size=1G
-iodepth=32
-numjobs=1
-stonewall
-
-[init_read_7g_8g]
-description=Init round 8: normal-distribution read 10G from the 1G just written.
-rw=randread
-random_distribution=normal
-offset=7G
-size=1G
-io_size=10G
+size=8G
+io_size=8G
 iodepth=32
 numjobs=1
 stonewall
 
 [prewarm_seq_read]
-description=Sequential read warmup over the full initialized 8G region.
+description=Warmup: sequentially read the full initialized region once.
 rw=read
 offset=0
 size=8G
+io_size=8G
 iodepth=32
 numjobs=1
 stonewall
 
-[prewarm_normal_read]
-description=Normal-distribution random read warmup over the full initialized 8G region.
+[prewarm_dist_read]
+description=Warmup: distribution-shaped random reads over the initialized region.
 rw=randread
-random_distribution=normal
+random_distribution=normal:20
 offset=0
 size=8G
+io_size=16G
 iodepth=32
 numjobs=2
-io_size=16G
 stonewall
 
-[measure_reads]
-description=Measured normal-distribution reads; 2 jobs x 40G = about 80G total reads.
-rw=randread
-random_distribution=normal
+[enter_test_phase]
+description=Runner hook: enable FTL test_phase immediately before measurement.
+rw=read
 offset=0
-size=8G
-iodepth=16
-numjobs=2
-io_size=40G
-write_lat_log=lat_v2_read
-log_avg_msec=1000
+size=4k
+io_size=4k
+iodepth=1
+numjobs=1
+stonewall
 
-[measure_writes]
-description=Concurrent random writes; 2 jobs x 4G = about 8G total writes.
-rw=randwrite
-random_distribution=normal
+[measure_mixed]
+description=Measured phase: mixed random reads and overwrites over the initialized region.
+rw=randrw
+rwmixread=91
+random_distribution=normal:20
 offset=0
 size=8G
+io_size=88G
 iodepth=32
-numjobs=2
-io_size=4G
-write_lat_log=lat_v2_write
+numjobs=4
+write_lat_log=lat_v2_mixed
+write_bw_log=lat_v2_mixed
+write_iops_log=lat_v2_mixed
 log_avg_msec=1000
+stonewall
