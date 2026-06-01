@@ -4,16 +4,16 @@
 ;   bash evaluation/fio_fragment_die_latency_mixed.sh
 ;
 ; Workload shape:
-;   1. init_write_8g writes the whole 8 GiB measurement region.
-;   2. prewarm_seq_read reads that whole region once.
-;   3. prewarm_dist_read issues distribution-shaped random reads.
-;   4. measure_mixed is the only measured phase: randrw over the same
-;      initialized 8 GiB region, with the runner injecting read/write mix
-;      and random distribution.
+;   1. The runner writes the 8 GiB initialized region in 512 MiB chunks by
+;      default.
+;   2. After each write chunk, the runner generates a guarded distribution-read
+;      warmup over that just-written chunk before the next write chunk.
+;   3. The measured phase is two concurrent jobs: reads over the initialized
+;      0-8 GiB region and writes over a separate region starting at 8 GiB.
 ;
-; Standalone default is approximately read:write = 10:1 with normal reads.
-; The runner rewrites filename, random_distribution, rwmixread, sizes, job
-; counts, iodepths, logs, and test_phase hooks in a temporary jobfile.
+; Standalone default is approximately read:write = 10:1 with normal reads
+; and a fixed 5 GiB measured write budget.
+; The runner generates the actual per-ratio/per-distribution jobfile.
 
 [global]
 ioengine=libaio
@@ -54,9 +54,9 @@ rw=randread
 random_distribution=normal:20
 offset=0
 size=8G
-io_size=16G
+io_size=40G
 iodepth=32
-numjobs=2
+numjobs=1
 stonewall
 
 [enter_test_phase]
@@ -69,18 +69,30 @@ iodepth=1
 numjobs=1
 stonewall
 
-[measure_mixed]
-description=Measured phase: mixed random reads and overwrites over the initialized region.
-rw=randrw
-rwmixread=91
+[measure_reads]
+description=Measured phase reads: distribution-shaped reads from init-only region.
+rw=randread
 random_distribution=normal:20
 offset=0
 size=8G
-io_size=88G
+io_size=50G
 iodepth=32
-numjobs=4
-write_lat_log=lat_v2_mixed
-write_bw_log=lat_v2_mixed
-write_iops_log=lat_v2_mixed
+numjobs=1
+write_lat_log=lat_v2_mixed_read
+write_bw_log=lat_v2_mixed_read
+write_iops_log=lat_v2_mixed_read
 log_avg_msec=1000
-stonewall
+
+[measure_writes]
+description=Measured phase writes: random writes to a separate non-read region.
+rw=randwrite
+random_distribution=normal:20
+offset=8G
+size=5G
+io_size=5G
+iodepth=32
+numjobs=1
+write_lat_log=lat_v2_mixed_write
+write_bw_log=lat_v2_mixed_write
+write_iops_log=lat_v2_mixed_write
+log_avg_msec=1000

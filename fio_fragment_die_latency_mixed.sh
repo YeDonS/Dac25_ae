@@ -4,8 +4,8 @@ set -euo pipefail
 # fio_fragment_die_latency_mixed.sh
 #
 # FIO counterpart to the SQLite latency-maintenance experiment:
-#   - init writes an 8 GiB raw-device region
-#   - warmup reads that initialized region
+#   - init writes an 8 GiB raw-device region in 512 MiB chunks by default
+#   - each just-written chunk is distribution-read before the next write chunk
 #   - measured phase runs mixed random reads/overwrites with read:write ratios
 #     such as 10:1, 8:2, and 7:3
 #   - access distribution is swept across zipf and normal by default
@@ -26,13 +26,27 @@ FIO_ACCESS_DIST_LIST="${FIO_ACCESS_DIST_LIST:-${SQLITE_ACCESS_DIST_LIST:-zipf no
 FIO_RW_RATIOS="${FIO_RW_RATIOS:-10:1 8:2 7:3}"
 FIO_REGION_SIZE="${FIO_REGION_SIZE:-8G}"
 FIO_INIT_WRITE_BYTES="${FIO_INIT_WRITE_BYTES:-$FIO_REGION_SIZE}"
-FIO_PREWARM_SEQ_BYTES="${FIO_PREWARM_SEQ_BYTES:-$FIO_REGION_SIZE}"
-FIO_PREWARM_RANDOM_BYTES="${FIO_PREWARM_RANDOM_BYTES:-16G}"
+FIO_INIT_CHUNK_SIZE="${FIO_INIT_CHUNK_SIZE:-512M}"
+FIO_INIT_CHUNK_COUNT="${FIO_INIT_CHUNK_COUNT:-0}"
+FIO_INIT_PREWARM_BYTES_PER_CHUNK="${FIO_INIT_PREWARM_BYTES_PER_CHUNK:-${FIO_INIT_PREWARM_READ_BYTES:-5x}}"
+FIO_INIT_PREWARM_GUARD="${FIO_INIT_PREWARM_GUARD:-1}"
+FIO_PREWARM_SEQ_BYTES="${FIO_PREWARM_SEQ_BYTES:-0}"
+FIO_PREWARM_RANDOM_BYTES="${FIO_PREWARM_RANDOM_BYTES:-0}"
 FIO_MEASURE_TOTAL_BYTES="${FIO_MEASURE_TOTAL_BYTES:-88G}"
+FIO_MEASURE_READ_BYTES="${FIO_MEASURE_READ_BYTES:-}"
+FIO_MEASURE_WRITE_BYTES="${FIO_MEASURE_WRITE_BYTES:-5G}"
+FIO_MEASURE_WRITE_OFFSET="${FIO_MEASURE_WRITE_OFFSET:-$FIO_REGION_SIZE}"
+FIO_MEASURE_WRITE_REGION_SIZE="${FIO_MEASURE_WRITE_REGION_SIZE:-io_size}"
 FIO_PREWARM_JOBS="${FIO_PREWARM_JOBS:-2}"
 FIO_PREWARM_IODEPTH="${FIO_PREWARM_IODEPTH:-32}"
-FIO_MEASURE_JOBS="${FIO_MEASURE_JOBS:-${FIO_READ_JOBS:-4}}"
+FIO_INIT_PREWARM_JOBS="${FIO_INIT_PREWARM_JOBS:-1}"
+FIO_INIT_PREWARM_IODEPTH="${FIO_INIT_PREWARM_IODEPTH:-32}"
+FIO_MEASURE_JOBS="${FIO_MEASURE_JOBS:-${FIO_READ_JOBS:-1}}"
+FIO_MEASURE_READ_JOBS="${FIO_MEASURE_READ_JOBS:-$FIO_MEASURE_JOBS}"
+FIO_MEASURE_WRITE_JOBS="${FIO_MEASURE_WRITE_JOBS:-$FIO_MEASURE_JOBS}"
 FIO_MEASURE_IODEPTH="${FIO_MEASURE_IODEPTH:-${FIO_READ_IODEPTH:-32}}"
+FIO_MEASURE_READ_IODEPTH="${FIO_MEASURE_READ_IODEPTH:-$FIO_MEASURE_IODEPTH}"
+FIO_MEASURE_WRITE_IODEPTH="${FIO_MEASURE_WRITE_IODEPTH:-$FIO_MEASURE_IODEPTH}"
 FIO_MEASURE_RATE="${FIO_MEASURE_RATE:-}"
 FIO_MEASURE_RATE_IOPS="${FIO_MEASURE_RATE_IOPS:-}"
 FIO_ZIPF_ALPHA="${FIO_ZIPF_ALPHA:-${ZIPF_ALPHA:-0.75}}"
@@ -62,6 +76,37 @@ die() {
 
 size_tag() {
     printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'
+}
+
+size_to_bytes() {
+    local raw="$1"
+    local num unit
+
+    if [[ "$raw" =~ ^([0-9]+)([KkMmGgTt]?)$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+    else
+        die "invalid size '$raw'; use integer bytes or K/M/G/T suffix"
+    fi
+
+    case "$unit" in
+        K|k) echo $((num * 1024)) ;;
+        M|m) echo $((num * 1024 * 1024)) ;;
+        G|g) echo $((num * 1024 * 1024 * 1024)) ;;
+        T|t) echo $((num * 1024 * 1024 * 1024 * 1024)) ;;
+        *) echo "$num" ;;
+    esac
+}
+
+is_disabled_size() {
+    case "$1" in
+        0|0K|0k|0M|0m|0G|0g|0T|0t|off|none|skip)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 ratio_tag() {
@@ -100,6 +145,154 @@ ratio_to_mixread() {
             print pct
         }
     ' || die "invalid ratio '$ratio'"
+}
+
+ratio_to_measure_bytes() {
+    local ratio="$1"
+    local total_bytes
+    local total_pages
+    local configured_read_bytes
+    local configured_write_bytes
+    local read_part
+    local write_part
+    local read_pages
+    local write_pages
+
+    if [[ "$ratio" =~ ^([0-9]+)$ ]]; then
+        read_part="${BASH_REMATCH[1]}"
+        write_part=$((100 - read_part))
+    elif [[ "$ratio" =~ ^([0-9]+):([0-9]+)$ ]]; then
+        read_part="${BASH_REMATCH[1]}"
+        write_part="${BASH_REMATCH[2]}"
+    else
+        die "invalid FIO_RW_RATIOS entry '$ratio'; use read:write, e.g. 10:1"
+    fi
+
+    if [[ -n "$FIO_MEASURE_READ_BYTES" ]]; then
+        configured_read_bytes="$(size_to_bytes "$FIO_MEASURE_READ_BYTES")"
+        (( configured_read_bytes % 4096 == 0 )) || die "FIO_MEASURE_READ_BYTES must be 4K aligned"
+        read_pages=$((configured_read_bytes / 4096))
+    fi
+    if [[ -n "$FIO_MEASURE_WRITE_BYTES" ]]; then
+        configured_write_bytes="$(size_to_bytes "$FIO_MEASURE_WRITE_BYTES")"
+        (( configured_write_bytes % 4096 == 0 )) || die "FIO_MEASURE_WRITE_BYTES must be 4K aligned"
+        write_pages=$((configured_write_bytes / 4096))
+    fi
+
+    if [[ -n "$FIO_MEASURE_READ_BYTES" && -n "$FIO_MEASURE_WRITE_BYTES" ]]; then
+        :
+    elif [[ -n "$FIO_MEASURE_WRITE_BYTES" ]]; then
+        read_pages="$(awk -v wp="$write_pages" -v r="$read_part" -v w="$write_part" '
+            BEGIN {
+                if (r <= 0 || w <= 0 || wp <= 0) exit 1
+                pages = int((wp * r / w) + 0.5)
+                if (pages < 1) pages = 1
+                print pages
+            }
+        ')" || die "invalid ratio '$ratio'"
+    elif [[ -n "$FIO_MEASURE_READ_BYTES" ]]; then
+        write_pages="$(awk -v rp="$read_pages" -v r="$read_part" -v w="$write_part" '
+            BEGIN {
+                if (r <= 0 || w <= 0 || rp <= 0) exit 1
+                pages = int((rp * w / r) + 0.5)
+                if (pages < 1) pages = 1
+                print pages
+            }
+        ')" || die "invalid ratio '$ratio'"
+    else
+        total_bytes="$(size_to_bytes "$FIO_MEASURE_TOTAL_BYTES")"
+        (( total_bytes % 4096 == 0 )) || die "FIO_MEASURE_TOTAL_BYTES must be 4K aligned"
+        total_pages=$((total_bytes / 4096))
+        read_pages="$(awk -v total="$total_pages" -v r="$read_part" -v w="$write_part" '
+            BEGIN {
+                if (r <= 0 || w <= 0) exit 1
+                pages = int((total * r / (r + w)) + 0.5)
+                if (pages < 1) pages = 1
+                if (pages >= total) pages = total - 1
+                print pages
+            }
+        ')" || die "invalid ratio '$ratio'"
+        write_pages=$((total_pages - read_pages))
+    fi
+
+    echo "$((read_pages * 4096)) $((write_pages * 4096))"
+}
+
+prewarm_bytes_for_chunk() {
+    local chunk_bytes="$1"
+    local spec="$FIO_INIT_PREWARM_BYTES_PER_CHUNK"
+    local multiplier
+
+    if is_disabled_size "$spec"; then
+        echo 0
+    elif [[ "$spec" == "chunk" ]]; then
+        echo "$chunk_bytes"
+    elif [[ "$spec" =~ ^([0-9]+)[xX]$ ]]; then
+        multiplier="${BASH_REMATCH[1]}"
+        echo $((chunk_bytes * multiplier))
+    elif [[ "$spec" =~ ^([0-9]+)[*]chunk$ ]]; then
+        multiplier="${BASH_REMATCH[1]}"
+        echo $((chunk_bytes * multiplier))
+    else
+        size_to_bytes "$spec"
+    fi
+}
+
+init_plan_summary() {
+    local region_bytes
+    local init_bytes
+    local chunk_size_bytes
+    local chunk_count
+    local offset_bytes=0
+    local init_read_bytes=0
+
+    region_bytes="$(size_to_bytes "$FIO_REGION_SIZE")"
+    if is_disabled_size "$FIO_INIT_WRITE_BYTES"; then
+        init_bytes=0
+    else
+        init_bytes="$(size_to_bytes "$FIO_INIT_WRITE_BYTES")"
+    fi
+    (( init_bytes <= region_bytes )) || die "FIO_INIT_WRITE_BYTES must not exceed FIO_REGION_SIZE"
+    (( init_bytes % 4096 == 0 )) || die "FIO_INIT_WRITE_BYTES must be 4K aligned"
+
+    if (( init_bytes == 0 )); then
+        echo "0 0 0"
+        return 0
+    fi
+
+    if [[ "$FIO_INIT_CHUNK_COUNT" =~ ^[0-9]+$ ]] && (( FIO_INIT_CHUNK_COUNT > 0 )); then
+        chunk_count="$FIO_INIT_CHUNK_COUNT"
+    else
+        chunk_size_bytes="$(size_to_bytes "$FIO_INIT_CHUNK_SIZE")"
+        (( chunk_size_bytes > 0 )) || die "FIO_INIT_CHUNK_SIZE must be positive"
+        (( chunk_size_bytes % 4096 == 0 )) || die "FIO_INIT_CHUNK_SIZE must be 4K aligned"
+        chunk_count=$(((init_bytes + chunk_size_bytes - 1) / chunk_size_bytes))
+    fi
+
+    if [[ "$FIO_INIT_CHUNK_COUNT" =~ ^[0-9]+$ ]] && (( FIO_INIT_CHUNK_COUNT > 0 )); then
+        local base_pages=$((init_bytes / 4096 / chunk_count))
+        local extra_pages=$((init_bytes / 4096 % chunk_count))
+        for ((i = 0; i < chunk_count; i++)); do
+            local pages=$base_pages
+            if (( i < extra_pages )); then
+                pages=$((pages + 1))
+            fi
+            local this_chunk_bytes=$((pages * 4096))
+            init_read_bytes=$((init_read_bytes + $(prewarm_bytes_for_chunk "$this_chunk_bytes")))
+        done
+    else
+        for ((i = 0; i < chunk_count; i++)); do
+            local remaining=$((init_bytes - offset_bytes))
+            local this_chunk_bytes="$chunk_size_bytes"
+            if (( remaining < this_chunk_bytes )); then
+                this_chunk_bytes="$remaining"
+            fi
+            init_read_bytes=$((init_read_bytes + $(prewarm_bytes_for_chunk "$this_chunk_bytes")))
+            offset_bytes=$((offset_bytes + this_chunk_bytes))
+        done
+    fi
+
+    echo "$chunk_count $init_bytes $init_read_bytes"
 }
 
 dist_to_fio() {
@@ -255,141 +448,255 @@ load_variant_module() {
     sleep 1
 }
 
+emit_guard_toggle_job() {
+    local name="$1"
+    local value="$2"
+    local offset_bytes="$3"
+    local test_phase_hook_path="$4"
+
+    [[ -n "$test_phase_hook_path" ]] || return 0
+
+    echo "[$name]"
+    echo "description=Set FTL test_phase=$value for guarded init prewarm."
+    echo "rw=read"
+    echo "offset=$offset_bytes"
+    echo "size=4k"
+    echo "io_size=4k"
+    echo "iodepth=1"
+    echo "numjobs=1"
+    echo "exec_prerun=echo $value > $test_phase_hook_path"
+    echo "stonewall"
+    echo ""
+}
+
+emit_init_chunk() {
+    local index="$1"
+    local offset_bytes="$2"
+    local chunk_bytes="$3"
+    local fio_dist="$4"
+    local test_phase_hook_path="$5"
+    local idx
+    local suffix
+    local prewarm_io_size
+
+    printf -v idx "%03d" "$index"
+    suffix="_$idx"
+    if [[ "$FIO_INIT_CHUNK_COUNT" == "1" ]]; then
+        suffix=""
+    fi
+
+    echo "[init_write${suffix}]"
+    echo "description=Init: write initialized region before prewarming it."
+    echo "rw=write"
+    echo "offset=$offset_bytes"
+    echo "size=$chunk_bytes"
+    echo "io_size=$chunk_bytes"
+    echo "iodepth=32"
+    echo "numjobs=1"
+    echo "stonewall"
+    echo ""
+
+    prewarm_io_size="$(prewarm_bytes_for_chunk "$chunk_bytes")"
+    if (( prewarm_io_size == 0 )); then
+        return 0
+    fi
+
+    if [[ "$FIO_INIT_PREWARM_GUARD" == "1" ]]; then
+        emit_guard_toggle_job "init_guard_on${suffix}" 1 "$offset_bytes" "$test_phase_hook_path"
+    fi
+
+    echo "[init_prewarm${suffix}]"
+    echo "description=Init: distribution-shaped read prewarm over the just-written region."
+    echo "rw=randread"
+    echo "random_distribution=$fio_dist"
+    echo "offset=$offset_bytes"
+    echo "size=$chunk_bytes"
+    echo "io_size=$prewarm_io_size"
+    echo "iodepth=$FIO_INIT_PREWARM_IODEPTH"
+    echo "numjobs=$FIO_INIT_PREWARM_JOBS"
+    echo "stonewall"
+    echo ""
+
+    if [[ "$FIO_INIT_PREWARM_GUARD" == "1" ]]; then
+        emit_guard_toggle_job "init_guard_off${suffix}" 0 "$offset_bytes" "$test_phase_hook_path"
+    fi
+}
+
 render_fio_job() {
     local out_job="$1"
     local fio_dist="$2"
     local mixread="$3"
     local log_prefix="$4"
     local test_phase_hook_path="$5"
+    local measure_read_bytes="$6"
+    local measure_write_bytes="$7"
+    local region_bytes
+    local init_bytes
+    local chunk_size_bytes
+    local chunk_count
+    local base_pages
+    local extra_pages
+    local offset_bytes=0
+    local prewarm_bytes
+    local page_bytes=4096
+    local init_plan
+    local init_plan_chunks
+    local init_plan_write_bytes
+    local init_plan_read_bytes
+    local write_region_size
 
-    awk \
-        -v filename="$DATA_DEV" \
-        -v region_size="$FIO_REGION_SIZE" \
-        -v init_write_bytes="$FIO_INIT_WRITE_BYTES" \
-        -v prewarm_seq_bytes="$FIO_PREWARM_SEQ_BYTES" \
-        -v prewarm_random_bytes="$FIO_PREWARM_RANDOM_BYTES" \
-        -v prewarm_jobs="$FIO_PREWARM_JOBS" \
-        -v prewarm_iodepth="$FIO_PREWARM_IODEPTH" \
-        -v measure_total_bytes="$FIO_MEASURE_TOTAL_BYTES" \
-        -v measure_jobs="$FIO_MEASURE_JOBS" \
-        -v measure_iodepth="$FIO_MEASURE_IODEPTH" \
-        -v fio_dist="$fio_dist" \
-        -v mixread="$mixread" \
-        -v log_prefix="$log_prefix" \
-        -v test_phase_hook_path="$test_phase_hook_path" \
-        -v measure_rate="$FIO_MEASURE_RATE" \
-        -v measure_rate_iops="$FIO_MEASURE_RATE_IOPS" '
-        function emit_enter_hook() {
-            if (section == "enter_test_phase" && !enter_hook_done) {
-                if (test_phase_hook_path != "")
-                    print "exec_prerun=echo 1 > " test_phase_hook_path
-                enter_hook_done = 1
-            }
-        }
-        function emit_measure_extras() {
-            if (section == "measure_mixed" && !measure_extra_done) {
-                if (measure_rate != "") print "rate=" measure_rate
-                if (measure_rate_iops != "") print "rate_iops=" measure_rate_iops
-                measure_extra_done = 1
-            }
-        }
-        /^\[/ {
-            emit_enter_hook()
-            emit_measure_extras()
-            section = $0
-            gsub(/^\[/, "", section)
-            gsub(/\]$/, "", section)
-            print
-            next
-        }
-        section == "global" && /^filename=/ {
-            print "filename=" filename
-            next
-        }
-        section == "init_write_8g" && /^size=/ {
-            print "size=" region_size
-            next
-        }
-        section == "init_write_8g" && /^io_size=/ {
-            print "io_size=" init_write_bytes
-            next
-        }
-        section == "prewarm_seq_read" && /^size=/ {
-            print "size=" region_size
-            next
-        }
-        section == "prewarm_seq_read" && /^io_size=/ {
-            print "io_size=" prewarm_seq_bytes
-            next
-        }
-        section == "prewarm_dist_read" && /^size=/ {
-            print "size=" region_size
-            next
-        }
-        section == "prewarm_dist_read" && /^io_size=/ {
-            print "io_size=" prewarm_random_bytes
-            next
-        }
-        section == "prewarm_dist_read" && /^random_distribution=/ {
-            print "random_distribution=" fio_dist
-            next
-        }
-        section == "prewarm_dist_read" && /^numjobs=/ {
-            print "numjobs=" prewarm_jobs
-            next
-        }
-        section == "prewarm_dist_read" && /^iodepth=/ {
-            print "iodepth=" prewarm_iodepth
-            next
-        }
-        section == "measure_mixed" && /^size=/ {
-            print "size=" region_size
-            next
-        }
-        section == "measure_mixed" && /^io_size=/ {
-            print "io_size=" measure_total_bytes
-            next
-        }
-        section == "measure_mixed" && /^random_distribution=/ {
-            print "random_distribution=" fio_dist
-            next
-        }
-        section == "measure_mixed" && /^rwmixread=/ {
-            print "rwmixread=" mixread
-            next
-        }
-        section == "measure_mixed" && /^numjobs=/ {
-            print "numjobs=" measure_jobs
-            next
-        }
-        section == "measure_mixed" && /^iodepth=/ {
-            print "iodepth=" measure_iodepth
-            next
-        }
-        section == "measure_mixed" && /^write_lat_log=/ {
-            print "write_lat_log=" log_prefix
-            next
-        }
-        section == "measure_mixed" && /^write_bw_log=/ {
-            print "write_bw_log=" log_prefix
-            next
-        }
-        section == "measure_mixed" && /^write_iops_log=/ {
-            print "write_iops_log=" log_prefix
-            next
-        }
-        section == "measure_mixed" && /^(rate|rate_iops)=/ {
-            next
-        }
-        section == "enter_test_phase" && /^exec_prerun=/ {
-            next
-        }
-        { print }
-        END {
-            emit_enter_hook()
-            emit_measure_extras()
-        }
-    ' "$FIO_JOB_FILE" >"$out_job"
+    region_bytes="$(size_to_bytes "$FIO_REGION_SIZE")"
+    if is_disabled_size "$FIO_INIT_WRITE_BYTES"; then
+        init_bytes=0
+    else
+        init_bytes="$(size_to_bytes "$FIO_INIT_WRITE_BYTES")"
+    fi
+    (( init_bytes <= region_bytes )) || die "FIO_INIT_WRITE_BYTES must not exceed FIO_REGION_SIZE"
+    (( init_bytes % page_bytes == 0 )) || die "FIO_INIT_WRITE_BYTES must be 4K aligned"
+
+    init_plan="$(init_plan_summary)"
+    read -r init_plan_chunks init_plan_write_bytes init_plan_read_bytes <<<"$init_plan"
+    if [[ "$FIO_MEASURE_WRITE_REGION_SIZE" == "io_size" ]]; then
+        write_region_size="$measure_write_bytes"
+    else
+        write_region_size="$FIO_MEASURE_WRITE_REGION_SIZE"
+    fi
+
+    {
+        echo "; Generated by fio_fragment_die_latency_mixed.sh"
+        echo "; variant/access/ratio are encoded in the output path."
+        echo "; init writes are chunked; each chunk is prewarmed before the next chunk."
+        echo "; init_chunk_count=$init_plan_chunks"
+        echo "; init_write_bytes=$init_plan_write_bytes"
+        echo "; init_prewarm_read_bytes=$init_plan_read_bytes"
+        echo "; measure_read_bytes=$measure_read_bytes"
+        echo "; measure_write_bytes=$measure_write_bytes"
+        echo "; measure_read_offset=0"
+        echo "; measure_write_offset=$FIO_MEASURE_WRITE_OFFSET"
+        echo "; measure_write_region_size=$write_region_size"
+        echo ""
+        echo "[global]"
+        echo "ioengine=libaio"
+        echo "direct=1"
+        echo "thread=1"
+        echo "group_reporting=1"
+        echo "time_based=0"
+        echo "norandommap=1"
+        echo "randrepeat=0"
+        echo "invalidate=1"
+        echo "bs=4k"
+        echo "iodepth=32"
+        echo "filename=$DATA_DEV"
+        echo ""
+
+        if (( init_bytes > 0 )); then
+            if [[ "$FIO_INIT_CHUNK_COUNT" =~ ^[0-9]+$ ]] && (( FIO_INIT_CHUNK_COUNT > 0 )); then
+                chunk_count="$FIO_INIT_CHUNK_COUNT"
+                (( init_bytes / page_bytes >= chunk_count )) || die "FIO_INIT_CHUNK_COUNT is larger than the 4K page count in init bytes"
+                base_pages=$((init_bytes / page_bytes / chunk_count))
+                extra_pages=$((init_bytes / page_bytes % chunk_count))
+                for ((i = 0; i < chunk_count; i++)); do
+                    local pages=$base_pages
+                    if (( i < extra_pages )); then
+                        pages=$((pages + 1))
+                    fi
+                    local this_chunk_bytes=$((pages * page_bytes))
+                    emit_init_chunk "$i" "$offset_bytes" "$this_chunk_bytes" "$fio_dist" "$test_phase_hook_path"
+                    offset_bytes=$((offset_bytes + this_chunk_bytes))
+                done
+            else
+                chunk_size_bytes="$(size_to_bytes "$FIO_INIT_CHUNK_SIZE")"
+                (( chunk_size_bytes > 0 )) || die "FIO_INIT_CHUNK_SIZE must be positive"
+                (( chunk_size_bytes % page_bytes == 0 )) || die "FIO_INIT_CHUNK_SIZE must be 4K aligned"
+                chunk_count=$(((init_bytes + chunk_size_bytes - 1) / chunk_size_bytes))
+                for ((i = 0; i < chunk_count; i++)); do
+                    local remaining=$((init_bytes - offset_bytes))
+                    local this_chunk_bytes="$chunk_size_bytes"
+                    if (( remaining < this_chunk_bytes )); then
+                        this_chunk_bytes="$remaining"
+                    fi
+                    emit_init_chunk "$i" "$offset_bytes" "$this_chunk_bytes" "$fio_dist" "$test_phase_hook_path"
+                    offset_bytes=$((offset_bytes + this_chunk_bytes))
+                done
+            fi
+        fi
+
+        if ! is_disabled_size "$FIO_PREWARM_SEQ_BYTES"; then
+            echo "[prewarm_seq_read]"
+            echo "description=Optional post-init sequential read over the initialized region."
+            echo "rw=read"
+            echo "offset=0"
+            echo "size=$FIO_REGION_SIZE"
+            echo "io_size=$FIO_PREWARM_SEQ_BYTES"
+            echo "iodepth=32"
+            echo "numjobs=1"
+            echo "stonewall"
+            echo ""
+        fi
+
+        if ! is_disabled_size "$FIO_PREWARM_RANDOM_BYTES"; then
+            echo "[prewarm_dist_read]"
+            echo "description=Optional post-init distribution-shaped random read warmup."
+            echo "rw=randread"
+            echo "random_distribution=$fio_dist"
+            echo "offset=0"
+            echo "size=$FIO_REGION_SIZE"
+            echo "io_size=$FIO_PREWARM_RANDOM_BYTES"
+            echo "iodepth=$FIO_PREWARM_IODEPTH"
+            echo "numjobs=$FIO_PREWARM_JOBS"
+            echo "stonewall"
+            echo ""
+        fi
+
+        echo "[enter_test_phase]"
+        echo "description=Enable FTL test_phase immediately before measurement."
+        echo "rw=read"
+        echo "offset=0"
+        echo "size=4k"
+        echo "io_size=4k"
+        echo "iodepth=1"
+        echo "numjobs=1"
+        if [[ -n "$test_phase_hook_path" ]]; then
+            echo "exec_prerun=echo 1 > $test_phase_hook_path"
+        fi
+        echo "stonewall"
+        echo ""
+
+        echo "[measure_reads]"
+        echo "description=Measured phase reads: distribution-shaped reads from init-only region."
+        echo "rw=randread"
+        echo "random_distribution=$fio_dist"
+        echo "offset=0"
+        echo "size=$FIO_REGION_SIZE"
+        echo "io_size=$measure_read_bytes"
+        echo "iodepth=$FIO_MEASURE_READ_IODEPTH"
+        echo "numjobs=$FIO_MEASURE_READ_JOBS"
+        echo "write_lat_log=${log_prefix}_read"
+        echo "write_bw_log=${log_prefix}_read"
+        echo "write_iops_log=${log_prefix}_read"
+        echo "log_avg_msec=1000"
+        if [[ -n "$FIO_MEASURE_RATE" ]]; then
+            echo "rate=$FIO_MEASURE_RATE"
+        fi
+        if [[ -n "$FIO_MEASURE_RATE_IOPS" ]]; then
+            echo "rate_iops=$FIO_MEASURE_RATE_IOPS"
+        fi
+        echo ""
+
+        echo "[measure_writes]"
+        echo "description=Measured phase writes: random writes to a separate non-read region."
+        echo "rw=randwrite"
+        echo "random_distribution=$fio_dist"
+        echo "offset=$FIO_MEASURE_WRITE_OFFSET"
+        echo "size=$write_region_size"
+        echo "io_size=$measure_write_bytes"
+        echo "iodepth=$FIO_MEASURE_WRITE_IODEPTH"
+        echo "numjobs=$FIO_MEASURE_WRITE_JOBS"
+        echo "write_lat_log=${log_prefix}_write"
+        echo "write_bw_log=${log_prefix}_write"
+        echo "write_iops_log=${log_prefix}_write"
+        echo "log_avg_msec=1000"
+    } >"$out_job"
 }
 
 run_fio_one_case() {
@@ -398,6 +705,13 @@ run_fio_one_case() {
     local ratio="$3"
     local mixread
     local fio_dist
+    local measure_bytes
+    local measure_read_bytes
+    local measure_write_bytes
+    local init_plan
+    local init_plan_chunks
+    local init_plan_write_bytes
+    local init_plan_read_bytes
     local ts
     local tag
     local out_dir
@@ -409,6 +723,10 @@ run_fio_one_case() {
 
     mixread="$(ratio_to_mixread "$ratio")"
     fio_dist="$(dist_to_fio "$access_dist")"
+    measure_bytes="$(ratio_to_measure_bytes "$ratio")"
+    read -r measure_read_bytes measure_write_bytes <<<"$measure_bytes"
+    init_plan="$(init_plan_summary)"
+    read -r init_plan_chunks init_plan_write_bytes init_plan_read_bytes <<<"$init_plan"
     ts="$(date +%Y%m%d_%H%M%S)"
     tag="fio_mixed_${variant}_$(dist_tag "$access_dist")_rw$(ratio_tag "$ratio")_${ts}"
     out_dir="${FIO_OUTPUT_DIR%/}/${variant}/$(dist_tag "$access_dist")/rw$(ratio_tag "$ratio")"
@@ -421,8 +739,11 @@ run_fio_one_case() {
 
     echo ""
     echo "================================================================"
-    echo "  [FIO-LATENCY-MIXED] variant=$variant dist=$access_dist($fio_dist) ratio=$ratio rwmixread=$mixread"
-    echo "  region=$FIO_REGION_SIZE init_write=$FIO_INIT_WRITE_BYTES prewarm_seq=$FIO_PREWARM_SEQ_BYTES prewarm_random=$FIO_PREWARM_RANDOM_BYTES measure_total=$FIO_MEASURE_TOTAL_BYTES"
+    echo "  [FIO-LATENCY-MIXED] variant=$variant dist=$access_dist($fio_dist) ratio=$ratio"
+    echo "  region=$FIO_REGION_SIZE init_write=$FIO_INIT_WRITE_BYTES init_chunk_size=$FIO_INIT_CHUNK_SIZE init_chunk_count=$FIO_INIT_CHUNK_COUNT init_prewarm_per_chunk=$FIO_INIT_PREWARM_BYTES_PER_CHUNK init_prewarm_guard=$FIO_INIT_PREWARM_GUARD"
+    echo "  init_plan_chunks=$init_plan_chunks init_write_bytes=$init_plan_write_bytes init_prewarm_read_bytes=$init_plan_read_bytes"
+    echo "  post_prewarm_seq=$FIO_PREWARM_SEQ_BYTES post_prewarm_random=$FIO_PREWARM_RANDOM_BYTES measure_total_fallback=$FIO_MEASURE_TOTAL_BYTES"
+    echo "  measure_read_bytes=$measure_read_bytes measure_write_bytes=$measure_write_bytes read_range=0+$FIO_REGION_SIZE write_range=${FIO_MEASURE_WRITE_OFFSET}+${FIO_MEASURE_WRITE_REGION_SIZE}"
     echo "  measure_jobs=$FIO_MEASURE_JOBS measure_iodepth=$FIO_MEASURE_IODEPTH gc_nand_timing=$FIO_GC_NAND_TIMING recent_write_guard=$FIO_TEST_PHASE_RECENT_WRITE_GUARD guard_read_reqs=$FIO_TEST_PHASE_GUARD_READ_REQS"
     echo "================================================================"
 
@@ -442,7 +763,7 @@ run_fio_one_case() {
         test_phase_hook_path="$FIO_TEST_PHASE_PATH"
     fi
 
-    render_fio_job "$fio_job_tmp" "$fio_dist" "$mixread" "$log_prefix" "$test_phase_hook_path"
+    render_fio_job "$fio_job_tmp" "$fio_dist" "$mixread" "$log_prefix" "$test_phase_hook_path" "$measure_read_bytes" "$measure_write_bytes"
     cp "$fio_job_tmp" "$fio_job_saved"
 
     echo "=== fio jobfile: $fio_job_saved ==="
