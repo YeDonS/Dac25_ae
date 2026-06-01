@@ -56,6 +56,8 @@ FIO_DRY_RUN="${FIO_DRY_RUN:-0}"
 FIO_OUTPUT_DIR="${FIO_OUTPUT_DIR:-${RESULT_FOLDER%/}/fio_latency_mixed}"
 
 FIO_TEST_PHASE_PATH="${FIO_TEST_PHASE_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase}"
+FIO_HEAT_EPOCH_PATH="${FIO_HEAT_EPOCH_PATH:-/sys/kernel/debug/nvmev/ftl0/heat_epoch}"
+FIO_INIT_ADVANCE_HEAT_EPOCH_EACH_CHUNK="${FIO_INIT_ADVANCE_HEAT_EPOCH_EACH_CHUNK:-1}"
 FIO_TEST_PHASE_STATS_PATH="${FIO_TEST_PHASE_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase_stats}"
 FIO_SUPERBLOCK_STATS_PATH="${FIO_SUPERBLOCK_STATS_PATH:-/sys/kernel/debug/nvmev/ftl0/superblock_stats}"
 FIO_DIE_STATS_PATH="${FIO_DIE_STATS_PATH:-/sys/module/nvmev/parameters/die_stats}"
@@ -469,12 +471,34 @@ emit_guard_toggle_job() {
     echo ""
 }
 
+emit_heat_epoch_advance_job() {
+    local name="$1"
+    local offset_bytes="$2"
+    local heat_epoch_path="$3"
+
+    [[ -n "$heat_epoch_path" ]] || return 0
+    [[ "$FIO_INIT_ADVANCE_HEAT_EPOCH_EACH_CHUNK" == "1" ]] || return 0
+
+    echo "[$name]"
+    echo "description=Advance FTL heat_epoch after guarded init prewarm."
+    echo "rw=read"
+    echo "offset=$offset_bytes"
+    echo "size=4k"
+    echo "io_size=4k"
+    echo "iodepth=1"
+    echo "numjobs=1"
+    echo "exec_prerun=echo 1 > $heat_epoch_path"
+    echo "stonewall"
+    echo ""
+}
+
 emit_init_chunk() {
     local index="$1"
     local offset_bytes="$2"
     local chunk_bytes="$3"
     local fio_dist="$4"
     local test_phase_hook_path="$5"
+    local heat_epoch_path="$6"
     local idx
     local suffix
     local prewarm_io_size
@@ -520,6 +544,7 @@ emit_init_chunk() {
     if [[ "$FIO_INIT_PREWARM_GUARD" == "1" ]]; then
         emit_guard_toggle_job "init_guard_off${suffix}" 0 "$offset_bytes" "$test_phase_hook_path"
     fi
+    emit_heat_epoch_advance_job "init_heat_epoch_advance${suffix}" "$offset_bytes" "$heat_epoch_path"
 }
 
 render_fio_job() {
@@ -530,6 +555,7 @@ render_fio_job() {
     local test_phase_hook_path="$5"
     local measure_read_bytes="$6"
     local measure_write_bytes="$7"
+    local heat_epoch_path="${8:-}"
     local region_bytes
     local init_bytes
     local chunk_size_bytes
@@ -569,6 +595,7 @@ render_fio_job() {
         echo "; init_chunk_count=$init_plan_chunks"
         echo "; init_write_bytes=$init_plan_write_bytes"
         echo "; init_prewarm_read_bytes=$init_plan_read_bytes"
+        echo "; init_advance_heat_epoch_each_chunk=$FIO_INIT_ADVANCE_HEAT_EPOCH_EACH_CHUNK"
         echo "; measure_read_bytes=$measure_read_bytes"
         echo "; measure_write_bytes=$measure_write_bytes"
         echo "; measure_read_offset=0"
@@ -601,7 +628,7 @@ render_fio_job() {
                         pages=$((pages + 1))
                     fi
                     local this_chunk_bytes=$((pages * page_bytes))
-                    emit_init_chunk "$i" "$offset_bytes" "$this_chunk_bytes" "$fio_dist" "$test_phase_hook_path"
+                    emit_init_chunk "$i" "$offset_bytes" "$this_chunk_bytes" "$fio_dist" "$test_phase_hook_path" "$heat_epoch_path"
                     offset_bytes=$((offset_bytes + this_chunk_bytes))
                 done
             else
@@ -615,7 +642,7 @@ render_fio_job() {
                     if (( remaining < this_chunk_bytes )); then
                         this_chunk_bytes="$remaining"
                     fi
-                    emit_init_chunk "$i" "$offset_bytes" "$this_chunk_bytes" "$fio_dist" "$test_phase_hook_path"
+                    emit_init_chunk "$i" "$offset_bytes" "$this_chunk_bytes" "$fio_dist" "$test_phase_hook_path" "$heat_epoch_path"
                     offset_bytes=$((offset_bytes + this_chunk_bytes))
                 done
             fi
@@ -720,6 +747,7 @@ run_fio_one_case() {
     local fio_job_saved
     local log_prefix
     local test_phase_hook_path=""
+    local heat_epoch_hook_path=""
 
     mixread="$(ratio_to_mixread "$ratio")"
     fio_dist="$(dist_to_fio "$access_dist")"
@@ -742,6 +770,7 @@ run_fio_one_case() {
     echo "  [FIO-LATENCY-MIXED] variant=$variant dist=$access_dist($fio_dist) ratio=$ratio"
     echo "  region=$FIO_REGION_SIZE init_write=$FIO_INIT_WRITE_BYTES init_chunk_size=$FIO_INIT_CHUNK_SIZE init_chunk_count=$FIO_INIT_CHUNK_COUNT init_prewarm_per_chunk=$FIO_INIT_PREWARM_BYTES_PER_CHUNK init_prewarm_guard=$FIO_INIT_PREWARM_GUARD"
     echo "  init_plan_chunks=$init_plan_chunks init_write_bytes=$init_plan_write_bytes init_prewarm_read_bytes=$init_plan_read_bytes"
+    echo "  init_advance_heat_epoch_each_chunk=$FIO_INIT_ADVANCE_HEAT_EPOCH_EACH_CHUNK heat_epoch_path=$FIO_HEAT_EPOCH_PATH"
     echo "  post_prewarm_seq=$FIO_PREWARM_SEQ_BYTES post_prewarm_random=$FIO_PREWARM_RANDOM_BYTES measure_total_fallback=$FIO_MEASURE_TOTAL_BYTES"
     echo "  measure_read_bytes=$measure_read_bytes measure_write_bytes=$measure_write_bytes read_range=0+$FIO_REGION_SIZE write_range=${FIO_MEASURE_WRITE_OFFSET}+${FIO_MEASURE_WRITE_REGION_SIZE}"
     echo "  measure_jobs=$FIO_MEASURE_JOBS measure_iodepth=$FIO_MEASURE_IODEPTH gc_nand_timing=$FIO_GC_NAND_TIMING recent_write_guard=$FIO_TEST_PHASE_RECENT_WRITE_GUARD guard_read_reqs=$FIO_TEST_PHASE_GUARD_READ_REQS"
@@ -759,11 +788,17 @@ run_fio_one_case() {
         else
             echo "[test_phase] $FIO_TEST_PHASE_PATH not present; generated job will run without test_phase hook" >&2
         fi
+        if [[ -e "$FIO_HEAT_EPOCH_PATH" ]]; then
+            heat_epoch_hook_path="$FIO_HEAT_EPOCH_PATH"
+        else
+            echo "[heat_epoch] $FIO_HEAT_EPOCH_PATH not present; generated job will run without init heat_epoch advance hook" >&2
+        fi
     else
         test_phase_hook_path="$FIO_TEST_PHASE_PATH"
+        heat_epoch_hook_path="$FIO_HEAT_EPOCH_PATH"
     fi
 
-    render_fio_job "$fio_job_tmp" "$fio_dist" "$mixread" "$log_prefix" "$test_phase_hook_path" "$measure_read_bytes" "$measure_write_bytes"
+    render_fio_job "$fio_job_tmp" "$fio_dist" "$mixread" "$log_prefix" "$test_phase_hook_path" "$measure_read_bytes" "$measure_write_bytes" "$heat_epoch_hook_path"
     cp "$fio_job_tmp" "$fio_job_saved"
 
     echo "=== fio jobfile: $fio_job_saved ==="
