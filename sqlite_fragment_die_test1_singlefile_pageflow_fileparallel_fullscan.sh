@@ -16,7 +16,9 @@ source commonvariables.sh
 
 # ---------- tunables ----------
 THREAD_COUNTS="${THREAD_COUNTS:-1 8}"
-VARIANTS="${VARIANTS:-die_base die_no1 die_base_lru die_no4}"
+# Include die_latency1_qlc_hotcold_sb as the placement-only ablation:
+# latency1 baseline scheduling + QLC hot/cold placement, with QLC rebalance off.
+VARIANTS="${VARIANTS:-die_base die_no1 die_base_lru die_no4 die_latency1_qlc_hotcold_sb}"
 
 SQLITE_TARGET_BYTES=${SQLITE_TARGET_BYTES:-10G}
 SQLITE_TABLE_COUNT=${SQLITE_TABLE_COUNT:-80}

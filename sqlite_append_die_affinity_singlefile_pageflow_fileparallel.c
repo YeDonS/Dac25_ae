@@ -1128,6 +1128,95 @@ static int cmp_double(const void *a, const void *b)
 	return 0;
 }
 
+struct cold_latency_samples {
+	double *values;
+	size_t count;
+	size_t cap;
+};
+
+static int cold_latency_samples_append(struct cold_latency_samples *samples,
+				       const double *values, size_t count)
+{
+	size_t new_count;
+	size_t new_cap;
+	double *new_values;
+
+	if (!samples || !values || count == 0)
+		return 0;
+	if (count > SIZE_MAX - samples->count)
+		return -EOVERFLOW;
+
+	new_count = samples->count + count;
+	if (new_count > samples->cap) {
+		new_cap = samples->cap ? samples->cap : 1024U;
+		while (new_cap < new_count) {
+			if (new_cap > SIZE_MAX / 2U) {
+				new_cap = new_count;
+				break;
+			}
+			new_cap *= 2U;
+		}
+		if (new_cap > SIZE_MAX / sizeof(*samples->values))
+			return -EOVERFLOW;
+		new_values = realloc(samples->values,
+				     new_cap * sizeof(*samples->values));
+		if (!new_values)
+			return -ENOMEM;
+		samples->values = new_values;
+		samples->cap = new_cap;
+	}
+
+	memcpy(samples->values + samples->count, values,
+	       count * sizeof(*samples->values));
+	samples->count = new_count;
+	return 0;
+}
+
+static double percentile_double_from_sorted(const double *values, size_t count,
+					    double pct)
+{
+	size_t idx;
+
+	if (!values || count == 0)
+		return 0.0;
+	if (pct <= 0.0)
+		return values[0];
+	if (pct >= 1.0)
+		return values[count - 1];
+
+	idx = (size_t)ceil(pct * (double)count);
+	if (idx == 0)
+		idx = 1;
+	idx--;
+	if (idx >= count)
+		idx = count - 1;
+	return values[idx];
+}
+
+static void print_cold_read_latency_summary(struct cold_latency_samples *samples)
+{
+	double total = 0.0;
+	double avg;
+
+	if (!samples || !samples->values || samples->count == 0)
+		return;
+
+	qsort(samples->values, samples->count, sizeof(*samples->values),
+	      cmp_double);
+	for (size_t i = 0; i < samples->count; ++i)
+		total += samples->values[i];
+	avg = total / (double)samples->count;
+
+	printf("[sqlite_init] cold_read_latency count=%zu avg=%.9fs "
+	       "p50=%.9fs p95=%.9fs p99=%.9fs p999=%.9fs max=%.9fs\n",
+	       samples->count, avg,
+	       percentile_double_from_sorted(samples->values, samples->count, 0.50),
+	       percentile_double_from_sorted(samples->values, samples->count, 0.95),
+	       percentile_double_from_sorted(samples->values, samples->count, 0.99),
+	       percentile_double_from_sorted(samples->values, samples->count, 0.999),
+	       samples->values[samples->count - 1]);
+}
+
 static int cmp_u64_asc(const void *a, const void *b)
 {
 	unsigned long long ua = *(const unsigned long long *)a;
@@ -2462,7 +2551,51 @@ struct concurrent_read_ctx {
 	const struct workload_options *opts;
 	double elapsed_sec;
 	unsigned long long rows_read;
+	double *op_latencies;
+	unsigned int op_latency_cap;
+	unsigned int op_latency_count;
 };
+
+static void concurrent_read_ctx_alloc_latencies(struct concurrent_read_ctx *ctx,
+						unsigned int reads)
+{
+	if (!ctx)
+		return;
+	ctx->op_latencies = NULL;
+	ctx->op_latency_cap = 0;
+	ctx->op_latency_count = 0;
+	if (reads == 0)
+		return;
+	ctx->op_latencies = calloc(reads, sizeof(*ctx->op_latencies));
+	if (!ctx->op_latencies)
+		return;
+	ctx->op_latency_cap = reads;
+}
+
+static void concurrent_read_ctx_record_latency(struct concurrent_read_ctx *ctx,
+					       double latency)
+{
+	if (!ctx || !ctx->op_latencies ||
+	    ctx->op_latency_count >= ctx->op_latency_cap)
+		return;
+	ctx->op_latencies[ctx->op_latency_count++] = latency;
+}
+
+static void concurrent_read_ctx_collect_latencies(struct concurrent_read_ctx *ctx,
+						  struct cold_latency_samples *samples)
+{
+	if (!ctx)
+		return;
+	if (ctx->op_latencies && ctx->op_latency_count > 0) {
+		if (cold_latency_samples_append(samples, ctx->op_latencies,
+						ctx->op_latency_count) != 0)
+			fprintf(stderr, "warning: failed to collect cold-read latency samples\n");
+	}
+	free(ctx->op_latencies);
+	ctx->op_latencies = NULL;
+	ctx->op_latency_cap = 0;
+	ctx->op_latency_count = 0;
+}
 
 static void *random_read_worker(void *arg)
 {
@@ -2507,12 +2640,19 @@ static void *random_read_worker(void *arg)
 
 		for (unsigned int r = 0; r < ctx->reads_per_tbl; ++r) {
 			unsigned int row_id = (unsigned int)(rand_r(&seed) % max_row);
+			double op_start, op_end;
+			int rc;
 
 			sqlite3_reset(stmt);
+			sqlite3_clear_bindings(stmt);
 			sqlite3_bind_int(stmt, 1, (int)row_id);
-			int rc = sqlite3_step(stmt);
+			op_start = monotonic_sec();
+			rc = sqlite3_step(stmt);
+			op_end = monotonic_sec();
 			if (rc == SQLITE_ROW) {
 				total_rows++;
+				concurrent_read_ctx_record_latency(ctx,
+								   op_end - op_start);
 				maybe_cold_extra_sleep(ctx->opts, total_rows,
 						       ctx->opts ?
 						       ctx->opts->cold_extra_read_sleep_every : 0);
@@ -2568,18 +2708,23 @@ static void *full_scan_read_worker(void *arg)
 
 		for (unsigned int r = 0; r < ctx->reads_per_tbl; ++r) {
 			int rc;
+			double op_start, op_end;
 
 			sqlite3_reset(stmt);
 			sqlite3_clear_bindings(stmt);
 			sqlite3_bind_int(stmt, 1, (int)ctx->record_id_begin);
 			sqlite3_bind_int(stmt, 2, (int)ctx->record_id_end);
+			op_start = monotonic_sec();
 			while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
 				total_rows++;
+			op_end = monotonic_sec();
 			if (rc != SQLITE_DONE) {
 				fprintf(stderr, "[thread %u] cold scan failed for %s: %s\n",
 					ctx->thread_id, table_name, sqlite3_errmsg(db));
 				break;
 			}
+			concurrent_read_ctx_record_latency(ctx,
+							   op_end - op_start);
 			maybe_cold_extra_sleep(ctx->opts, r + 1U,
 					       ctx->opts ?
 					       ctx->opts->cold_extra_read_sleep_every : 0);
@@ -2608,6 +2753,7 @@ static double run_cold_random_concurrent_read(const char *db_path,
 {
 	pthread_t *tids;
 	struct concurrent_read_ctx *ctxs;
+	struct cold_latency_samples lat_samples = {};
 	double wall_start, wall_end;
 	unsigned long long total_rows = 0;
 
@@ -2641,12 +2787,15 @@ static double run_cold_random_concurrent_read(const char *db_path,
 			ctxs[i].opts = opts;
 			ctxs[i].elapsed_sec = 0.0;
 			ctxs[i].rows_read = 0;
+			concurrent_read_ctx_alloc_latencies(&ctxs[i], reads_per_tbl);
 			pthread_create(&tids[i], NULL, random_read_worker, &ctxs[i]);
 		}
 
 		for (unsigned int i = 0; i < threads; ++i) {
 			pthread_join(tids[i], NULL);
 			total_rows += ctxs[i].rows_read;
+			concurrent_read_ctx_collect_latencies(&ctxs[i],
+							      &lat_samples);
 		}
 	}
 
@@ -2659,10 +2808,12 @@ static double run_cold_random_concurrent_read(const char *db_path,
 	       "wall_time=%.6fs throughput=%.2fMB/s\n",
 	       threads, reads_per_tbl, total_rows, wall_elapsed,
 	       wall_elapsed > 0 ? data_mb / wall_elapsed : 0.0);
+	print_cold_read_latency_summary(&lat_samples);
 
 	if (total_rows_out)
 		*total_rows_out = total_rows;
 
+	free(lat_samples.values);
 	free(tids);
 	free(ctxs);
 	return wall_elapsed;
@@ -2680,6 +2831,7 @@ static double run_cold_random_row_plan_concurrent_read(const char *db_path,
 {
 	pthread_t *tids;
 	struct concurrent_read_ctx *ctxs;
+	struct cold_latency_samples lat_samples = {};
 	double wall_start, wall_end;
 	unsigned long long total_rows = 0;
 
@@ -2723,6 +2875,8 @@ static double run_cold_random_row_plan_concurrent_read(const char *db_path,
 			ctxs[launched].opts = opts;
 			ctxs[launched].elapsed_sec = 0.0;
 			ctxs[launched].rows_read = 0;
+			concurrent_read_ctx_alloc_latencies(&ctxs[launched],
+							    reads);
 			printf("[sqlite_cold_random_row] batch=%u table=%u thread=%u reads=%u\n",
 			       batch_begin / threads, tbl, launched, reads);
 			pthread_create(&tids[launched], NULL, random_read_worker, &ctxs[launched]);
@@ -2735,6 +2889,8 @@ static double run_cold_random_row_plan_concurrent_read(const char *db_path,
 			printf("[sqlite_cold_random_row] batch=%u table=%u thread=%u time=%.6fs rows=%llu\n",
 			       batch_begin / threads, ctxs[i].table_id, i,
 			       ctxs[i].elapsed_sec, ctxs[i].rows_read);
+			concurrent_read_ctx_collect_latencies(&ctxs[i],
+							      &lat_samples);
 		}
 	}
 
@@ -2746,10 +2902,12 @@ static double run_cold_random_row_plan_concurrent_read(const char *db_path,
 	printf("[sqlite_cold_random_row] threads=%u total_rows=%llu wall_time=%.6fs throughput=%.2fMB/s\n",
 	       threads, total_rows, wall_elapsed,
 	       wall_elapsed > 0 ? data_mb / wall_elapsed : 0.0);
+	print_cold_read_latency_summary(&lat_samples);
 
 	if (total_rows_out)
 		*total_rows_out = total_rows;
 
+	free(lat_samples.values);
 	free(tids);
 	free(ctxs);
 	return wall_elapsed;
@@ -2766,6 +2924,7 @@ static double run_cold_full_scan_concurrent_read(const char *db_path,
 {
 	pthread_t *tids;
 	struct concurrent_read_ctx *ctxs;
+	struct cold_latency_samples lat_samples = {};
 	double wall_start, wall_end;
 	unsigned long long total_rows = 0;
 
@@ -2818,6 +2977,7 @@ static double run_cold_full_scan_concurrent_read(const char *db_path,
 			ctxs[i].opts = opts;
 			ctxs[i].elapsed_sec = 0.0;
 			ctxs[i].rows_read = 0;
+			concurrent_read_ctx_alloc_latencies(&ctxs[i], reads);
 			printf("[sqlite_cold_full_scan] table=%u thread=%u ids=[%u,%u)\n",
 			       tbl, i, ctxs[i].record_id_begin, ctxs[i].record_id_end);
 			row_off += n;
@@ -2827,6 +2987,8 @@ static double run_cold_full_scan_concurrent_read(const char *db_path,
 		for (unsigned int i = 0; i < threads; ++i) {
 			pthread_join(tids[i], NULL);
 			total_rows += ctxs[i].rows_read;
+			concurrent_read_ctx_collect_latencies(&ctxs[i],
+							      &lat_samples);
 		}
 
 		tbl_end = monotonic_sec();
@@ -2847,10 +3009,12 @@ static double run_cold_full_scan_concurrent_read(const char *db_path,
 	printf("[sqlite_cold_full_scan] threads=%u total_rows=%llu wall_time=%.6fs throughput=%.2fMB/s\n",
 	       threads, total_rows, wall_elapsed,
 	       wall_elapsed > 0 ? data_mb / wall_elapsed : 0.0);
+	print_cold_read_latency_summary(&lat_samples);
 
 	if (total_rows_out)
 		*total_rows_out = total_rows;
 
+	free(lat_samples.values);
 	free(tids);
 	free(ctxs);
 	return wall_elapsed;
@@ -2869,6 +3033,7 @@ static double run_cold_full_scan_overwrite_concurrent_read(sqlite3 *db,
 {
 	pthread_t *tids;
 	struct concurrent_read_ctx *ctxs;
+	struct cold_latency_samples lat_samples = {};
 	double wall_start, wall_end;
 	unsigned long long total_rows = 0;
 	unsigned int overwrite_seed;
@@ -2936,6 +3101,7 @@ static double run_cold_full_scan_overwrite_concurrent_read(sqlite3 *db,
 			ctxs[i].opts = opts;
 			ctxs[i].elapsed_sec = 0.0;
 			ctxs[i].rows_read = 0;
+			concurrent_read_ctx_alloc_latencies(&ctxs[i], reads);
 			printf("[sqlite_cold_full_scan] table=%u thread=%u ids=[%u,%u)\n",
 			       tbl, i, ctxs[i].record_id_begin, ctxs[i].record_id_end);
 			row_off += n;
@@ -2945,6 +3111,8 @@ static double run_cold_full_scan_overwrite_concurrent_read(sqlite3 *db,
 		for (unsigned int i = 0; i < threads; ++i) {
 			pthread_join(tids[i], NULL);
 			total_rows += ctxs[i].rows_read;
+			concurrent_read_ctx_collect_latencies(&ctxs[i],
+							      &lat_samples);
 		}
 
 		tbl_end = monotonic_sec();
@@ -2965,10 +3133,12 @@ static double run_cold_full_scan_overwrite_concurrent_read(sqlite3 *db,
 	printf("[sqlite_cold_full_scan] threads=%u total_rows=%llu wall_time=%.6fs throughput=%.2fMB/s\n",
 	       threads, total_rows, wall_elapsed,
 	       wall_elapsed > 0 ? data_mb / wall_elapsed : 0.0);
+	print_cold_read_latency_summary(&lat_samples);
 
 	if (total_rows_out)
 		*total_rows_out = total_rows;
 
+	free(lat_samples.values);
 	free(tids);
 	free(ctxs);
 	return wall_elapsed;
