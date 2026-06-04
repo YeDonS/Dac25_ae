@@ -14,12 +14,14 @@
 ; Standalone default is approximately read:write = 10:1 with normal reads
 ; and a fixed 5 GiB measured write budget.
 ; The runner generates the actual per-ratio/per-distribution jobfile.
+; fio 3.16 computes a non-zero-offset working range as size - offset, so
+; offset=8G with a 5G write range must use size=13G.
 
 [global]
 ioengine=libaio
 direct=1
 thread=1
-group_reporting=1
+group_reporting=0
 time_based=0
 norandommap=1
 randrepeat=0
@@ -88,7 +90,7 @@ description=Measured phase writes: random writes to a separate non-read region.
 rw=randwrite
 random_distribution=normal:20
 offset=8G
-size=5G
+size=13G
 io_size=5G
 iodepth=32
 numjobs=1

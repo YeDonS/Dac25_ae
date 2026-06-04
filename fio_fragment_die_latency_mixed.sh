@@ -111,6 +111,13 @@ is_disabled_size() {
     esac
 }
 
+fio_size_end() {
+    local offset_bytes="$1"
+    local range_bytes="$2"
+
+    echo $((offset_bytes + range_bytes))
+}
+
 ratio_tag() {
     printf '%s' "$1" | tr ':' '_' | tr -c 'A-Za-z0-9_' '_'
 }
@@ -432,6 +439,114 @@ capture_run_stats() {
     capture_stat_file "$FIO_BG_NAND_STATS_PATH" "fio_bg_nand_stats" "$tag" "$out_dir"
 }
 
+validate_fio_json() {
+    local out_json="$1"
+    local expected_init_write="$2"
+    local expected_init_prewarm="$3"
+    local expected_measure_read="$4"
+    local expected_measure_write="$5"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "[fio-validate] python3 is required to validate fio JSON output" >&2
+        return 1
+    fi
+
+    python3 "$SCRIPT_DIR/fio_validate_latency_mixed_json.py" "$out_json" \
+        --expected-init-write "$expected_init_write" \
+        --expected-init-prewarm "$expected_init_prewarm" \
+        --expected-measure-read "$expected_measure_read" \
+        --expected-measure-write "$expected_measure_write"
+}
+
+validate_generated_fio_job() {
+    local fio_job="$1"
+    local expected_measure_write_region_size="$2"
+
+    python3 - "$fio_job" "$expected_measure_write_region_size" <<'PY'
+import sys
+from pathlib import Path
+
+units = {
+    "": 1,
+    "K": 1024,
+    "M": 1024**2,
+    "G": 1024**3,
+    "T": 1024**4,
+}
+
+
+def size_to_bytes(raw):
+    value = str(raw).strip()
+    if not value:
+        raise ValueError("empty size")
+    unit = value[-1:].upper()
+    if unit in units and unit:
+        number = value[:-1]
+    else:
+        unit = ""
+        number = value
+    if not number.isdigit():
+        raise ValueError(f"invalid size {raw!r}")
+    return int(number) * units[unit]
+
+
+path = Path(sys.argv[1])
+expected_write_region = int(sys.argv[2])
+sections = {}
+current = None
+
+for raw in path.read_text(errors="replace").splitlines():
+    line = raw.strip()
+    if not line or line.startswith(";"):
+        continue
+    if line.startswith("[") and line.endswith("]"):
+        current = line[1:-1]
+        sections[current] = {}
+        continue
+    if current and "=" in line:
+        key, value = line.split("=", 1)
+        sections[current][key.strip()] = value.strip()
+
+errors = []
+for name, opts in sections.items():
+    if "offset" not in opts or "size" not in opts:
+        continue
+    try:
+        offset = size_to_bytes(opts["offset"])
+        size = size_to_bytes(opts["size"])
+    except ValueError as exc:
+        errors.append(f"{name}: {exc}")
+        continue
+    if size <= offset:
+        errors.append(f"{name}: size={size} must be greater than offset={offset}")
+
+if "measure_writes" not in sections:
+    errors.append("measure_writes section is missing")
+else:
+    opts = sections["measure_writes"]
+    try:
+        span = size_to_bytes(opts["size"]) - size_to_bytes(opts["offset"])
+    except KeyError as exc:
+        errors.append(f"measure_writes: missing {exc.args[0]}")
+    except ValueError as exc:
+        errors.append(f"measure_writes: {exc}")
+    else:
+        if span != expected_write_region:
+            errors.append(
+                "measure_writes: size-offset span "
+                f"{span} != expected write region {expected_write_region}"
+            )
+
+if errors:
+    print("[fio-job-validate] FAIL", file=sys.stderr)
+    for error in errors:
+        print(f"[fio-job-validate]   {error}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"[fio-job-validate] PASS {path}")
+PY
+}
+
 load_variant_module() {
     local variant="$1"
     local ko_path="${NVMEV_DIR}/nvmev_${variant}.ko"
@@ -462,7 +577,7 @@ emit_guard_toggle_job() {
     echo "description=Set FTL test_phase=$value for guarded init prewarm."
     echo "rw=read"
     echo "offset=$offset_bytes"
-    echo "size=4k"
+    echo "size=$(fio_size_end "$offset_bytes" 4096)"
     echo "io_size=4k"
     echo "iodepth=1"
     echo "numjobs=1"
@@ -483,7 +598,7 @@ emit_heat_epoch_advance_job() {
     echo "description=Advance FTL heat_epoch after guarded init prewarm."
     echo "rw=read"
     echo "offset=$offset_bytes"
-    echo "size=4k"
+    echo "size=$(fio_size_end "$offset_bytes" 4096)"
     echo "io_size=4k"
     echo "iodepth=1"
     echo "numjobs=1"
@@ -513,7 +628,7 @@ emit_init_chunk() {
     echo "description=Init: write initialized region before prewarming it."
     echo "rw=write"
     echo "offset=$offset_bytes"
-    echo "size=$chunk_bytes"
+    echo "size=$(fio_size_end "$offset_bytes" "$chunk_bytes")"
     echo "io_size=$chunk_bytes"
     echo "iodepth=32"
     echo "numjobs=1"
@@ -534,7 +649,7 @@ emit_init_chunk() {
     echo "rw=randread"
     echo "random_distribution=$fio_dist"
     echo "offset=$offset_bytes"
-    echo "size=$chunk_bytes"
+    echo "size=$(fio_size_end "$offset_bytes" "$chunk_bytes")"
     echo "io_size=$prewarm_io_size"
     echo "iodepth=$FIO_INIT_PREWARM_IODEPTH"
     echo "numjobs=$FIO_INIT_PREWARM_JOBS"
@@ -570,6 +685,9 @@ render_fio_job() {
     local init_plan_write_bytes
     local init_plan_read_bytes
     local write_region_size
+    local write_region_size_bytes
+    local write_offset_bytes
+    local write_size_end
 
     region_bytes="$(size_to_bytes "$FIO_REGION_SIZE")"
     if is_disabled_size "$FIO_INIT_WRITE_BYTES"; then
@@ -583,10 +701,15 @@ render_fio_job() {
     init_plan="$(init_plan_summary)"
     read -r init_plan_chunks init_plan_write_bytes init_plan_read_bytes <<<"$init_plan"
     if [[ "$FIO_MEASURE_WRITE_REGION_SIZE" == "io_size" ]]; then
-        write_region_size="$measure_write_bytes"
+        write_region_size_bytes="$measure_write_bytes"
     else
-        write_region_size="$FIO_MEASURE_WRITE_REGION_SIZE"
+        write_region_size_bytes="$(size_to_bytes "$FIO_MEASURE_WRITE_REGION_SIZE")"
     fi
+    (( write_region_size_bytes % page_bytes == 0 )) || die "FIO_MEASURE_WRITE_REGION_SIZE must be 4K aligned"
+    write_region_size="$write_region_size_bytes"
+    write_offset_bytes="$(size_to_bytes "$FIO_MEASURE_WRITE_OFFSET")"
+    (( write_offset_bytes % page_bytes == 0 )) || die "FIO_MEASURE_WRITE_OFFSET must be 4K aligned"
+    write_size_end="$(fio_size_end "$write_offset_bytes" "$write_region_size_bytes")"
 
     {
         echo "; Generated by fio_fragment_die_latency_mixed.sh"
@@ -601,12 +724,14 @@ render_fio_job() {
         echo "; measure_read_offset=0"
         echo "; measure_write_offset=$FIO_MEASURE_WRITE_OFFSET"
         echo "; measure_write_region_size=$write_region_size"
+        echo "; measure_write_fio_size_end=$write_size_end"
+        echo "; fio size is emitted as offset+range for non-zero-offset jobs."
         echo ""
         echo "[global]"
         echo "ioengine=libaio"
         echo "direct=1"
         echo "thread=1"
-        echo "group_reporting=1"
+        echo "group_reporting=0"
         echo "time_based=0"
         echo "norandommap=1"
         echo "randrepeat=0"
@@ -714,8 +839,8 @@ render_fio_job() {
         echo "description=Measured phase writes: random writes to a separate non-read region."
         echo "rw=randwrite"
         echo "random_distribution=$fio_dist"
-        echo "offset=$FIO_MEASURE_WRITE_OFFSET"
-        echo "size=$write_region_size"
+        echo "offset=$write_offset_bytes"
+        echo "size=$write_size_end"
         echo "io_size=$measure_write_bytes"
         echo "iodepth=$FIO_MEASURE_WRITE_IODEPTH"
         echo "numjobs=$FIO_MEASURE_WRITE_JOBS"
@@ -748,11 +873,20 @@ run_fio_one_case() {
     local log_prefix
     local test_phase_hook_path=""
     local heat_epoch_hook_path=""
+    local rc=0
+    local measure_write_offset_bytes
+    local measure_write_region_size_bytes
 
     mixread="$(ratio_to_mixread "$ratio")"
     fio_dist="$(dist_to_fio "$access_dist")"
     measure_bytes="$(ratio_to_measure_bytes "$ratio")"
     read -r measure_read_bytes measure_write_bytes <<<"$measure_bytes"
+    measure_write_offset_bytes="$(size_to_bytes "$FIO_MEASURE_WRITE_OFFSET")"
+    if [[ "$FIO_MEASURE_WRITE_REGION_SIZE" == "io_size" ]]; then
+        measure_write_region_size_bytes="$measure_write_bytes"
+    else
+        measure_write_region_size_bytes="$(size_to_bytes "$FIO_MEASURE_WRITE_REGION_SIZE")"
+    fi
     init_plan="$(init_plan_summary)"
     read -r init_plan_chunks init_plan_write_bytes init_plan_read_bytes <<<"$init_plan"
     ts="$(date +%Y%m%d_%H%M%S)"
@@ -772,7 +906,7 @@ run_fio_one_case() {
     echo "  init_plan_chunks=$init_plan_chunks init_write_bytes=$init_plan_write_bytes init_prewarm_read_bytes=$init_plan_read_bytes"
     echo "  init_advance_heat_epoch_each_chunk=$FIO_INIT_ADVANCE_HEAT_EPOCH_EACH_CHUNK heat_epoch_path=$FIO_HEAT_EPOCH_PATH"
     echo "  post_prewarm_seq=$FIO_PREWARM_SEQ_BYTES post_prewarm_random=$FIO_PREWARM_RANDOM_BYTES measure_total_fallback=$FIO_MEASURE_TOTAL_BYTES"
-    echo "  measure_read_bytes=$measure_read_bytes measure_write_bytes=$measure_write_bytes read_range=0+$FIO_REGION_SIZE write_range=${FIO_MEASURE_WRITE_OFFSET}+${FIO_MEASURE_WRITE_REGION_SIZE}"
+    echo "  measure_read_bytes=$measure_read_bytes measure_write_bytes=$measure_write_bytes read_range=0+$FIO_REGION_SIZE write_range=${measure_write_offset_bytes}+${measure_write_region_size_bytes}"
     echo "  measure_jobs=$FIO_MEASURE_JOBS measure_iodepth=$FIO_MEASURE_IODEPTH gc_nand_timing=$FIO_GC_NAND_TIMING recent_write_guard=$FIO_TEST_PHASE_RECENT_WRITE_GUARD guard_read_reqs=$FIO_TEST_PHASE_GUARD_READ_REQS"
     echo "================================================================"
 
@@ -799,6 +933,7 @@ run_fio_one_case() {
     fi
 
     render_fio_job "$fio_job_tmp" "$fio_dist" "$mixread" "$log_prefix" "$test_phase_hook_path" "$measure_read_bytes" "$measure_write_bytes" "$heat_epoch_hook_path"
+    validate_generated_fio_job "$fio_job_tmp" "$measure_write_region_size_bytes"
     cp "$fio_job_tmp" "$fio_job_saved"
 
     echo "=== fio jobfile: $fio_job_saved ==="
@@ -808,21 +943,23 @@ run_fio_one_case() {
     fi
 
     if sudo fio "$fio_job_tmp" --output="$out_json" --output-format=json; then
-        set_test_phase 0 || true
-        capture_run_stats "$tag" "$out_dir"
+        if validate_fio_json "$out_json" \
+            "$init_plan_write_bytes" "$init_plan_read_bytes" \
+            "$measure_read_bytes" "$measure_write_bytes"; then
+            rc=0
+        else
+            rc=$?
+        fi
     else
-        local rc=$?
-        set_test_phase 0 || true
-        capture_run_stats "$tag" "$out_dir"
-        rm -f "$fio_job_tmp"
-        sudo rmmod nvmev 2>/dev/null || rmmod nvmev 2>/dev/null || true
-        sleep 5
-        return "$rc"
+        rc=$?
     fi
 
+    set_test_phase 0 || true
+    capture_run_stats "$tag" "$out_dir"
     rm -f "$fio_job_tmp"
     sudo rmmod nvmev 2>/dev/null || rmmod nvmev 2>/dev/null || true
     sleep 5
+    return "$rc"
 }
 
 if [[ ! -f "$FIO_JOB_FILE" ]]; then
