@@ -54,6 +54,13 @@ FIO_NORMAL_DEVIATION="${FIO_NORMAL_DEVIATION:-20}"
 FIO_REBUILD_DIE_MODULES="${FIO_REBUILD_DIE_MODULES:-${SQLITE_REBUILD_DIE_MODULES:-0}}"
 FIO_DRY_RUN="${FIO_DRY_RUN:-0}"
 FIO_OUTPUT_DIR="${FIO_OUTPUT_DIR:-${RESULT_FOLDER%/}/fio_latency_mixed}"
+FIO_DRAIN_AFTER_MEASURE="${FIO_DRAIN_AFTER_MEASURE:-0}"
+FIO_DRAIN_MIN_SEC="${FIO_DRAIN_MIN_SEC:-60}"
+FIO_DRAIN_TIMEOUT_SEC="${FIO_DRAIN_TIMEOUT_SEC:-300}"
+FIO_DRAIN_POLL_SEC="${FIO_DRAIN_POLL_SEC:-5}"
+FIO_DRAIN_STABLE_POLLS="${FIO_DRAIN_STABLE_POLLS:-3}"
+FIO_DRAIN_STABLE_KEYS="${FIO_DRAIN_STABLE_KEYS:-bg_repromote_ops bg_qlc_rebalance_ops slc_to_qlc_migration_pages slc_gc_valid_copy_pages slc_gc_invalid_reclaimed_pages qlc_repromote_pages internal_write_pages_est slc_to_qlc_nand_reads slc_to_qlc_nand_writes repromote_nand_reads repromote_nand_writes}"
+FIO_STRICT_COMPILE_FLAGS="${FIO_STRICT_COMPILE_FLAGS:-0}"
 
 FIO_TEST_PHASE_PATH="${FIO_TEST_PHASE_PATH:-/sys/kernel/debug/nvmev/ftl0/test_phase}"
 FIO_HEAT_EPOCH_PATH="${FIO_HEAT_EPOCH_PATH:-/sys/kernel/debug/nvmev/ftl0/heat_epoch}"
@@ -404,18 +411,15 @@ capture_stat_file() {
     fi
 }
 
-capture_numeric_stats_aggregate() {
+aggregate_numeric_stats_to_file() {
     local path="$1"
-    local name="$2"
-    local tag="$3"
-    local out_dir="$4"
-    local out_file="${FIO_OUTPUT_DIR%/}/${name}_aggregate_${tag}.txt"
+    local out_file="$2"
     local files=()
 
     mapfile -t files < <(debugfs_sibling_files "$path")
-    [[ ${#files[@]} -gt 0 ]] || return 0
+    [[ ${#files[@]} -gt 0 ]] || return 1
 
-    if sudo cat "${files[@]}" 2>/dev/null | awk '
+    sudo cat "${files[@]}" 2>/dev/null | awk '
         NF == 2 && $2 ~ /^[0-9]+$/ {
             if (!seen[$1]++) order[++n] = $1
             sum[$1] += $2
@@ -423,7 +427,17 @@ capture_numeric_stats_aggregate() {
         END {
             for (i = 1; i <= n; i++) print order[i], sum[order[i]]
         }
-    ' >"$out_file"; then
+    ' >"$out_file"
+}
+
+capture_numeric_stats_aggregate() {
+    local path="$1"
+    local name="$2"
+    local tag="$3"
+    local out_dir="$4"
+    local out_file="${FIO_OUTPUT_DIR%/}/${name}_aggregate_${tag}.txt"
+
+    if aggregate_numeric_stats_to_file "$path" "$out_file"; then
         cp "$out_file" "$out_dir/" 2>/dev/null || true
     fi
 }
@@ -437,6 +451,168 @@ capture_run_stats() {
     capture_stat_file "$FIO_SUPERBLOCK_STATS_PATH" "fio_superblock_stats" "$tag" "$out_dir"
     capture_stat_file "$FIO_DIE_STATS_PATH" "fio_die_stats" "$tag" "$out_dir"
     capture_stat_file "$FIO_BG_NAND_STATS_PATH" "fio_bg_nand_stats" "$tag" "$out_dir"
+}
+
+numeric_stat_value() {
+    local key="$1"
+    local file="$2"
+
+    awk -v key="$key" '$1 == key { value = $2 } END { print value + 0 }' "$file"
+}
+
+numeric_stats_signature() {
+    local file="$1"
+
+    awk -v keys="$FIO_DRAIN_STABLE_KEYS" '
+        BEGIN { n = split(keys, key_order, " ") }
+        NF == 2 && $2 ~ /^[0-9]+$/ { value[$1] = $2 }
+        END {
+            for (i = 1; i <= n; i++) {
+                key = key_order[i]
+                printf "%s=%s;", key, (key in value ? value[key] : 0)
+            }
+        }
+    ' "$file"
+}
+
+wait_for_test_phase_drain() {
+    local tag="$1"
+    local tmp_stats
+    local elapsed=0
+    local stable=0
+    local last_sig=""
+    local sig
+    local active_reads
+    local active_overwrites
+    local active_bg_ops
+    local bg_repromote
+    local bg_qlc_rebalance
+    local internal_write
+
+    [[ "$FIO_DRAIN_AFTER_MEASURE" == "1" ]] || return 0
+
+    for value in "$FIO_DRAIN_MIN_SEC" "$FIO_DRAIN_TIMEOUT_SEC" \
+        "$FIO_DRAIN_POLL_SEC" "$FIO_DRAIN_STABLE_POLLS"; do
+        [[ "$value" =~ ^[0-9]+$ ]] || die "drain controls must be integer seconds/counts"
+    done
+    (( FIO_DRAIN_POLL_SEC > 0 )) || die "FIO_DRAIN_POLL_SEC must be positive"
+    (( FIO_DRAIN_STABLE_POLLS > 0 )) || die "FIO_DRAIN_STABLE_POLLS must be positive"
+
+    tmp_stats="$(mktemp "${TMPDIR:-/tmp}/fio_latency_mixed_drain_${tag}.XXXXXX.stats")"
+    echo "[fio-drain] enabled: min=${FIO_DRAIN_MIN_SEC}s timeout=${FIO_DRAIN_TIMEOUT_SEC}s poll=${FIO_DRAIN_POLL_SEC}s stable_polls=${FIO_DRAIN_STABLE_POLLS}"
+
+    while (( elapsed <= FIO_DRAIN_TIMEOUT_SEC )); do
+        if ! aggregate_numeric_stats_to_file "$FIO_TEST_PHASE_STATS_PATH" "$tmp_stats"; then
+            echo "[fio-drain] unable to read $FIO_TEST_PHASE_STATS_PATH; skipping drain wait" >&2
+            rm -f "$tmp_stats"
+            return 0
+        fi
+
+        active_reads="$(numeric_stat_value active_reads "$tmp_stats")"
+        active_overwrites="$(numeric_stat_value active_overwrites "$tmp_stats")"
+        active_bg_ops="$(numeric_stat_value active_bg_ops "$tmp_stats")"
+        bg_repromote="$(numeric_stat_value bg_repromote_ops "$tmp_stats")"
+        bg_qlc_rebalance="$(numeric_stat_value bg_qlc_rebalance_ops "$tmp_stats")"
+        internal_write="$(numeric_stat_value internal_write_pages_est "$tmp_stats")"
+        sig="$(numeric_stats_signature "$tmp_stats")"
+
+        echo "[fio-drain] t=${elapsed}s active_reads=$active_reads active_writes=$active_overwrites active_bg=$active_bg_ops bg_repromote=$bg_repromote bg_qlc_rebalance=$bg_qlc_rebalance internal_write_pages_est=$internal_write stable=$stable"
+
+        if (( elapsed >= FIO_DRAIN_MIN_SEC )) && \
+            (( active_reads == 0 && active_overwrites == 0 && active_bg_ops == 0 )) && \
+            [[ "$sig" == "$last_sig" ]]; then
+            stable=$((stable + 1))
+        else
+            stable=0
+        fi
+
+        if (( stable >= FIO_DRAIN_STABLE_POLLS )); then
+            echo "[fio-drain] stable after ${elapsed}s"
+            rm -f "$tmp_stats"
+            return 0
+        fi
+
+        last_sig="$sig"
+        sleep "$FIO_DRAIN_POLL_SEC"
+        elapsed=$((elapsed + FIO_DRAIN_POLL_SEC))
+    done
+
+    echo "[fio-drain] timed out after ${FIO_DRAIN_TIMEOUT_SEC}s; capturing post-drain stats anyway" >&2
+    rm -f "$tmp_stats"
+    return 0
+}
+
+expected_compile_flags_for_variant() {
+    local variant="$1"
+
+    case "$variant" in
+        die_latency*_qlc_all_norp_sb)
+            cat <<'EOF'
+compile_read_repromotion_enabled 0
+compile_die_batched_repromotion_enabled 0
+compile_qlc_hotcold_enabled 1
+compile_qlc_rebalance_enabled 0
+compile_test_phase_repromotion_enabled 0
+compile_test_phase_qlc_rebalance_enabled 0
+EOF
+            ;;
+        die_latency1_norp_sb)
+            cat <<'EOF'
+compile_read_repromotion_enabled 0
+compile_die_batched_repromotion_enabled 0
+compile_qlc_hotcold_enabled 0
+compile_qlc_rebalance_enabled 0
+compile_test_phase_repromotion_enabled 0
+compile_test_phase_qlc_rebalance_enabled 1
+EOF
+            ;;
+        die_latency[23]_norp_sb)
+            cat <<'EOF'
+compile_read_repromotion_enabled 0
+compile_die_batched_repromotion_enabled 0
+compile_qlc_hotcold_enabled 0
+compile_qlc_rebalance_enabled 0
+compile_test_phase_repromotion_enabled 0
+compile_test_phase_qlc_rebalance_enabled 0
+EOF
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+check_compile_flags() {
+    local variant="$1"
+    local tag="$2"
+    local stats_file="${FIO_OUTPUT_DIR%/}/fio_test_phase_stats_${tag}.txt"
+    local expected
+    local key
+    local expected_value
+    local actual_value
+    local errors=0
+
+    expected="$(expected_compile_flags_for_variant "$variant" || true)"
+    [[ -n "$expected" ]] || return 0
+    [[ -f "$stats_file" ]] || return 0
+
+    while read -r key expected_value; do
+        [[ -n "$key" ]] || continue
+        actual_value="$(awk -v key="$key" '$1 == key { print $2; found = 1; exit } END { if (!found) print "MISSING" }' "$stats_file")"
+        if [[ "$actual_value" != "$expected_value" ]]; then
+            echo "[fio-compile-flags] $variant $key actual=$actual_value expected=$expected_value" >&2
+            errors=$((errors + 1))
+        fi
+    done <<<"$expected"
+
+    if (( errors > 0 )); then
+        if [[ "$FIO_STRICT_COMPILE_FLAGS" == "1" ]]; then
+            return 1
+        fi
+        echo "[fio-compile-flags] WARN $variant has unexpected compile flags; set FIO_STRICT_COMPILE_FLAGS=1 to fail the run" >&2
+    else
+        echo "[fio-compile-flags] PASS $variant"
+    fi
 }
 
 validate_fio_json() {
@@ -908,6 +1084,7 @@ run_fio_one_case() {
     echo "  post_prewarm_seq=$FIO_PREWARM_SEQ_BYTES post_prewarm_random=$FIO_PREWARM_RANDOM_BYTES measure_total_fallback=$FIO_MEASURE_TOTAL_BYTES"
     echo "  measure_read_bytes=$measure_read_bytes measure_write_bytes=$measure_write_bytes read_range=0+$FIO_REGION_SIZE write_range=${measure_write_offset_bytes}+${measure_write_region_size_bytes}"
     echo "  measure_jobs=$FIO_MEASURE_JOBS measure_iodepth=$FIO_MEASURE_IODEPTH gc_nand_timing=$FIO_GC_NAND_TIMING recent_write_guard=$FIO_TEST_PHASE_RECENT_WRITE_GUARD guard_read_reqs=$FIO_TEST_PHASE_GUARD_READ_REQS"
+    echo "  drain_after_measure=$FIO_DRAIN_AFTER_MEASURE drain_min=${FIO_DRAIN_MIN_SEC}s drain_timeout=${FIO_DRAIN_TIMEOUT_SEC}s strict_compile_flags=$FIO_STRICT_COMPILE_FLAGS"
     echo "================================================================"
 
     if [[ "$FIO_DRY_RUN" != "1" ]]; then
@@ -954,8 +1131,19 @@ run_fio_one_case() {
         rc=$?
     fi
 
-    set_test_phase 0 || true
-    capture_run_stats "$tag" "$out_dir"
+    if [[ "$FIO_DRAIN_AFTER_MEASURE" == "1" ]]; then
+        echo "=== Capturing foreground stats before post-measure drain ==="
+        capture_run_stats "$tag" "$out_dir"
+        check_compile_flags "$variant" "$tag" || rc=$?
+        wait_for_test_phase_drain "$tag"
+        echo "=== Capturing post-drain stats ==="
+        capture_run_stats "${tag}_post_drain" "$out_dir"
+        set_test_phase 0 || true
+    else
+        set_test_phase 0 || true
+        capture_run_stats "$tag" "$out_dir"
+        check_compile_flags "$variant" "$tag" || rc=$?
+    fi
     rm -f "$fio_job_tmp"
     sudo rmmod nvmev 2>/dev/null || rmmod nvmev 2>/dev/null || true
     sleep 5
