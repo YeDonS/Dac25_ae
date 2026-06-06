@@ -2,6 +2,8 @@
 /*
  * Ablation: latency1 scheduler + QLC hot/cold placement only.
  * Disable both QLC->SLC read repromotion and in-QLC rebalance for the whole run.
+ * This is the placement-only control: latency1 intentionally has no
+ * read-priority yield/catch-up policy.
  */
 #define NVMEV_ENABLE_QLC_HOTCOLD 1
 #define NVMEV_ENABLE_QLC_REBALANCE 0

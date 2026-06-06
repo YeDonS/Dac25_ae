@@ -18,8 +18,8 @@ source commonvariables.sh
 
 NVMEV_DIR="${SCRIPT_DIR}/../nvmevirt_DA"
 
-# Match the current SQLite comparison set by default.
-VARIANTS="${VARIANTS:-die_latency1_qlc_all_norp_sb die_latency2_qlc_all_norp_sb die_latency3_qlc_all_norp_sb die_latency1_sb}"
+# Match the current placement/read-priority comparison set by default.
+VARIANTS="${VARIANTS:-die_latency1_qlc_all_norp_sb die_latency2_qlc_all_norp_sb die_latency3_qlc_all_norp_sb die_latency1_norp_sb}"
 
 FIO_JOB_FILE="${FIO_JOB_FILE:-fio_latency_v2_mixed.fio}"
 FIO_ACCESS_DIST_LIST="${FIO_ACCESS_DIST_LIST:-${SQLITE_ACCESS_DIST_LIST:-zipf normal}}"
@@ -453,6 +453,104 @@ capture_run_stats() {
     capture_stat_file "$FIO_BG_NAND_STATS_PATH" "fio_bg_nand_stats" "$tag" "$out_dir"
 }
 
+cleanup_case_outputs() {
+    local tag="$1"
+    local out_dir="$2"
+    local log_prefix="$3"
+    local root="${FIO_OUTPUT_DIR%/}"
+    local suffix
+
+    rm -f "${out_dir}/${tag}.json" "${out_dir}/${tag}.fio"
+    rm -f "${log_prefix}"_*.log
+    rm -f "${root}/fio_test_phase_stats_${tag}.txt" \
+          "${root}/fio_test_phase_stats_aggregate_${tag}.txt" \
+          "${root}/fio_superblock_stats_${tag}.txt" \
+          "${root}/fio_die_stats_${tag}.txt" \
+          "${root}/fio_bg_nand_stats_${tag}.txt"
+    rm -f "${out_dir}/fio_test_phase_stats_${tag}.txt" \
+          "${out_dir}/fio_test_phase_stats_aggregate_${tag}.txt" \
+          "${out_dir}/fio_superblock_stats_${tag}.txt" \
+          "${out_dir}/fio_die_stats_${tag}.txt" \
+          "${out_dir}/fio_bg_nand_stats_${tag}.txt"
+    for suffix in post_drain; do
+        rm -f "${root}/fio_test_phase_stats_${tag}_${suffix}.txt" \
+              "${root}/fio_test_phase_stats_aggregate_${tag}_${suffix}.txt" \
+              "${root}/fio_superblock_stats_${tag}_${suffix}.txt" \
+              "${root}/fio_die_stats_${tag}_${suffix}.txt" \
+              "${root}/fio_bg_nand_stats_${tag}_${suffix}.txt"
+        rm -f "${out_dir}/fio_test_phase_stats_${tag}_${suffix}.txt" \
+              "${out_dir}/fio_test_phase_stats_aggregate_${tag}_${suffix}.txt" \
+              "${out_dir}/fio_superblock_stats_${tag}_${suffix}.txt" \
+              "${out_dir}/fio_die_stats_${tag}_${suffix}.txt" \
+              "${out_dir}/fio_bg_nand_stats_${tag}_${suffix}.txt"
+    done
+    rm -f "${root}/fio_test_phase_stats_aggregate_${tag}_foreground_post_drain.txt" \
+          "${out_dir}/fio_test_phase_stats_aggregate_${tag}_foreground_post_drain.txt" \
+          "${root}/fio_post_drain_${tag}.txt" \
+          "${out_dir}/fio_post_drain_${tag}.txt"
+}
+
+write_foreground_post_drain_aggregate() {
+    local tag="$1"
+    local out_dir="$2"
+    local root="${FIO_OUTPUT_DIR%/}"
+    local fg="${out_dir}/fio_test_phase_stats_aggregate_${tag}.txt"
+    local post="${out_dir}/fio_test_phase_stats_aggregate_${tag}_post_drain.txt"
+    local out_file="${root}/fio_test_phase_stats_aggregate_${tag}_foreground_post_drain.txt"
+
+    [[ -f "$fg" && -f "$post" ]] || return 0
+    awk '
+        BEGIN { print "key foreground post_drain delta" }
+        FNR == NR && NF == 2 && $2 ~ /^-?[0-9]+$/ {
+            if (!seen[$1]++) order[++n] = $1
+            fg[$1] = $2
+            next
+        }
+        NF == 2 && $2 ~ /^-?[0-9]+$/ {
+            if (!seen[$1]++) order[++n] = $1
+            post[$1] = $2
+            next
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                key = order[i]
+                f = (key in fg) ? fg[key] : ""
+                p = (key in post) ? post[key] : ""
+                d = ((key in fg) && (key in post)) ? post[key] - fg[key] : ""
+                print key, f, p, d
+            }
+        }
+    ' "$fg" "$post" >"$out_file"
+    cp "$out_file" "$out_dir/" 2>/dev/null || true
+}
+
+write_post_drain_bundle() {
+    local tag="$1"
+    local out_dir="$2"
+    local root="${FIO_OUTPUT_DIR%/}"
+    local out_file="${root}/fio_post_drain_${tag}.txt"
+    local file
+    local files=(
+        "${out_dir}/fio_test_phase_stats_${tag}_post_drain.txt"
+        "${out_dir}/fio_test_phase_stats_aggregate_${tag}_post_drain.txt"
+        "${out_dir}/fio_superblock_stats_${tag}_post_drain.txt"
+        "${out_dir}/fio_die_stats_${tag}_post_drain.txt"
+        "${out_dir}/fio_bg_nand_stats_${tag}_post_drain.txt"
+        "${out_dir}/fio_test_phase_stats_aggregate_${tag}_foreground_post_drain.txt"
+    )
+
+    : >"$out_file"
+    for file in "${files[@]}"; do
+        [[ -f "$file" ]] || continue
+        {
+            echo "===== $(basename "$file") ====="
+            cat "$file"
+            echo ""
+        } >>"$out_file"
+    done
+    cp "$out_file" "$out_dir/" 2>/dev/null || true
+}
+
 numeric_stat_value() {
     local key="$1"
     local file="$2"
@@ -563,7 +661,7 @@ compile_die_batched_repromotion_enabled 0
 compile_qlc_hotcold_enabled 0
 compile_qlc_rebalance_enabled 0
 compile_test_phase_repromotion_enabled 0
-compile_test_phase_qlc_rebalance_enabled 1
+compile_test_phase_qlc_rebalance_enabled 0
 EOF
             ;;
         die_latency[23]_norp_sb)
@@ -1040,7 +1138,6 @@ run_fio_one_case() {
     local init_plan_chunks
     local init_plan_write_bytes
     local init_plan_read_bytes
-    local ts
     local tag
     local out_dir
     local out_json
@@ -1065,8 +1162,7 @@ run_fio_one_case() {
     fi
     init_plan="$(init_plan_summary)"
     read -r init_plan_chunks init_plan_write_bytes init_plan_read_bytes <<<"$init_plan"
-    ts="$(date +%Y%m%d_%H%M%S)"
-    tag="fio_mixed_${variant}_$(dist_tag "$access_dist")_rw$(ratio_tag "$ratio")_${ts}"
+    tag="fio_mixed_${variant}_$(dist_tag "$access_dist")_rw$(ratio_tag "$ratio")"
     out_dir="${FIO_OUTPUT_DIR%/}/${variant}/$(dist_tag "$access_dist")/rw$(ratio_tag "$ratio")"
     out_json="${out_dir}/${tag}.json"
     fio_job_tmp="$(mktemp "${TMPDIR:-/tmp}/fio_latency_v2_mixed_${variant}.XXXXXX.fio")"
@@ -1074,6 +1170,7 @@ run_fio_one_case() {
     log_prefix="${out_dir}/${tag}"
 
     mkdir -p "$out_dir"
+    cleanup_case_outputs "$tag" "$out_dir" "$log_prefix"
 
     echo ""
     echo "================================================================"
@@ -1138,6 +1235,8 @@ run_fio_one_case() {
         wait_for_test_phase_drain "$tag"
         echo "=== Capturing post-drain stats ==="
         capture_run_stats "${tag}_post_drain" "$out_dir"
+        write_foreground_post_drain_aggregate "$tag" "$out_dir"
+        write_post_drain_bundle "$tag" "$out_dir"
         set_test_phase 0 || true
     else
         set_test_phase 0 || true

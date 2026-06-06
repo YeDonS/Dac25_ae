@@ -3,6 +3,8 @@
  * Ablation: current latency1 superblock baseline with read repromotion disabled.
  * Keep all other latency1_sb placement/scheduling defaults aligned.
  */
+#define NVMEV_ENABLE_QLC_HOTCOLD 0
+#define NVMEV_ENABLE_QLC_REBALANCE 0
 #define NVMEV_ENABLE_READ_REPROMOTION 0
 #define NVMEV_ENABLE_DIE_BATCHED_REPROMOTION 0
 #define NVMEV_TEST_PHASE_REPROMOTION_ENABLE 0
