@@ -6,7 +6,9 @@
  * variant repromotion and QLC rebalance are disabled, so the remaining
  * read-priority debt is SLC maintenance worker opportunities. Requeue a
  * skipped opportunity immediately and repay it with one forced catch-up run
- * before allowing another read-priority debt burst to accumulate.
+ * before allowing another read-priority debt burst to accumulate. Keep V2 from
+ * pre-cleaning many closed SBs at once: only one maintenance SB may be in
+ * MIG/GC_RDY/GC phase at a time for this ablation.
  */
 #define NVMEV_ENABLE_QLC_HOTCOLD 1
 #define NVMEV_ENABLE_QLC_REBALANCE 0
@@ -22,6 +24,9 @@
 #endif
 #ifndef NVMEV_LATENCY2_FORCE_CATCHUP_MAX
 #define NVMEV_LATENCY2_FORCE_CATCHUP_MAX 1U
+#endif
+#ifndef NVMEV_LATENCY2_MAX_INFLIGHT_MAINT_SBS
+#define NVMEV_LATENCY2_MAX_INFLIGHT_MAINT_SBS 1U
 #endif
 
 #include "conv_ftl_latency2_superblock.c"
