@@ -106,6 +106,9 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #ifndef NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE
 #define NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE NVMEV_TEST_PHASE_REPROMOTION_ENABLE
 #endif
+#ifndef NVMEV_SLC_GC_REQUIRE_COMPLETE_MIGRATION
+#define NVMEV_SLC_GC_REQUIRE_COMPLETE_MIGRATION 1
+#endif
 /* Variant: baseline with host append/overwrite die hint retained; other optional mechanisms disabled.
  * Superblock variant: free-line accounting is reported and thresholded at one
  * block-id stripe across all dies, rather than at one physical block per die.
@@ -1614,7 +1617,8 @@ static uint32_t migrate_superblock_cold_pages_from_slc(struct conv_ftl *conv_ftl
 						       uint32_t budget,
 						       uint64_t cold_thresh_x10,
 						       bool guard_disabled,
-						       struct slc_mig_scan_stats *stats)
+						       struct slc_mig_scan_stats *stats,
+						       bool *scan_complete)
 {
 	struct ssdparams *spp;
 	uint32_t die_count;
@@ -1625,6 +1629,8 @@ static uint32_t migrate_superblock_cold_pages_from_slc(struct conv_ftl *conv_ftl
 
 	if (!conv_ftl || !conv_ftl->ssd || !budget)
 		return 0;
+	if (scan_complete)
+		*scan_complete = false;
 	spp = &conv_ftl->ssd->sp;
 	die_count = conv_ftl->die_count ? conv_ftl->die_count : 1;
 	pages_per_die = spp->pgs_per_blk;
@@ -1687,6 +1693,8 @@ static uint32_t migrate_superblock_cold_pages_from_slc(struct conv_ftl *conv_ftl
 
 	if (moved)
 		conv_ftl->slc_sb_migration_pages += moved;
+	if (scan_complete)
+		*scan_complete = moved < budget;
 	return moved;
 }
 
@@ -1771,12 +1779,14 @@ static uint32_t slc_migrate_sb_pages_to_qlc(struct conv_ftl *conv_ftl,
 {
 	struct ssdparams *spp;
 	struct baseline_sb_summary sum;
+	struct baseline_sb_summary after;
 	uint64_t cold_thresh_x10;
 	uint32_t die_count;
 	uint32_t pages_per_die;
 	uint32_t total_idx;
 	uint32_t idx;
 	uint32_t moved = 0;
+	bool enqueue_for_gc = false;
 
 	if (!conv_ftl || !conv_ftl->ssd || !budget)
 		return 0;
@@ -1831,7 +1841,10 @@ static uint32_t slc_migrate_sb_pages_to_qlc(struct conv_ftl *conv_ftl,
 
 	if (moved)
 		conv_ftl->slc_sb_migration_pages += moved;
-	slc_sb_finish_migration(conv_ftl, blk_id, moved > 0);
+	if (moved && slc_sb_collect_summary(conv_ftl, blk_id, &after) &&
+	    !after.active && !after.open_writer && after.total_vpc == 0)
+		enqueue_for_gc = true;
+	slc_sb_finish_migration(conv_ftl, blk_id, enqueue_for_gc);
 	return moved;
 }
 
@@ -1860,10 +1873,10 @@ static bool slc_hard_make_victim(struct conv_ftl *conv_ftl,
 
 	if (slc_select_emergency_fold_sb(conv_ftl, preferred_blk, &blk_id)) {
 		moved = slc_migrate_sb_pages_to_qlc(conv_ftl, blk_id, max_pages, false);
-		if (!moved && !slc_has_any_victim(conv_ftl))
-			moved = slc_migrate_sb_pages_to_qlc(conv_ftl, blk_id,
-							    slc_pages_per_superblock(conv_ftl),
-							    true);
+		if (!slc_has_any_victim(conv_ftl))
+			moved += slc_migrate_sb_pages_to_qlc(conv_ftl, blk_id,
+							     slc_pages_per_superblock(conv_ftl),
+							     true);
 		if (migrated_out)
 			*migrated_out += moved;
 	}
@@ -1872,9 +1885,11 @@ static bool slc_hard_make_victim(struct conv_ftl *conv_ftl,
 }
 
 /* [SB-QUEUE GC v1] Scan closed SBs through a bounded cursor. For each SB,
- * migrate cold pages page-by-page until the budget is spent. Any SB that yielded
- * cold pages becomes a GC candidate; GC applies the invalid-ratio gate before
- * erasing in non-forced mode.
+ * migrate cold pages page-by-page until the budget is spent. A SB becomes
+ * GC-eligible only after this pass has scanned it without exhausting the local
+ * migration budget, or after migration leaves no valid SLC pages behind. This
+ * avoids queueing a half-migrated SB and making GC copy the remaining valid
+ * pages as an artifact of the maintenance scheduler.
  *
  * vs 旧 baseline migrate_some_cold_from_slc 的 per-LPN cursor 扫描:
  *   - 永远跳过正在写的 ACTIVE SB (closed-only);
@@ -1906,8 +1921,13 @@ static uint32_t migrate_cold_pages_to_victim_queue_from_slc(struct conv_ftl *con
 	 * 仅用于排序近似, 没选中也没关系 (下一轮会再选)。 */
 	for (scanned = 0; scanned < scan_limit && moved < max_pages; scanned++) {
 		struct baseline_sb_summary sum;
+		struct baseline_sb_summary after;
+		uint32_t budget_left;
 		uint32_t sb_moved = 0;
 		bool enqueue_for_gc = false;
+		bool scan_complete = false;
+		uint64_t recent_before = stats ? stats->skip_recent : 0;
+		uint64_t move_fail_before = stats ? stats->move_fail : 0;
 
 		if (conv_ftl->slc_sb_migrated_victim_count >= victim_cap)
 			break;
@@ -1939,19 +1959,39 @@ static uint32_t migrate_cold_pages_to_victim_queue_from_slc(struct conv_ftl *con
 		if (!slc_sb_try_begin_migration(conv_ftl, blk_id))
 			continue;
 
+		budget_left = max_pages - moved;
 		if (sum.total_vpc) {
 			sb_moved = migrate_superblock_cold_pages_from_slc(conv_ftl, blk_id,
-									  max_pages - moved,
+									  budget_left,
 									  cold_thresh_x10,
 									  guard_disabled,
-									  stats);
+									  stats,
+									  &scan_complete);
 		}
 		moved += sb_moved;
 
-		if (sum.total_vpc == 0 && sum.total_ipc > 0)
+		if (sum.total_vpc == 0) {
 			enqueue_for_gc = true;
-		else if (sb_moved > 0)
-			enqueue_for_gc = true;
+		} else if (sb_moved > 0 || scan_complete) {
+			bool had_recent = stats && stats->skip_recent != recent_before;
+			bool had_move_fail = stats && stats->move_fail != move_fail_before;
+
+			if (!slc_sb_collect_summary(conv_ftl, blk_id, &after)) {
+				enqueue_for_gc = true;
+			} else if (!after.active && !after.open_writer) {
+				if (after.total_vpc == 0) {
+					enqueue_for_gc = true;
+				} else if (scan_complete && sb_moved > 0 &&
+					   !had_recent && !had_move_fail &&
+					   after.total_ipc > 0) {
+					enqueue_for_gc = true;
+				}
+			}
+		}
+
+		if (enqueue_for_gc &&
+		    conv_ftl->slc_sb_migrated_victim_count >= victim_cap)
+			enqueue_for_gc = false;
 
 		slc_sb_finish_migration(conv_ftl, blk_id, enqueue_for_gc);
 		if (need_resched())
@@ -3396,6 +3436,8 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   (uint32_t)NVMEV_TEST_PHASE_REPROMOTION_ENABLE);
 	seq_printf(m, "compile_test_phase_qlc_rebalance_enabled %u\n",
 		   (uint32_t)NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE);
+	seq_printf(m, "compile_slc_gc_requires_complete_migration %u\n",
+		   (uint32_t)NVMEV_SLC_GC_REQUIRE_COMPLETE_MIGRATION);
 	seq_printf(m, "test_phase_repromote_policy %s\n",
 		   NVMEV_TEST_PHASE_REPROMOTION_ENABLE ? "enabled" : "blocked");
 	seq_printf(m, "read_requests %lld\n",
@@ -3646,6 +3688,8 @@ static int baseline_superblock_stats_show(struct seq_file *m, void *v)
 		   (uint32_t)NVMEV_TEST_PHASE_REPROMOTION_ENABLE);
 	seq_printf(m, "compile_test_phase_qlc_rebalance_enabled %u\n",
 		   (uint32_t)NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE);
+	seq_printf(m, "compile_slc_gc_requires_complete_migration %u\n",
+		   (uint32_t)NVMEV_SLC_GC_REQUIRE_COMPLETE_MIGRATION);
 	seq_printf(m, "test_phase_repromote_policy %s\n",
 		   NVMEV_TEST_PHASE_REPROMOTION_ENABLE ? "enabled" : "blocked");
 	seq_printf(m, "die_count %u\n", superblock_die_count(conv_ftl));

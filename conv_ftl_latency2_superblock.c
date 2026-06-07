@@ -106,6 +106,9 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #ifndef NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE
 #define NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE NVMEV_TEST_PHASE_REPROMOTION_ENABLE
 #endif
+#ifndef NVMEV_SLC_GC_REQUIRE_COMPLETE_MIGRATION
+#define NVMEV_SLC_GC_REQUIRE_COMPLETE_MIGRATION 1
+#endif
 #ifndef NVMEV_LATENCY2_READ_QUIET_NS
 #define NVMEV_LATENCY2_READ_QUIET_NS 50000ULL
 #endif
@@ -114,6 +117,12 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #endif
 #ifndef NVMEV_LATENCY2_FORCE_AFTER_YIELDS
 #define NVMEV_LATENCY2_FORCE_AFTER_YIELDS 8U
+#endif
+#ifndef NVMEV_LATENCY2_FORCE_CATCHUP_MAX
+#define NVMEV_LATENCY2_FORCE_CATCHUP_MAX NVMEV_LATENCY2_FORCE_AFTER_YIELDS
+#endif
+#ifndef NVMEV_LATENCY2_MAX_INFLIGHT_MAINT_SBS
+#define NVMEV_LATENCY2_MAX_INFLIGHT_MAINT_SBS 1U
 #endif
 /* Variant: baseline with host append/overwrite die hint retained; other optional mechanisms disabled.
  * Superblock variant: free-line accounting is reported and thresholded at one
@@ -293,6 +302,7 @@ static bool baseline_line_is_host_open_locked(struct conv_ftl *conv_ftl,
 static bool slc_has_any_victim(struct conv_ftl *conv_ftl);
 static bool qlc_has_any_victim(struct conv_ftl *conv_ftl);
 static uint64_t get_dynamic_cold_threshold_x10(struct conv_ftl *conv_ftl);
+static uint32_t maint_v2_inflight_sbs(struct conv_ftl *conv_ftl);
 
 static inline void compute_line_distribution(uint32_t total_lines,
 					     uint32_t *slc_lines,
@@ -1121,7 +1131,8 @@ static void maint_v2_free(struct conv_ftl *conv_ftl);
 
 /* V2 dispatcher 主入口 (从 bg_slc_maint_worker 在 V2 启用时调用) */
 static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
-				   enum slc_pressure_level level);
+				   enum slc_pressure_level level,
+				   bool force_catchup);
 
 static uint32_t migrate_chain_chunk_from_slc(struct conv_ftl *conv_ftl, struct ppa *seed_ppa,
 					     uint32_t budget, uint64_t dyn_thresh)
@@ -1836,12 +1847,14 @@ static uint32_t slc_migrate_sb_pages_to_qlc(struct conv_ftl *conv_ftl,
 {
 	struct ssdparams *spp;
 	struct baseline_sb_summary sum;
+	struct baseline_sb_summary after;
 	uint64_t cold_thresh_x10;
 	uint32_t die_count;
 	uint32_t pages_per_die;
 	uint32_t total_idx;
 	uint32_t idx;
 	uint32_t moved = 0;
+	bool enqueue_for_gc = false;
 
 	if (!conv_ftl || !conv_ftl->ssd || !budget)
 		return 0;
@@ -1896,7 +1909,10 @@ static uint32_t slc_migrate_sb_pages_to_qlc(struct conv_ftl *conv_ftl,
 
 	if (moved)
 		conv_ftl->slc_sb_migration_pages += moved;
-	slc_sb_finish_migration(conv_ftl, blk_id, moved > 0);
+	if (moved && slc_sb_collect_summary(conv_ftl, blk_id, &after) &&
+	    !after.active && !after.open_writer && after.total_vpc == 0)
+		enqueue_for_gc = true;
+	slc_sb_finish_migration(conv_ftl, blk_id, enqueue_for_gc);
 	return moved;
 }
 
@@ -1925,10 +1941,10 @@ static bool slc_hard_make_victim(struct conv_ftl *conv_ftl,
 
 	if (slc_select_emergency_fold_sb(conv_ftl, preferred_blk, &blk_id)) {
 		moved = slc_migrate_sb_pages_to_qlc(conv_ftl, blk_id, max_pages, false);
-		if (!moved && !slc_has_any_victim(conv_ftl))
-			moved = slc_migrate_sb_pages_to_qlc(conv_ftl, blk_id,
-							    slc_pages_per_superblock(conv_ftl),
-							    true);
+		if (!slc_has_any_victim(conv_ftl))
+			moved += slc_migrate_sb_pages_to_qlc(conv_ftl, blk_id,
+							     slc_pages_per_superblock(conv_ftl),
+							     true);
 		if (migrated_out)
 			*migrated_out += moved;
 	}
@@ -3590,6 +3606,8 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   (uint32_t)NVMEV_TEST_PHASE_REPROMOTION_ENABLE);
 	seq_printf(m, "compile_test_phase_qlc_rebalance_enabled %u\n",
 		   (uint32_t)NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE);
+	seq_printf(m, "compile_slc_gc_requires_complete_migration %u\n",
+		   (uint32_t)NVMEV_SLC_GC_REQUIRE_COMPLETE_MIGRATION);
 	seq_printf(m, "test_phase_repromote_policy %s\n",
 		   NVMEV_TEST_PHASE_REPROMOTION_ENABLE ? "enabled" : "blocked");
 	seq_printf(m, "read_requests %lld\n",
@@ -3856,6 +3874,8 @@ static int baseline_superblock_stats_show(struct seq_file *m, void *v)
 		   (uint32_t)NVMEV_TEST_PHASE_REPROMOTION_ENABLE);
 	seq_printf(m, "compile_test_phase_qlc_rebalance_enabled %u\n",
 		   (uint32_t)NVMEV_TEST_PHASE_QLC_REBALANCE_ENABLE);
+	seq_printf(m, "compile_slc_gc_requires_complete_migration %u\n",
+		   (uint32_t)NVMEV_SLC_GC_REQUIRE_COMPLETE_MIGRATION);
 	seq_printf(m, "test_phase_repromote_policy %s\n",
 		   NVMEV_TEST_PHASE_REPROMOTION_ENABLE ? "enabled" : "blocked");
 	seq_printf(m, "die_count %u\n", superblock_die_count(conv_ftl));
@@ -3936,6 +3956,10 @@ static int baseline_superblock_stats_show(struct seq_file *m, void *v)
 		   (unsigned long long)READ_ONCE(conv_ftl->heat_epoch));
 	seq_printf(m, "migration_read_path_time_ns %llu\n",
 		   (unsigned long long)conv_ftl->migration_read_path_time_ns);
+	seq_printf(m, "maint_v2_max_inflight_sbs %u\n",
+		   (uint32_t)NVMEV_LATENCY2_MAX_INFLIGHT_MAINT_SBS);
+	seq_printf(m, "maint_v2_inflight_sbs %u\n",
+		   maint_v2_inflight_sbs(conv_ftl));
 	seq_printf(m, "maint_v2_runs %llu\n",
 		   (unsigned long long)conv_ftl->maint_v2_runs);
 	seq_printf(m, "maint_v2_tasks_done %llu\n",
@@ -10060,18 +10084,28 @@ static void latency2_qlc_rebalance_delayed_requeue(struct conv_ftl *conv_ftl)
 }
 
 static bool latency2_read_priority_should_force_progress(struct conv_ftl *conv_ftl,
-							 enum slc_pressure_level level)
+							 enum slc_pressure_level level,
+							 uint32_t *catchup_passes)
 {
+	uint32_t streak;
+	uint32_t catchup;
+
+	if (catchup_passes)
+		*catchup_passes = 0;
 	if (!conv_ftl || !test_phase_enabled(conv_ftl))
 		return false;
 	if (level < SLC_LEVEL_BG)
 		return false;
-	if (atomic_read(&conv_ftl->latency3_read_priority_yield_streak) <
-	    NVMEV_LATENCY2_FORCE_AFTER_YIELDS)
+
+	streak = (uint32_t)atomic_read(&conv_ftl->latency3_read_priority_yield_streak);
+	if (streak < NVMEV_LATENCY2_FORCE_AFTER_YIELDS)
 		return false;
 
 	atomic64_inc(&conv_ftl->test_phase_read_priority_forced_progress_runs);
 	atomic_set(&conv_ftl->latency3_read_priority_yield_streak, 0);
+	catchup = min_t(uint32_t, streak, NVMEV_LATENCY2_FORCE_CATCHUP_MAX);
+	if (catchup_passes)
+		*catchup_passes = catchup ? catchup : 1;
 	return true;
 }
 
@@ -10129,6 +10163,28 @@ static uint8_t maint_sb_get_phase(struct conv_ftl *conv_ftl, uint32_t sb_id)
 	    sb_id >= conv_ftl->slc_blks_per_pl)
 		return MAINT_SB_PHASE_IDLE;
 	return READ_ONCE(conv_ftl->maint_sb_phase[sb_id]);
+}
+
+static uint32_t maint_v2_inflight_sbs(struct conv_ftl *conv_ftl)
+{
+	uint32_t sb;
+	uint32_t count = 0;
+
+	if (!conv_ftl || !conv_ftl->maint_sb_phase)
+		return 0;
+	for (sb = 0; sb < conv_ftl->slc_blks_per_pl; sb++) {
+		if (READ_ONCE(conv_ftl->maint_sb_phase[sb]) != MAINT_SB_PHASE_IDLE)
+			count++;
+	}
+	return count;
+}
+
+static bool maint_v2_can_enqueue_new_sb(struct conv_ftl *conv_ftl)
+{
+	if (NVMEV_LATENCY2_MAX_INFLIGHT_MAINT_SBS == 0U)
+		return true;
+	return maint_v2_inflight_sbs(conv_ftl) <
+	       NVMEV_LATENCY2_MAX_INFLIGHT_MAINT_SBS;
 }
 
 static uint32_t maint_sb_get_generation(struct conv_ftl *conv_ftl, uint32_t sb_id)
@@ -10713,7 +10769,8 @@ static int maint_enqueue_sb_gc(struct conv_ftl *conv_ftl, uint32_t sb_id,
 /* V2 worker 主循环: 按 die slack 排序, 跳过 demand/channel busy 的 die,
  * 每次只跑一个 task; 跑完看是否还有 work 决定要不要 re-queue。 */
 static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
-				   enum slc_pressure_level level)
+				   enum slc_pressure_level level,
+				   bool force_catchup)
 {
 	uint64_t now;
 	uint32_t total_dies, d;
@@ -10721,6 +10778,7 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 	uint32_t *order;
 	bool emergency = (level == SLC_LEVEL_EMERGENCY);
 	bool force_hard_progress = emergency;
+	bool bypass_idle_filters = emergency || force_catchup;
 	uint32_t executed = 0;
 	uint32_t processed = 0;
 	uint32_t stale_dropped = 0;
@@ -10750,7 +10808,7 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 	}
 
 	/* 1. 若压力到 BG+, 用 bounded cursor 找一个 closed SB 喂 per-die 任务。 */
-	if (level >= SLC_LEVEL_BG) {
+	if (level >= SLC_LEVEL_BG && maint_v2_can_enqueue_new_sb(conv_ftl)) {
 		struct baseline_sb_summary cand;
 		uint32_t total = conv_ftl->slc_blks_per_pl;
 		uint32_t start = total ? conv_ftl->slc_migration_scan_cursor % total : 0;
@@ -10822,10 +10880,10 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 			bool task_executed = false;
 
 			d = order[i];
-			if (!force_hard_progress) {
-				if (slack[d] < (int64_t)MAINT_V2_IDLE_THRESHOLD_NS) {
-					conv_ftl->maint_v2_no_slack_skips++;
-					/* 排在后面的 die slack 只会更小, 不再尝试。 */
+				if (!bypass_idle_filters) {
+					if (slack[d] < (int64_t)MAINT_V2_IDLE_THRESHOLD_NS) {
+						conv_ftl->maint_v2_no_slack_skips++;
+						/* 排在后面的 die slack 只会更小, 不再尝试。 */
 					break;
 				}
 				if (die_has_host_demand(conv_ftl, d)) {
@@ -10836,9 +10894,9 @@ static bool bg_slc_maint_worker_v2(struct conv_ftl *conv_ftl,
 					conv_ftl->maint_v2_ch_busy_skips++;
 					continue;
 				}
-			} else {
-				conv_ftl->maint_v2_emergency_overrides++;
-			}
+				} else if (force_hard_progress) {
+					conv_ftl->maint_v2_emergency_overrides++;
+				}
 
 			t = maint_dequeue_task(conv_ftl, d);
 			if (!t)
@@ -11066,6 +11124,8 @@ static void bg_slc_maint_worker(struct work_struct *work)
 	enum slc_pressure_level level;
 	uint32_t budget = 0;
 	uint32_t moved;
+	uint32_t catchup_passes = 1;
+	uint32_t pass;
 	bool force_progress;
 	bool force_after_yields;
 
@@ -11076,9 +11136,11 @@ static void bg_slc_maint_worker(struct work_struct *work)
 
 	collect_slc_stats(conv_ftl, &slc_st);
 	level = slc_pressure_level(conv_ftl, &slc_st);
-	conv_ftl->slc_maint_runs++;
 	force_after_yields =
-		latency2_read_priority_should_force_progress(conv_ftl, level);
+		latency2_read_priority_should_force_progress(conv_ftl, level,
+							     &catchup_passes);
+	if (!force_after_yields)
+		catchup_passes = 1;
 	force_progress = (level >= SLC_LEVEL_EMERGENCY) || force_after_yields;
 
 	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
@@ -11092,55 +11154,77 @@ static void bg_slc_maint_worker(struct work_struct *work)
 		atomic_inc(&conv_ftl->latency3_read_priority_force_active);
 	latency2_read_priority_note_progress(conv_ftl);
 
-		/* [LATENCY v2] 如果 V2 数组已分配, 维护只走 idle-die dispatcher;
-		 * 否则才降级到 V1 行为。 */
+	/* [LATENCY v2] 如果 V2 数组已分配, 维护只走 idle-die dispatcher;
+	 * 否则才降级到 V1 行为。 */
 	if (maint_v2_enabled(conv_ftl)) {
-		(void)bg_slc_maint_worker_v2(conv_ftl, level);
+		for (pass = 0; pass < catchup_passes; pass++) {
+			if (pass > 0) {
+				collect_slc_stats(conv_ftl, &slc_st);
+				level = slc_pressure_level(conv_ftl, &slc_st);
+				if (level < SLC_LEVEL_BG)
+					break;
+			}
+			conv_ftl->slc_maint_runs++;
+			(void)bg_slc_maint_worker_v2(conv_ftl, level,
+						     force_after_yields);
+			cond_resched();
+		}
 		if (force_progress)
 			atomic_dec_if_positive(&conv_ftl->latency3_read_priority_force_active);
 		atomic_dec_if_positive(&conv_ftl->latency3_bg_read_priority_gate);
 		return;
 	}
 
-	switch (level) {
-	case SLC_LEVEL_IDLE_ONLY:
-		budget = 8;
-		break;
-	case SLC_LEVEL_BG:
-		budget = slc_pages_per_superblock(conv_ftl);
-		if (budget < 32)
-			budget = 32;
-		break;
-	case SLC_LEVEL_URGENT:
-		budget = slc_pages_per_superblock(conv_ftl);
-		if (budget < 32)
-			budget = 32;
-		break;
-	case SLC_LEVEL_EMERGENCY:
-		/* 紧急: host write 路径已经在做同步维护, worker 这边再补一次大块。 */
-		budget = slc_pages_per_superblock(conv_ftl) * 2;
-		break;
+	for (pass = 0; pass < catchup_passes; pass++) {
+		if (pass > 0) {
+			collect_slc_stats(conv_ftl, &slc_st);
+			level = slc_pressure_level(conv_ftl, &slc_st);
+			if (level < SLC_LEVEL_BG)
+				break;
+		}
+		conv_ftl->slc_maint_runs++;
+
+		switch (level) {
+		case SLC_LEVEL_IDLE_ONLY:
+			budget = 8;
+			break;
+		case SLC_LEVEL_BG:
+			budget = slc_pages_per_superblock(conv_ftl);
+			if (budget < 32)
+				budget = 32;
+			break;
+		case SLC_LEVEL_URGENT:
+			budget = slc_pages_per_superblock(conv_ftl);
+			if (budget < 32)
+				budget = 32;
+			break;
+		case SLC_LEVEL_EMERGENCY:
+			/* 紧急: host write 路径已经在做同步维护, worker 这边再补一次大块。 */
+			budget = slc_pages_per_superblock(conv_ftl) * 2;
+			break;
+		}
+
+		moved = 0;
+		if (level >= SLC_LEVEL_EMERGENCY && !slc_has_any_victim(conv_ftl)) {
+			uint32_t hard_moved = 0;
+
+			(void)slc_hard_make_victim(conv_ftl, U32_MAX, budget,
+						   &hard_moved);
+			moved += hard_moved;
+		}
+
+		if (!(level >= SLC_LEVEL_EMERGENCY && slc_has_any_victim(conv_ftl)))
+			moved += migrate_some_cold_from_slc(conv_ftl, budget, -1);
+		conv_ftl->slc_maint_pages += moved;
+
+		/* 如果 migrated_victim 队列非空, 顺手做一次 SLC GC: 这是异步路径上的 GC,
+		 * 不影响 host I/O 的 nsecs_target。 */
+		if (conv_ftl->slc_sb_migrated_victim_count)
+			(void)do_gc_superblock_slc(conv_ftl,
+						   level >= SLC_LEVEL_EMERGENCY);
+		cond_resched();
 	}
 
-	moved = 0;
-	if (level >= SLC_LEVEL_EMERGENCY && !slc_has_any_victim(conv_ftl)) {
-		uint32_t hard_moved = 0;
-
-		(void)slc_hard_make_victim(conv_ftl, U32_MAX, budget, &hard_moved);
-		moved += hard_moved;
-	}
-
-	if (!(level >= SLC_LEVEL_EMERGENCY && slc_has_any_victim(conv_ftl)))
-		moved += migrate_some_cold_from_slc(conv_ftl, budget, -1);
-	conv_ftl->slc_maint_pages += moved;
-
-	/* 如果 migrated_victim 队列非空, 顺手做一次 SLC GC: 这是异步路径上的 GC,
-	 * 不影响 host I/O 的 nsecs_target。 */
-	if (conv_ftl->slc_sb_migrated_victim_count) {
-		(void)do_gc_superblock_slc(conv_ftl, level >= SLC_LEVEL_EMERGENCY);
-	}
-
-	cond_resched();
 	if (force_progress)
 		atomic_dec_if_positive(&conv_ftl->latency3_read_priority_force_active);
 	atomic_dec_if_positive(&conv_ftl->latency3_bg_read_priority_gate);
