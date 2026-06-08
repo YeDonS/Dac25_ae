@@ -3142,6 +3142,7 @@ static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
 	atomic64_set(&conv_ftl->test_phase_recent_guard_skips, 0);
 	atomic64_set(&conv_ftl->test_phase_recent_guard_forced, 0);
 	atomic64_set(&conv_ftl->test_phase_last_read_ktime_ns, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_busy_until_ns, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_yields, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_delayed_requeues, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_forced_progress_runs, 0);
@@ -3273,6 +3274,25 @@ static void latency3_note_read_window_end_all(struct conv_ftl *conv_ftls,
 	}
 }
 
+static void latency3_extend_read_priority_window_all(struct conv_ftl *conv_ftls,
+						     uint32_t nr_parts,
+						     uint64_t busy_until_ns)
+{
+	uint32_t i;
+
+	if (!conv_ftls || !nr_parts || !busy_until_ns)
+		return;
+
+	for (i = 0; i < nr_parts; i++) {
+		struct conv_ftl *part_ftl = &conv_ftls[i];
+
+		if (!test_phase_enabled(part_ftl))
+			continue;
+		nvmev_test_phase_extend_read_priority_window(part_ftl,
+							     busy_until_ns);
+	}
+}
+
 static void test_phase_note_overwrite_begin(struct conv_ftl *conv_ftl, bool *tracked)
 {
 	if (tracked)
@@ -3322,6 +3342,7 @@ static void test_phase_note_bg_end(struct conv_ftl *conv_ftl, bool tracked)
 
 static bool latency3_read_priority_read_window_active(struct conv_ftl *conv_ftl)
 {
+	uint64_t busy_until_ns;
 	uint64_t last_read_ns;
 	uint64_t now_ns;
 
@@ -3329,6 +3350,15 @@ static bool latency3_read_priority_read_window_active(struct conv_ftl *conv_ftl)
 		return false;
 	if (atomic_read(&conv_ftl->test_phase_active_reads) > 0)
 		return true;
+
+	busy_until_ns =
+		(uint64_t)atomic64_read(&conv_ftl->test_phase_read_priority_busy_until_ns);
+	if (busy_until_ns && conv_ftl->ssd) {
+		uint64_t io_now = __get_ioclock(conv_ftl->ssd);
+
+		if (io_now <= busy_until_ns)
+			return true;
+	}
 
 	last_read_ns = atomic64_read(&conv_ftl->test_phase_last_read_ktime_ns);
 	if (!last_read_ns)
@@ -10426,11 +10456,15 @@ ret->nsecs_target = nsecs_latest;
 		lba, nr_lba, nsecs_latest - nsecs_start,
 		conv_ftl->migration_read_path_count);
 
-#if defined(NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS) && NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS
-	if (test_phase_read_tracked)
-		nvmev_test_phase_read_req_lat_note(stats_ftl,
-						   nsecs_latest - nsecs_start);
-#endif
+	#if defined(NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS) && NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS
+		if (test_phase_read_tracked)
+			nvmev_test_phase_read_req_lat_note(stats_ftl,
+							   nsecs_latest - nsecs_start);
+	#endif
+		if (test_phase_read_tracked)
+			latency3_extend_read_priority_window_all(
+				conv_ftls, nr_parts,
+				nsecs_latest + NVMEV_LATENCY3_READ_QUIET_NS);
 	latency3_note_read_window_end_all(conv_ftls, nr_parts, stats_ftl,
 					  test_phase_read_tracked);
 	test_phase_note_read_end(stats_ftl, test_phase_read_tracked);

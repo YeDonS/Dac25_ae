@@ -511,6 +511,7 @@ struct conv_ftl {
 	atomic64_t test_phase_recent_guard_skips;     /* SLC->QLC migration pages skipped by guard */
 	atomic64_t test_phase_recent_guard_forced;    /* guarded pages migrated under SLC pressure */
 	atomic64_t test_phase_last_read_ktime_ns;     /* host read arrival wall-clock for read-priority bg yield */
+	atomic64_t test_phase_read_priority_busy_until_ns; /* simulated read service window end */
 	atomic64_t test_phase_read_priority_yields;   /* bg workers yielded to foreground reads */
 	atomic64_t test_phase_read_priority_delayed_requeues; /* yielded work was delayed before retry */
 	atomic64_t test_phase_read_priority_forced_progress_runs; /* pressure forced one bg maintenance run */
@@ -696,6 +697,27 @@ nvmev_test_phase_read_req_lat_note(struct conv_ftl *conv_ftl, uint64_t lat_ns)
 	atomic64_inc(&conv_ftl->test_phase_read_req_lat_hist[bucket]);
 }
 
+static inline void
+nvmev_test_phase_extend_read_priority_window(struct conv_ftl *conv_ftl,
+					     uint64_t busy_until_ns)
+{
+	s64 old_until;
+
+	if (!conv_ftl || !busy_until_ns)
+		return;
+
+	old_until = atomic64_read(&conv_ftl->test_phase_read_priority_busy_until_ns);
+	while (busy_until_ns > (uint64_t)old_until) {
+		s64 prev = atomic64_cmpxchg(
+			&conv_ftl->test_phase_read_priority_busy_until_ns,
+			old_until, (s64)busy_until_ns);
+
+		if (prev == old_until)
+			break;
+		old_until = prev;
+	}
+}
+
 static inline uint64_t
 nvmev_test_phase_read_req_lat_percentile_ns(struct conv_ftl *conv_ftl,
 					    uint64_t count, uint32_t pct_milli)
@@ -793,6 +815,8 @@ nvmev_test_phase_read_prio_diag_seq_print(struct seq_file *m, struct conv_ftl *c
 		   atomic_read(&conv_ftl->latency3_read_priority_force_active));
 	seq_printf(m, "read_priority_yield_streak_current %d\n",
 		   atomic_read(&conv_ftl->latency3_read_priority_yield_streak));
+	seq_printf(m, "read_priority_busy_until_ns %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_busy_until_ns));
 }
 
 #endif
