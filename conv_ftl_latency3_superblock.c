@@ -3353,36 +3353,44 @@ static bool latency3_read_priority_read_window_active(struct conv_ftl *conv_ftl)
 	uint64_t busy_until_ns;
 	uint64_t last_read_ns;
 	uint64_t now_ns;
+	bool window_active = false;
 
 	if (!test_phase_enabled(conv_ftl))
 		return false;
 	if (atomic_read(&conv_ftl->test_phase_active_reads) > 0)
-		return true;
+		window_active = true;
 
-	busy_until_ns =
-		(uint64_t)atomic64_read(&conv_ftl->test_phase_read_priority_busy_until_ns);
-	if (busy_until_ns && conv_ftl->ssd) {
-		uint64_t io_now = __get_ioclock(conv_ftl->ssd);
+	if (!window_active) {
+		busy_until_ns =
+			(uint64_t)atomic64_read(&conv_ftl->test_phase_read_priority_busy_until_ns);
+		if (busy_until_ns && conv_ftl->ssd) {
+			uint64_t io_now = __get_ioclock(conv_ftl->ssd);
 
-		if (io_now <= busy_until_ns)
-			return true;
+			if (io_now <= busy_until_ns)
+				window_active = true;
+		}
 	}
 
-	last_read_ns = atomic64_read(&conv_ftl->test_phase_last_read_ktime_ns);
-	if (last_read_ns) {
-		now_ns = ktime_get_ns();
-		if (now_ns >= last_read_ns &&
-		    now_ns - last_read_ns < NVMEV_LATENCY3_READ_QUIET_NS)
-			return true;
+	if (!window_active) {
+		last_read_ns = atomic64_read(&conv_ftl->test_phase_last_read_ktime_ns);
+		if (last_read_ns) {
+			now_ns = ktime_get_ns();
+			if (now_ns >= last_read_ns &&
+			    now_ns - last_read_ns < NVMEV_LATENCY3_READ_QUIET_NS)
+				window_active = true;
+		}
 	}
 
-	if (nvmev_test_phase_consume_read_priority_token(conv_ftl)) {
+	if (!window_active)
+		return false;
+
+	if (!nvmev_test_phase_consume_read_priority_token(conv_ftl))
+		return false;
+
 #if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
-		atomic64_inc(&conv_ftl->test_phase_read_priority_token_window_hits);
+	atomic64_inc(&conv_ftl->test_phase_read_priority_token_window_hits);
 #endif
-		return true;
-	}
-	return false;
+	return true;
 }
 
 static bool latency3_read_priority_should_yield(struct conv_ftl *conv_ftl)
