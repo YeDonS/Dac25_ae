@@ -3199,6 +3199,12 @@ static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
 	atomic_set(&conv_ftl->latency3_bg_read_priority_gate, 0);
 	atomic_set(&conv_ftl->latency3_read_priority_yield_streak, 0);
 	atomic_set(&conv_ftl->latency3_read_priority_force_active, 0);
+#if defined(NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS) && NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS
+	nvmev_test_phase_read_req_lat_reset(conv_ftl);
+#endif
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	nvmev_test_phase_read_prio_diag_reset(conv_ftl);
+#endif
 	conv_ftl->test_phase_host_writes_start = conv_ftl->total_host_writes;
 	conv_ftl->test_phase_slc_sb_migration_pages_start =
 		conv_ftl->slc_sb_migration_pages;
@@ -3335,14 +3341,34 @@ static bool latency2_read_priority_read_window_active(struct conv_ftl *conv_ftl)
 
 static bool latency2_read_priority_should_yield(struct conv_ftl *conv_ftl)
 {
+	bool window_active;
+
 	if (!test_phase_enabled(conv_ftl))
 		return false;
-	if (atomic_read(&conv_ftl->latency3_read_priority_force_active) > 0)
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	atomic64_inc(&conv_ftl->test_phase_read_priority_should_yield_checks);
+#endif
+	if (atomic_read(&conv_ftl->latency3_read_priority_force_active) > 0) {
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+		atomic64_inc(&conv_ftl->test_phase_read_priority_should_yield_force_blocked);
+#endif
 		return false;
-	if (atomic_read(&conv_ftl->latency3_bg_read_priority_gate) <= 0)
+	}
+	if (atomic_read(&conv_ftl->latency3_bg_read_priority_gate) <= 0) {
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+		atomic64_inc(&conv_ftl->test_phase_read_priority_should_yield_gate_closed);
+#endif
 		return false;
+	}
 
-	return latency2_read_priority_read_window_active(conv_ftl);
+	window_active = latency2_read_priority_read_window_active(conv_ftl);
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	if (window_active)
+		atomic64_inc(&conv_ftl->test_phase_read_priority_should_yield_true);
+	else
+		atomic64_inc(&conv_ftl->test_phase_read_priority_should_yield_window_closed);
+#endif
+	return window_active;
 }
 
 static void latency2_read_priority_note_yield(struct conv_ftl *conv_ftl)
@@ -3612,6 +3638,12 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   NVMEV_TEST_PHASE_REPROMOTION_ENABLE ? "enabled" : "blocked");
 	seq_printf(m, "read_requests %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_reqs));
+#if defined(NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS) && NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS
+	nvmev_test_phase_read_req_lat_seq_print(m, conv_ftl);
+#endif
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	nvmev_test_phase_read_prio_diag_seq_print(m, conv_ftl);
+#endif
 	seq_printf(m, "read_priority_yields %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_priority_yields));
 	seq_printf(m, "read_priority_delayed_requeues %lld\n",
@@ -9888,6 +9920,10 @@ static void bg_repromotion_worker(struct work_struct *work)
 	if (test_phase_enabled(conv_ftl) && !NVMEV_TEST_PHASE_REPROMOTION_ENABLE)
 		return;
 	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	if (test_phase_enabled(conv_ftl))
+		atomic64_inc(&conv_ftl->test_phase_read_priority_gate_entries);
+#endif
 	if (latency2_read_priority_should_yield(conv_ftl)) {
 		latency2_read_priority_note_yield(conv_ftl);
 		latency2_repromotion_delayed_requeue(conv_ftl);
@@ -9977,6 +10013,10 @@ static void bg_qlc_rebalance_worker(struct work_struct *work)
 	struct conv_ftl *conv_ftl = container_of(work, struct conv_ftl, qlc_rebalance_work);
 
 	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	if (test_phase_enabled(conv_ftl))
+		atomic64_inc(&conv_ftl->test_phase_read_priority_gate_entries);
+#endif
 	if (latency2_read_priority_should_yield(conv_ftl)) {
 		latency2_read_priority_note_yield(conv_ftl);
 		latency2_qlc_rebalance_delayed_requeue(conv_ftl);
@@ -11144,6 +11184,10 @@ static void bg_slc_maint_worker(struct work_struct *work)
 	force_progress = (level >= SLC_LEVEL_EMERGENCY) || force_after_yields;
 
 	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	if (test_phase_enabled(conv_ftl))
+		atomic64_inc(&conv_ftl->test_phase_read_priority_gate_entries);
+#endif
 	if (!force_progress && latency2_read_priority_should_yield(conv_ftl)) {
 		latency2_read_priority_note_yield(conv_ftl);
 		latency2_slc_maint_delayed_requeue(conv_ftl);
@@ -11485,6 +11529,11 @@ ret->nsecs_target = nsecs_latest;
 		lba, nr_lba, nsecs_latest - nsecs_start,
 		conv_ftl->migration_read_path_count);
 
+#if defined(NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS) && NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS
+	if (test_phase_read_tracked)
+		nvmev_test_phase_read_req_lat_note(stats_ftl,
+						   nsecs_latest - nsecs_start);
+#endif
 	latency2_note_read_window_end_all(conv_ftls, nr_parts, stats_ftl,
 					  test_phase_read_tracked);
 	test_phase_note_read_end(stats_ftl, test_phase_read_tracked);

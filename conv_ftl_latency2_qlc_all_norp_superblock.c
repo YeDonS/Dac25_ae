@@ -7,7 +7,8 @@
  * read-priority debt is SLC maintenance worker opportunities. Requeue skipped
  * opportunities immediately, force progress after eight consecutive yields,
  * and repay up to eight maintenance passes. V2 may keep multiple closed SBs in
- * MIG/GC_RDY/GC phase so this run measures the stronger per-die dispatcher.
+ * MIG/GC_RDY/GC phase without an explicit in-flight SB cap so this run measures
+ * the stronger per-die dispatcher.
  */
 #define NVMEV_ENABLE_QLC_HOTCOLD 1
 #define NVMEV_ENABLE_QLC_REBALANCE 0
@@ -16,6 +17,8 @@
 #define NVMEV_ENABLE_DIE_BATCHED_REPROMOTION 0
 #define NVMEV_TEST_PHASE_REPROMOTION_ENABLE 0
 #define NVMEV_SLC_GC_REQUIRE_COMPLETE_MIGRATION 1
+#define NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS 1
+#define NVMEV_TEST_PHASE_READ_PRIORITY_DIAG 1
 #ifndef NVMEV_LATENCY2_REQUEUE_DELAY_US
 #define NVMEV_LATENCY2_REQUEUE_DELAY_US 0U
 #endif

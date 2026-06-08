@@ -3123,6 +3123,15 @@ static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
 	atomic_set(&conv_ftl->test_phase_active_reads, 0);
 	atomic_set(&conv_ftl->test_phase_active_overwrites, 0);
 	atomic_set(&conv_ftl->test_phase_active_bg_ops, 0);
+	atomic_set(&conv_ftl->latency3_bg_read_priority_gate, 0);
+	atomic_set(&conv_ftl->latency3_read_priority_yield_streak, 0);
+	atomic_set(&conv_ftl->latency3_read_priority_force_active, 0);
+#if defined(NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS) && NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS
+	nvmev_test_phase_read_req_lat_reset(conv_ftl);
+#endif
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	nvmev_test_phase_read_prio_diag_reset(conv_ftl);
+#endif
 	conv_ftl->test_phase_host_writes_start = conv_ftl->total_host_writes;
 	conv_ftl->test_phase_slc_sb_migration_pages_start =
 		conv_ftl->slc_sb_migration_pages;
@@ -3442,6 +3451,12 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   NVMEV_TEST_PHASE_REPROMOTION_ENABLE ? "enabled" : "blocked");
 	seq_printf(m, "read_requests %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_reqs));
+#if defined(NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS) && NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS
+	nvmev_test_phase_read_req_lat_seq_print(m, conv_ftl);
+#endif
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	nvmev_test_phase_read_prio_diag_seq_print(m, conv_ftl);
+#endif
 	seq_printf(m, "test_phase_recent_write_guard_config %u\n",
 		   READ_ONCE(nvmev_test_phase_recent_write_guard) ? 1U : 0U);
 	seq_printf(m, "test_phase_recent_write_guard_active %u\n",
@@ -10039,6 +10054,11 @@ ret->nsecs_target = nsecs_latest;
 		lba, nr_lba, nsecs_latest - nsecs_start,
 		conv_ftl->migration_read_path_count);
 
+#if defined(NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS) && NVMEV_TEST_PHASE_READ_REQ_LATENCY_STATS
+	if (test_phase_read_tracked)
+		nvmev_test_phase_read_req_lat_note(stats_ftl,
+						   nsecs_latest - nsecs_start);
+#endif
 	test_phase_note_read_end(stats_ftl, test_phase_read_tracked);
 	return true;
 }
