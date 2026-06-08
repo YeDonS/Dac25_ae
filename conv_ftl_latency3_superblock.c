@@ -113,6 +113,9 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 #ifndef NVMEV_LATENCY3_READ_QUIET_NS
 #define NVMEV_LATENCY3_READ_QUIET_NS 50000ULL
 #endif
+#ifndef NVMEV_LATENCY3_READ_WINDOW_GATE_TOKENS
+#define NVMEV_LATENCY3_READ_WINDOW_GATE_TOKENS 8U
+#endif
 #ifndef NVMEV_LATENCY3_REQUEUE_DELAY_US
 #define NVMEV_LATENCY3_REQUEUE_DELAY_US 50U
 #endif
@@ -3143,6 +3146,7 @@ static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
 	atomic64_set(&conv_ftl->test_phase_recent_guard_forced, 0);
 	atomic64_set(&conv_ftl->test_phase_last_read_ktime_ns, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_busy_until_ns, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_gate_tokens, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_yields, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_delayed_requeues, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_forced_progress_runs, 0);
@@ -3213,6 +3217,8 @@ static void test_phase_note_read_begin(struct conv_ftl *conv_ftl, bool *tracked)
 		}
 	}
 	atomic64_set(&conv_ftl->test_phase_last_read_ktime_ns, ktime_get_ns());
+	nvmev_test_phase_refresh_read_priority_tokens(
+		conv_ftl, NVMEV_LATENCY3_READ_WINDOW_GATE_TOKENS);
 	atomic_inc(&conv_ftl->test_phase_active_reads);
 	if (atomic_read(&conv_ftl->test_phase_active_bg_ops) > 0)
 		atomic64_inc(&conv_ftl->test_phase_read_bg_conflicts);
@@ -3249,6 +3255,8 @@ static void latency3_note_read_window_begin_all(struct conv_ftl *conv_ftls,
 		if (!test_phase_enabled(part_ftl))
 			continue;
 		atomic64_set(&part_ftl->test_phase_last_read_ktime_ns, now_ns);
+		nvmev_test_phase_refresh_read_priority_tokens(
+			part_ftl, NVMEV_LATENCY3_READ_WINDOW_GATE_TOKENS);
 		atomic_inc(&part_ftl->test_phase_active_reads);
 	}
 }
@@ -3361,11 +3369,20 @@ static bool latency3_read_priority_read_window_active(struct conv_ftl *conv_ftl)
 	}
 
 	last_read_ns = atomic64_read(&conv_ftl->test_phase_last_read_ktime_ns);
-	if (!last_read_ns)
-		return false;
-	now_ns = ktime_get_ns();
-	return now_ns >= last_read_ns &&
-	       now_ns - last_read_ns < NVMEV_LATENCY3_READ_QUIET_NS;
+	if (last_read_ns) {
+		now_ns = ktime_get_ns();
+		if (now_ns >= last_read_ns &&
+		    now_ns - last_read_ns < NVMEV_LATENCY3_READ_QUIET_NS)
+			return true;
+	}
+
+	if (nvmev_test_phase_consume_read_priority_token(conv_ftl)) {
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+		atomic64_inc(&conv_ftl->test_phase_read_priority_token_window_hits);
+#endif
+		return true;
+	}
+	return false;
 }
 
 static bool latency3_read_priority_should_yield(struct conv_ftl *conv_ftl)
