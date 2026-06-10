@@ -3166,9 +3166,13 @@ static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
 	atomic64_set(&conv_ftl->test_phase_bg_repromote_ops, 0);
 	atomic64_set(&conv_ftl->test_phase_bg_qlc_rebalance_ops, 0);
 	atomic64_set(&conv_ftl->test_phase_read_bg_conflicts, 0);
+	atomic64_set(&conv_ftl->test_phase_read_begin_bg_active, 0);
+	atomic64_set(&conv_ftl->test_phase_bg_begin_read_active, 0);
 	atomic64_set(&conv_ftl->test_phase_read_overwrite_conflicts, 0);
 	atomic64_set(&conv_ftl->test_phase_read_die_conflicts, 0);
 	atomic64_set(&conv_ftl->test_phase_read_die_wait_ns, 0);
+	atomic64_set(&conv_ftl->test_phase_read_lp_bypass_ops, 0);
+	atomic64_set(&conv_ftl->test_phase_read_lp_bypass_ns, 0);
 	atomic64_set(&conv_ftl->test_phase_host_read_nand_ops, 0);
 	atomic64_set(&conv_ftl->test_phase_host_read_slc_ops, 0);
 	atomic64_set(&conv_ftl->test_phase_host_read_qlc_ops, 0);
@@ -3195,6 +3199,12 @@ static void test_phase_reset_stats(struct conv_ftl *conv_ftl)
 	atomic64_set(&conv_ftl->test_phase_last_read_ktime_ns, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_busy_until_ns, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_gate_tokens, 0);
+	atomic64_set(&conv_ftl->test_phase_last_read_issue_ns, 0);
+	atomic64_set(&conv_ftl->test_phase_read_issue_gap_count, 0);
+	atomic64_set(&conv_ftl->test_phase_read_issue_gap_sum_ns, 0);
+	atomic64_set(&conv_ftl->test_phase_read_issue_gap_max_ns, 0);
+	atomic64_set(&conv_ftl->test_phase_read_issue_same_time, 0);
+	atomic64_set(&conv_ftl->test_phase_read_issue_backwards, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_yields, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_delayed_requeues, 0);
 	atomic64_set(&conv_ftl->test_phase_read_priority_forced_progress_runs, 0);
@@ -3227,8 +3237,11 @@ static void test_phase_log_summary(struct conv_ftl *conv_ftl, const char *phase)
 		return;
 
 	NVMEV_INFO("[TEST_PHASE] %s reads=%lld overwrites=%lld bg_repromote=%lld "
-		   "bg_qlc_rebalance=%lld read_bg_conflicts=%lld read_overwrite_conflicts=%lld "
-		   "read_die_conflicts=%lld read_die_wait_ns=%lld phys_qlc_reads=%lld "
+		   "bg_qlc_rebalance=%lld read_bg_conflicts=%lld "
+		   "read_begin_bg_active=%lld bg_begin_read_active=%lld "
+		   "read_overwrite_conflicts=%lld "
+		   "read_die_conflicts=%lld read_die_wait_ns=%lld "
+		   "read_lp_bypass_ops=%lld read_lp_bypass_ns=%lld phys_qlc_reads=%lld "
 		   "tier_mismatch_reads=%lld phys_qlc_read_pages=%lld "
 		   "tier_mismatch_read_pages=%lld\n",
 		   phase ? phase : "summary",
@@ -3237,9 +3250,13 @@ static void test_phase_log_summary(struct conv_ftl *conv_ftl, const char *phase)
 		   atomic64_read(&conv_ftl->test_phase_bg_repromote_ops),
 		   atomic64_read(&conv_ftl->test_phase_bg_qlc_rebalance_ops),
 		   atomic64_read(&conv_ftl->test_phase_read_bg_conflicts),
+		   atomic64_read(&conv_ftl->test_phase_read_begin_bg_active),
+		   atomic64_read(&conv_ftl->test_phase_bg_begin_read_active),
 		   atomic64_read(&conv_ftl->test_phase_read_overwrite_conflicts),
 		   atomic64_read(&conv_ftl->test_phase_read_die_conflicts),
 		   atomic64_read(&conv_ftl->test_phase_read_die_wait_ns),
+		   atomic64_read(&conv_ftl->test_phase_read_lp_bypass_ops),
+		   atomic64_read(&conv_ftl->test_phase_read_lp_bypass_ns),
 		   atomic64_read(&conv_ftl->test_phase_host_read_phys_qlc_ops),
 		   atomic64_read(&conv_ftl->test_phase_host_read_tier_mismatch_ops),
 		   atomic64_read(&conv_ftl->test_phase_host_read_phys_qlc_pages),
@@ -3247,7 +3264,9 @@ static void test_phase_log_summary(struct conv_ftl *conv_ftl, const char *phase)
 	baseline_superblock_stats_log_summary(conv_ftl, phase);
 }
 
-static void test_phase_note_read_begin(struct conv_ftl *conv_ftl, bool *tracked)
+static void test_phase_note_read_begin(struct conv_ftl *conv_ftl,
+				       uint64_t issue_ns,
+				       bool *tracked)
 {
 	if (tracked)
 		*tracked = false;
@@ -3264,12 +3283,15 @@ static void test_phase_note_read_begin(struct conv_ftl *conv_ftl, bool *tracked)
 				     test_phase_guard_epoch_for_reads(reads));
 		}
 	}
+	nvmev_test_phase_note_read_issue(conv_ftl, issue_ns);
 	atomic64_set(&conv_ftl->test_phase_last_read_ktime_ns, ktime_get_ns());
 	nvmev_test_phase_refresh_read_priority_tokens(
 		conv_ftl, NVMEV_LATENCY2_READ_WINDOW_GATE_TOKENS);
 	atomic_inc(&conv_ftl->test_phase_active_reads);
-	if (atomic_read(&conv_ftl->test_phase_active_bg_ops) > 0)
+	if (atomic_read(&conv_ftl->test_phase_active_bg_ops) > 0) {
 		atomic64_inc(&conv_ftl->test_phase_read_bg_conflicts);
+		atomic64_inc(&conv_ftl->test_phase_read_begin_bg_active);
+	}
 	if (atomic_read(&conv_ftl->test_phase_active_overwrites) > 0)
 		atomic64_inc(&conv_ftl->test_phase_read_overwrite_conflicts);
 	if (tracked)
@@ -3355,11 +3377,20 @@ static bool latency2_read_priority_read_window_active(struct conv_ftl *conv_ftl)
 	uint64_t last_read_ns;
 	uint64_t now_ns;
 	bool window_active = false;
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	bool hit_active_read = false;
+	bool hit_busy_window = false;
+	bool hit_quiet_window = false;
+#endif
 
 	if (!test_phase_enabled(conv_ftl))
 		return false;
-	if (atomic_read(&conv_ftl->test_phase_active_reads) > 0)
+	if (atomic_read(&conv_ftl->test_phase_active_reads) > 0) {
 		window_active = true;
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+		hit_active_read = true;
+#endif
+	}
 
 	if (!window_active) {
 		busy_until_ns =
@@ -3367,8 +3398,12 @@ static bool latency2_read_priority_read_window_active(struct conv_ftl *conv_ftl)
 		if (busy_until_ns && conv_ftl->ssd) {
 			uint64_t io_now = __get_ioclock(conv_ftl->ssd);
 
-			if (io_now <= busy_until_ns)
+			if (io_now <= busy_until_ns) {
 				window_active = true;
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+				hit_busy_window = true;
+#endif
+			}
 		}
 	}
 
@@ -3377,18 +3412,32 @@ static bool latency2_read_priority_read_window_active(struct conv_ftl *conv_ftl)
 		if (last_read_ns) {
 			now_ns = ktime_get_ns();
 			if (now_ns >= last_read_ns &&
-			    now_ns - last_read_ns < NVMEV_LATENCY2_READ_QUIET_NS)
+			    now_ns - last_read_ns < NVMEV_LATENCY2_READ_QUIET_NS) {
 				window_active = true;
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+				hit_quiet_window = true;
+#endif
+			}
 		}
 	}
 
 	if (!window_active)
 		return false;
 
-	if (!nvmev_test_phase_consume_read_priority_token(conv_ftl))
+	if (!nvmev_test_phase_consume_read_priority_token(conv_ftl)) {
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+		atomic64_inc(&conv_ftl->test_phase_read_priority_token_empty);
+#endif
 		return false;
+	}
 
 #if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	if (hit_active_read)
+		atomic64_inc(&conv_ftl->test_phase_read_priority_window_active_read_hits);
+	else if (hit_busy_window)
+		atomic64_inc(&conv_ftl->test_phase_read_priority_window_busy_hits);
+	else if (hit_quiet_window)
+		atomic64_inc(&conv_ftl->test_phase_read_priority_window_quiet_hits);
 	atomic64_inc(&conv_ftl->test_phase_read_priority_token_window_hits);
 #endif
 	return true;
@@ -3474,8 +3523,10 @@ static void test_phase_note_bg_begin(struct conv_ftl *conv_ftl,
 	if (specific_counter)
 		atomic64_inc(specific_counter);
 	atomic_inc(&conv_ftl->test_phase_active_bg_ops);
-	if (atomic_read(&conv_ftl->test_phase_active_reads) > 0)
+	if (atomic_read(&conv_ftl->test_phase_active_reads) > 0) {
 		atomic64_inc(&conv_ftl->test_phase_read_bg_conflicts);
+		atomic64_inc(&conv_ftl->test_phase_bg_begin_read_active);
+	}
 	if (tracked)
 		*tracked = true;
 }
@@ -3727,12 +3778,17 @@ static int test_phase_stats_show(struct seq_file *m, void *v)
 		   atomic64_read(&conv_ftl->test_phase_bg_qlc_rebalance_ops));
 	seq_printf(m, "read_bg_conflicts %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_bg_conflicts));
+	nvmev_test_phase_read_overlap_seq_print(m, conv_ftl);
 	seq_printf(m, "read_overwrite_conflicts %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_overwrite_conflicts));
 	seq_printf(m, "read_die_conflicts %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_die_conflicts));
 	seq_printf(m, "read_die_wait_ns %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_read_die_wait_ns));
+	seq_printf(m, "read_lp_bypass_ops %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_lp_bypass_ops));
+	seq_printf(m, "read_lp_bypass_ns %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_lp_bypass_ns));
 	seq_printf(m, "host_read_nand_ops %lld\n",
 		   atomic64_read(&conv_ftl->test_phase_host_read_nand_ops));
 	seq_printf(m, "global_read_sum %llu\n",
@@ -10206,11 +10262,23 @@ static bool latency2_read_priority_should_force_progress(struct conv_ftl *conv_f
 
 static void slc_maint_kick(struct conv_ftl *conv_ftl)
 {
+	bool should_yield;
+
 	if (!conv_ftl || !conv_ftl->bg_migration_wq)
 		return;
 	if (!test_phase_enabled(conv_ftl))
 		return;
-	if (latency2_read_priority_read_window_active(conv_ftl))
+
+	atomic_inc(&conv_ftl->latency3_bg_read_priority_gate);
+#if defined(NVMEV_TEST_PHASE_READ_PRIORITY_DIAG) && NVMEV_TEST_PHASE_READ_PRIORITY_DIAG
+	atomic64_inc(&conv_ftl->test_phase_read_priority_gate_entries);
+#endif
+	should_yield = latency2_read_priority_should_yield(conv_ftl);
+	if (should_yield)
+		latency2_read_priority_note_yield(conv_ftl);
+	atomic_dec_if_positive(&conv_ftl->latency3_bg_read_priority_gate);
+
+	if (should_yield)
 		latency2_slc_maint_delayed_requeue(conv_ftl);
 	else
 		queue_work(conv_ftl->bg_migration_wq, &conv_ftl->slc_maint_work);
@@ -11382,12 +11450,15 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
     }
 
 	rd_seq = atomic64_inc_return(&conv_ftl->total_host_reads);
-	test_phase_note_read_begin(stats_ftl, &test_phase_read_tracked);
+	test_phase_note_read_begin(stats_ftl, nsecs_start,
+				   &test_phase_read_tracked);
 	latency2_note_read_window_begin_all(conv_ftls, nr_parts, stats_ftl,
 					    test_phase_read_tracked);
 	if (test_phase_read_tracked && stats_ftl) {
 		srd.tracked_read_die_conflicts = &stats_ftl->test_phase_read_die_conflicts;
 		srd.tracked_read_die_wait_ns = &stats_ftl->test_phase_read_die_wait_ns;
+		srd.tracked_read_lp_bypass_ops = &stats_ftl->test_phase_read_lp_bypass_ops;
+		srd.tracked_read_lp_bypass_ns = &stats_ftl->test_phase_read_lp_bypass_ns;
 	}
 
 	if (LBA_TO_BYTE(nr_lba) <= (KB(4) * nr_parts)) {

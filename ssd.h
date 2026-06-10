@@ -5,6 +5,7 @@
 
 #include <linux/types.h>
 #include <linux/atomic.h>
+#include <linux/spinlock.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "channel_model.h"
@@ -122,6 +123,7 @@ struct nand_lun {
 	uint64_t next_lun_avail_time;
 	uint64_t hp_next_lun_avail_time;
 	uint64_t lp_next_lun_avail_time;
+	spinlock_t timing_lock;
 	bool busy;
 	uint64_t gc_endtime;
 };
@@ -132,6 +134,7 @@ struct ssd_channel {
 	uint64_t next_ch_avail_time;
 	uint64_t hp_next_ch_avail_time;
 	uint64_t lp_next_ch_avail_time;
+	spinlock_t timing_lock;
 	uint64_t gc_endtime;
 	struct channel_model *perf_model;
 };
@@ -140,6 +143,7 @@ struct ssd_pcie {
 	uint64_t next_pcie_avail_time;
 	uint64_t hp_next_pcie_avail_time;
 	uint64_t lp_next_pcie_avail_time;
+	spinlock_t timing_lock;
 	struct channel_model *perf_model;
 };
 
@@ -152,6 +156,8 @@ struct nand_cmd {
 	struct ppa *ppa;
 	atomic64_t *tracked_read_die_conflicts;
 	atomic64_t *tracked_read_die_wait_ns;
+	atomic64_t *tracked_read_lp_bypass_ops;
+	atomic64_t *tracked_read_lp_bypass_ns;
 };
 
 struct buffer {

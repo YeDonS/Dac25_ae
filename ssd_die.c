@@ -558,6 +558,7 @@ static void ssd_init_nand_lun(struct nand_lun *lun, struct ssdparams *spp)
 	lun->next_lun_avail_time = 0;
 	lun->hp_next_lun_avail_time = 0;
 	lun->lp_next_lun_avail_time = 0;
+	spin_lock_init(&lun->timing_lock);
 	lun->busy = false;
 }
 
@@ -586,6 +587,7 @@ static void ssd_init_ch(struct ssd_channel *ch, struct ssdparams *spp)
 	ch->next_ch_avail_time = 0;
 	ch->hp_next_ch_avail_time = 0;
 	ch->lp_next_ch_avail_time = 0;
+	spin_lock_init(&ch->timing_lock);
 
 	ch->perf_model = kmalloc(sizeof(struct channel_model), GFP_KERNEL);
 	if (!ch->perf_model) {
@@ -622,6 +624,7 @@ static void ssd_init_pcie(struct ssd_pcie *pcie, struct ssdparams *spp)
 	pcie->next_pcie_avail_time = 0;
 	pcie->hp_next_pcie_avail_time = 0;
 	pcie->lp_next_pcie_avail_time = 0;
+	spin_lock_init(&pcie->timing_lock);
 	pcie->perf_model = kmalloc(sizeof(struct channel_model), GFP_KERNEL);
 	if (!pcie->perf_model) {
 		NVMEV_ERROR("Failed to allocate pcie performance model memory\n");
@@ -706,8 +709,8 @@ static inline uint64_t ssd_pcie_xfer_time(struct ssd_pcie *pcie,
 
 static inline uint64_t ssd_pcie_sched_start(struct ssd_pcie *pcie,
 					    uint64_t request_time,
-					    bool read_priority,
-					    bool low_priority)
+			  bool read_priority,
+			  bool low_priority)
 {
 	if (read_priority)
 		return max(pcie->hp_next_pcie_avail_time, request_time);
@@ -761,11 +764,13 @@ static uint64_t ssd_advance_pcie_internal(struct ssd *ssd,
 	if (!ssd || !ssd->pcie || !ssd->pcie->perf_model)
 		return request_time;
 	pcie = ssd->pcie;
+	spin_lock(&pcie->timing_lock);
 
 	if (!read_priority && !low_priority) {
 		request_time = max(pcie->next_pcie_avail_time, request_time);
 		end = chmodel_request(pcie->perf_model, request_time, length);
 		ssd_pcie_commit_normal(pcie, end);
+		spin_unlock(&pcie->timing_lock);
 		return end;
 	}
 
@@ -781,6 +786,7 @@ static uint64_t ssd_advance_pcie_internal(struct ssd *ssd,
 		ssd_pcie_commit_read_priority(pcie, start, end);
 	else
 		ssd_pcie_commit_low_priority(pcie, end);
+	spin_unlock(&pcie->timing_lock);
 	return end;
 }
 
@@ -897,7 +903,7 @@ static inline uint64_t ssd_channel_xfer_time(struct ssd_channel *ch,
 static inline uint64_t ssd_channel_sched_start(struct ssd_channel *ch,
 					       uint64_t request_time,
 					       bool read_priority,
-					       bool low_priority)
+					   bool low_priority)
 {
 	if (read_priority)
 		return max(ch->hp_next_ch_avail_time, request_time);
@@ -950,11 +956,13 @@ static uint64_t ssd_advance_channel(struct ssd_channel *ch,
 
 	if (!ch || !ch->perf_model)
 		return request_time;
+	spin_lock(&ch->timing_lock);
 
 	if (!read_priority && !low_priority) {
 		request_time = max(ch->next_ch_avail_time, request_time);
 		end = chmodel_request(ch->perf_model, request_time, length);
 		ssd_channel_commit_normal(ch, end);
+		spin_unlock(&ch->timing_lock);
 		return end;
 	}
 
@@ -971,6 +979,7 @@ static uint64_t ssd_advance_channel(struct ssd_channel *ch,
 		ssd_channel_commit_read_priority(ch, start, end);
 	else
 		ssd_channel_commit_low_priority(ch, end);
+	spin_unlock(&ch->timing_lock);
 	return end;
 }
 
@@ -1054,16 +1063,24 @@ static uint64_t ssd_advance_nand_internal(struct ssd *ssd, struct nand_cmd *ncmd
 	/* 判断是否为 QLC 块 */
 	is_qlc = is_qlc_block_ssd(ssd, ppa->g.blk);
 
+	spin_lock(&lun->timing_lock);
 	switch (c) {
 		case NAND_READ:
 			/* read: perform NAND cmd first */
-			nand_stime = ssd_lun_sched_start(lun, cmd_stime,
-							 read_priority, low_priority);
-			if (read_priority && lun->next_lun_avail_time > nand_stime) {
-				atomic64_inc(&read_priority_bypass_ops);
-				atomic64_add(lun->next_lun_avail_time - nand_stime,
-					     &read_priority_bypass_ns);
-			}
+				nand_stime = ssd_lun_sched_start(lun, cmd_stime,
+								 read_priority, low_priority);
+				if (read_priority && lun->next_lun_avail_time > nand_stime) {
+					uint64_t bypass_ns =
+						lun->next_lun_avail_time - nand_stime;
+
+					atomic64_inc(&read_priority_bypass_ops);
+					atomic64_add(bypass_ns, &read_priority_bypass_ns);
+					if (ncmd->tracked_read_lp_bypass_ops)
+						atomic64_inc(ncmd->tracked_read_lp_bypass_ops);
+					if (ncmd->tracked_read_lp_bypass_ns)
+						atomic64_add(bypass_ns,
+							     ncmd->tracked_read_lp_bypass_ns);
+				}
 
 				if (ncmd->type != GC_IO) {
 				int die_idx = ppa->g.lun * spp->nchs + ppa->g.ch;
@@ -1202,8 +1219,10 @@ static uint64_t ssd_advance_nand_internal(struct ssd *ssd, struct nand_cmd *ncmd
 
 	default:
 		NVMEV_ERROR("Unsupported NAND command: 0x%x\n", c);
-		return 0;
+		completed_time = 0;
+		break;
 	}
+	spin_unlock(&lun->timing_lock);
 
 	if (ncmd->type == GC_IO && completed_time > cmd_stime) {
 		uint64_t delta = completed_time - cmd_stime;
@@ -1258,15 +1277,15 @@ uint64_t ssd_next_idle_time(struct ssd *ssd)
 	for (i = 0; i < spp->nchs; i++) {
 		struct ssd_channel *ch = &ssd->ch[i];
 
-		latest = max(latest, ch->next_ch_avail_time);
+		latest = max(latest, READ_ONCE(ch->next_ch_avail_time));
 
 		for (j = 0; j < spp->luns_per_ch; j++) {
 			struct nand_lun *lun = &ch->lun[j];
-			latest = max(latest, lun->next_lun_avail_time);
+			latest = max(latest, READ_ONCE(lun->next_lun_avail_time));
 		}
 	}
 	if (ssd->pcie)
-		latest = max(latest, ssd->pcie->next_pcie_avail_time);
+		latest = max(latest, READ_ONCE(ssd->pcie->next_pcie_avail_time));
 
 	return latest;
 }
@@ -1277,7 +1296,7 @@ uint64_t ssd_lun_next_idle_time(struct ssd *ssd, unsigned int ch, unsigned int l
 	    lun >= (unsigned int)ssd->sp.luns_per_ch)
 		return ssd ? __get_ioclock(ssd) : 0;
 
-	return ssd->ch[ch].lun[lun].next_lun_avail_time;
+	return READ_ONCE(ssd->ch[ch].lun[lun].next_lun_avail_time);
 }
 
 uint64_t ssd_pcie_next_idle_time(struct ssd *ssd)
@@ -1285,7 +1304,7 @@ uint64_t ssd_pcie_next_idle_time(struct ssd *ssd)
 	if (!ssd || !ssd->pcie)
 		return ssd ? __get_ioclock(ssd) : 0;
 
-	return ssd->pcie->next_pcie_avail_time;
+	return READ_ONCE(ssd->pcie->next_pcie_avail_time);
 }
 
 void adjust_ftl_latency(int target, int lat)
