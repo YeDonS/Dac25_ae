@@ -4,6 +4,8 @@
 #define _NVMEVIRT_SSD_H
 
 #include <linux/types.h>
+#include <linux/atomic.h>
+#include <linux/spinlock.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "channel_model.h"
@@ -15,7 +17,7 @@ uint64_t __get_ioclock(struct ssd *ssd);
     Channel = 40 * 8 = 320
     LUN     = 40 * 8 = 320
     Plane   = 16 * 1 = 16
-    Block   = 32 * 256 = 8192
+    Block   = 2432
     Page    = 16 * 256 = 4096
     Sector  = 4 * 8 = 32
 
@@ -35,6 +37,11 @@ enum {
 	NAND_NOP = 3,
 };
 
+enum ssd_latency_profile {
+	SSD_LATENCY_PROFILE_NORMAL = 0,
+	SSD_LATENCY_PROFILE_INIT_FAST = 1,
+};
+
 enum {
 	USER_IO = 0,
 	GC_IO = 1,
@@ -47,7 +54,8 @@ enum {
 
 	PG_FREE = 0,
 	PG_INVALID = 1,
-	PG_VALID = 2
+	PG_VALID = 2,
+	PG_RESERVED = 3
 };
 
 /* Cell type */
@@ -109,10 +117,19 @@ struct nand_plane {
 	int nblks;
 };
 
+enum ssd_resource_owner {
+	SSD_OWNER_NONE = 0,
+	SSD_OWNER_HOST_READ,
+	SSD_OWNER_HOST_WRITE,
+	SSD_OWNER_BACKGROUND,
+};
+
 struct nand_lun {
 	struct nand_plane *pl;
 	int npls;
 	uint64_t next_lun_avail_time;
+	enum ssd_resource_owner tail_owner;
+	spinlock_t timing_lock;
 	bool busy;
 	uint64_t gc_endtime;
 };
@@ -120,11 +137,17 @@ struct nand_lun {
 struct ssd_channel {
 	struct nand_lun *lun;
 	int nluns;
+	uint64_t next_ch_avail_time;
+	enum ssd_resource_owner tail_owner;
+	spinlock_t timing_lock;
 	uint64_t gc_endtime;
 	struct channel_model *perf_model;
 };
 
 struct ssd_pcie {
+	uint64_t next_pcie_avail_time;
+	enum ssd_resource_owner tail_owner;
+	spinlock_t timing_lock;
 	struct channel_model *perf_model;
 };
 
@@ -135,6 +158,26 @@ struct nand_cmd {
 	uint64_t stime; /* Coperd: request arrival time */
 	bool interleave_pci_dma;
 	struct ppa *ppa;
+	atomic64_t *tracked_read_die_conflicts;
+	atomic64_t *tracked_read_die_wait_ns;
+	atomic64_t *tracked_read_die_read_conflicts;
+	atomic64_t *tracked_read_die_read_wait_ns;
+	atomic64_t *tracked_read_die_bg_conflicts;
+	atomic64_t *tracked_read_die_bg_wait_ns;
+	atomic64_t *tracked_read_ch_conflicts;
+	atomic64_t *tracked_read_ch_wait_ns;
+	atomic64_t *tracked_read_ch_read_conflicts;
+	atomic64_t *tracked_read_ch_read_wait_ns;
+	atomic64_t *tracked_read_ch_bg_conflicts;
+	atomic64_t *tracked_read_ch_bg_wait_ns;
+	atomic64_t *tracked_read_pcie_conflicts;
+	atomic64_t *tracked_read_pcie_wait_ns;
+	atomic64_t *tracked_read_pcie_read_conflicts;
+	atomic64_t *tracked_read_pcie_read_wait_ns;
+	atomic64_t *tracked_read_pcie_bg_conflicts;
+	atomic64_t *tracked_read_pcie_bg_wait_ns;
+	atomic64_t *tracked_read_lp_bypass_ops;
+	atomic64_t *tracked_read_lp_bypass_ns;
 };
 
 struct buffer {
@@ -195,6 +238,22 @@ struct ssdparams {
 	int fw_wbuf_lat1; /* Firmware overhead1 of write buffer in nanoseconds */
 	int fw_ch_xfer_lat; /* Firmware overhead of nand channel data transfer(4KB) in nanoseconds */
 
+	int base_pg_4kb_rd_lat[MAX_CELL_TYPES];
+	int base_pg_rd_lat[MAX_CELL_TYPES];
+	int base_pg_wr_lat;
+	int base_blk_er_lat;
+	int base_qlc_pg_4kb_rd_lat[4];
+	int base_qlc_pg_rd_lat[4];
+	int base_qlc_pg_wr_lat;
+	int base_qlc_blk_er_lat;
+	int base_migration_lat;
+	int base_fw_4kb_rd_lat;
+	int base_fw_rd_lat;
+	int base_fw_wbuf_lat0;
+	int base_fw_wbuf_lat1;
+	int base_fw_ch_xfer_lat;
+	enum ssd_latency_profile latency_profile;
+
 	uint64_t ch_bandwidth; /*NAND CH Maximum bandwidth in MiB/s*/
 	uint64_t pcie_bandwidth; /*PCIE Maximum bandwidth in MiB/s*/
 
@@ -245,6 +304,10 @@ struct ssd {
 	unsigned int cpu_nr_dispatcher;
 };
 
+void ssd_capture_latency_defaults(struct ssdparams *spp);
+void ssd_set_latency_profile(struct ssd *ssd, enum ssd_latency_profile profile);
+const char *ssd_latency_profile_name(enum ssd_latency_profile profile);
+
 static inline struct ssd_channel *get_ch(struct ssd *ssd, struct ppa *ppa)
 {
 	return &(ssd->ch[ppa->g.ch]);
@@ -285,9 +348,16 @@ void ssd_init(struct ssd *ssd, struct ssdparams *spp, uint32_t cpu_nr_dispatcher
 void ssd_remove(struct ssd *ssd);
 
 uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd);
+uint64_t ssd_advance_nand_read_priority(struct ssd *ssd, struct nand_cmd *ncmd);
+uint64_t ssd_advance_nand_low_priority(struct ssd *ssd, struct nand_cmd *ncmd);
 uint64_t ssd_advance_pcie(struct ssd *ssd, uint64_t request_time, uint64_t length);
 uint64_t ssd_advance_write_buffer(struct ssd *ssd, uint64_t request_time, uint64_t length);
+uint64_t ssd_advance_write_buffer_low_priority(struct ssd *ssd,
+					       uint64_t request_time,
+					       uint64_t length);
 uint64_t ssd_next_idle_time(struct ssd *ssd);
+uint64_t ssd_lun_next_idle_time(struct ssd *ssd, unsigned int ch, unsigned int lun);
+uint64_t ssd_pcie_next_idle_time(struct ssd *ssd);
 
 void buffer_init(struct buffer *buf, size_t size);
 uint32_t buffer_allocate(struct buffer *buf, size_t size);

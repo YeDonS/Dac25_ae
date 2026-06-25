@@ -99,7 +99,7 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 #define NAND_READ_LATENCY_MSB (36013 + 6000)
 #define NAND_READ_LATENCY_CSB (0) //not used
 #define NAND_PROG_LATENCY (185000)
-#define NAND_ERASE_LATENCY (0)
+#define NAND_ERASE_LATENCY (2000000) /* 2 ms block erase */
 
 /* QLC 4KB 读延迟：约为 SLC 的 1.5-4. 倍 */
 #define QLC_4KB_READ_LATENCY_TOP    ((35760 - 6000) * 15 / 10) 
@@ -117,7 +117,7 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 #define QLC_PROG_LATENCY (185000 * 4)
 
 /* QLC 擦除延迟：约为 SLC 的 3 倍 */  
-#define QLC_ERASE_LATENCY (0) // 3ms (假设 SLC 擦除延迟为 1ms)
+#define QLC_ERASE_LATENCY (8000000) /* 8 ms block erase */
 
 /* SLC 到 QLC 迁移延迟：读取 SLC + 写入 QLC */
 #define MIGRATION_LATENCY (NAND_READ_LATENCY_LSB + QLC_PROG_LATENCY)
@@ -138,6 +138,7 @@ static_assert((ONESHOT_PAGE_SIZE % FLASH_PAGE_SIZE) == 0);
 #define FW_WBUF_LATENCY1 (460)
 #define FW_CH_XFER_LATENCY (0)
 #define OP_AREA_PERCENT (0.07)
+
 
 // #define GLOBAL_WB_SIZE (NAND_CHANNELS * LUNS_PER_NAND_CH * ONESHOT_PAGE_SIZE * 2)
 #define GLOBAL_WB_SIZE ((NAND_CHANNELS * LUNS_PER_NAND_CH * ONESHOT_PAGE_SIZE * 2) * (NAND_CHANNELS * LUNS_PER_NAND_CH))

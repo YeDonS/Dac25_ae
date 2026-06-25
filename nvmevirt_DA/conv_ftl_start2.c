@@ -27,19 +27,9 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 /* SLC 低水位阈值：空闲行数低于总行数的该百分比则触发迁移 */
 #define SLC_FREE_LOW_WM_PCT 10
 
-#define SLC_LINE_RATIO_NUM 1
-#define QLC_LINE_RATIO_NUM 9
-
-#define SLC_BLOCK_CAPACITY_FACTOR 1
-#define QLC_BLOCK_CAPACITY_FACTOR QLC_PAGE_PATTERN
-
-#define QLC_PAGE_PATTERN 4
-#define QLC_PAGE_TYPE_L   0
-#define QLC_PAGE_TYPE_CL  1
-#define QLC_PAGE_TYPE_CU  2
-#define QLC_PAGE_TYPE_U   3
-
 #define RECENT_WRITE_GUARD_PCT 10U
+
+static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn);
 
 static bool recent_write_guard(struct conv_ftl *conv_ftl, uint64_t lpn);
 
@@ -1626,14 +1616,13 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	conv_ftl->qlc_resident_page_cnt = 0;
 	conv_ftl->qlc_migration_read_sum = 0;
 	conv_ftl->qlc_migration_page_cnt = 0;
+	conv_ftl->global_read_sum = 0;
+	conv_ftl->global_valid_pg_cnt = 0;
 	conv_ftl->qlc_zone_rr_cursor = 0;
 	spin_lock_init(&conv_ftl->qlc_zone_lock);
 
 	/* 直接初始化水位线（无后台线程） */
 	{
-		uint32_t slc_total_lines = total_slc_lines(conv_ftl);
-		uint32_t qlc_total_lines = total_qlc_lines(conv_ftl);
-		uint32_t total_lines = slc_total_lines + qlc_total_lines;
 		uint64_t slc_total_pages = total_slc_pages(conv_ftl);
 		uint64_t qlc_total_pages = total_qlc_pages(conv_ftl);
 		uint64_t tmp;
@@ -1641,21 +1630,11 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 		tmp = div_u64(slc_total_pages * 80, 100);
 		conv_ftl->slc_high_watermark = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
 
-		tmp = div_u64(slc_total_pages * 70, 100);
-		conv_ftl->slc_low_watermark = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
-
-		conv_ftl->gc_high_watermark = total_lines * 90 / 100;
-		conv_ftl->gc_low_watermark = total_lines * 80 / 100;
-
 		tmp = div_u64(slc_total_pages * 15, 100);
 		conv_ftl->slc_gc_free_thres_high = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
-		tmp = div_u64(slc_total_pages * 20, 100);
-		conv_ftl->slc_gc_free_thres_low = pages_to_lines(tmp, conv_ftl->slc_pgs_per_blk);
 
 		tmp = div_u64(qlc_total_pages * 15, 100);
 		conv_ftl->qlc_gc_free_thres_high = pages_to_lines(tmp, conv_ftl->qlc_pgs_per_blk);
-		tmp = div_u64(qlc_total_pages * 20, 100);
-		conv_ftl->qlc_gc_free_thres_low = pages_to_lines(tmp, conv_ftl->qlc_pgs_per_blk);
 	}
 
 	NVMEV_INFO("Init FTL Instance with %d channels(%ld pages)\n", conv_ftl->ssd->sp.nchs,
@@ -2546,9 +2525,13 @@ static bool is_slc_block(struct conv_ftl *conv_ftl, uint32_t blk_id)
 	/* 在多通道配置下，每个通道/LUN都有独立的block ID空间 (0-8191)
 	 * SLC占用每个plane的前slc_blks_per_pl个block
 	 */
-	if (blk_id >= BLKS_PER_PLN) {
-		NVMEV_ERROR("Block ID out of range: %u >= %u (max per plane)\n", 
-		           blk_id, BLKS_PER_PLN);
+	uint32_t max_blks = conv_ftl->slc_blks_per_pl + conv_ftl->qlc_blks_per_pl;
+	if (!max_blks && conv_ftl->ssd)
+		max_blks = conv_ftl->ssd->sp.blks_per_pl;
+
+	if (blk_id >= max_blks) {
+		NVMEV_ERROR("Block ID out of range: %u >= %u (max per plane)\n",
+			    blk_id, max_blks);
 		return false;
 	}
 	

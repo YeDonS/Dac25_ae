@@ -3,12 +3,8 @@
 #include <linux/kthread.h>
 #include <linux/ktime.h>
 #include <linux/highmem.h>
-#include <linux/moduleparam.h>
-#include <linux/hashtable.h>
-#include <linux/spinlock.h>
-#include <linux/mm.h>
-#include <linux/dma-mapping.h>
-#include <linux/iommu.h>
+#include <linux/printk.h>
+#include <linux/sched.h>
 #include <linux/sched/clock.h>
 
 #include "nvmev.h"
@@ -22,6 +18,20 @@ struct buffer;
 
 #undef PERF_DEBUG
 
+/* Throttle SQ processing to avoid long dispatcher stalls. */
+#ifndef NVMEV_PROC_IO_SQ_MAX_BATCH
+#define NVMEV_PROC_IO_SQ_MAX_BATCH 1024
+#endif
+#ifndef NVMEV_PROC_IO_SQ_BUDGET_NS
+#define NVMEV_PROC_IO_SQ_BUDGET_NS (5ULL * 1000 * 1000)
+#endif
+#ifndef NVMEV_PROC_IO_SQ_RESCHED_EVERY
+#define NVMEV_PROC_IO_SQ_RESCHED_EVERY 64
+#endif
+#ifndef NVMEV_PROC_IO_SQ_TIME_CHECK_EVERY
+#define NVMEV_PROC_IO_SQ_TIME_CHECK_EVERY 32
+#endif
+
 #define PRP_PFN(x) ((unsigned long)((x) >> PAGE_SHIFT))
 
 #define sq_entry(entry_id) sq->sq[SQ_ENTRY_TO_PAGE_NUM(entry_id)][SQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
@@ -29,27 +39,7 @@ struct buffer;
 
 extern bool io_using_dma;
 
-#define NVMEV_IO_LOG(string, args...) NVMEV_DEBUG("io: " string, ##args)
-#define NVMEV_IO_ERR(string, args...) NVMEV_ERROR("io: " string, ##args)
-
-static unsigned long long nvmev_io_slow_ns;
-module_param_named(io_slow_ns, nvmev_io_slow_ns, ullong, 0644);
-MODULE_PARM_DESC(io_slow_ns, "Log io cmd processing time if above threshold (ns), 0 disables");
-
-#define NVMEV_PRP_HASH_BITS 12
-struct nvmev_prp_inflight {
-	struct hlist_node hnode;
-	u64 pfn;
-	u32 count;
-	u16 last_cid;
-	u16 last_sqid;
-};
-
-static DEFINE_HASHTABLE(nvmev_prp_ht, NVMEV_PRP_HASH_BITS);
-static DEFINE_SPINLOCK(nvmev_prp_lock);
-static bool nvmev_prp_track = true;
-module_param_named(prp_track, nvmev_prp_track, bool, 0644);
-MODULE_PARM_DESC(prp_track, "Detect concurrent writes to same PRP page (default on)");
+static void __fill_cq_result(struct nvmev_proc_table *proc_entry);
 
 static inline unsigned int __get_io_worker(int sqid)
 {
@@ -65,196 +55,16 @@ static inline unsigned long long __get_wallclock(void)
 	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
 }
 
-static inline bool nvmev_dma_to_phys(dma_addr_t dma, phys_addr_t *phys_out)
+static unsigned int __do_perform_io(int sqid, int sq_entry)
 {
-#ifdef CONFIG_IOMMU_API
-	struct iommu_domain *domain;
-
-	if (nvmev_vdev && nvmev_vdev->pdev) {
-		domain = iommu_get_domain_for_dev(&nvmev_vdev->pdev->dev);
-		if (domain) {
-			phys_addr_t phys = iommu_iova_to_phys(domain, dma);
-			if (!phys && dma)
-				return false;
-			*phys_out = phys;
-			return true;
-		}
-	}
-#endif
-	*phys_out = (phys_addr_t)dma;
-	return true;
-}
-
-static inline bool nvmev_dma_to_phys_checked(dma_addr_t dma, phys_addr_t *phys_out)
-{
-	if (!nvmev_dma_to_phys(dma, phys_out))
-		return false;
-	if (!pfn_valid((*phys_out) >> PAGE_SHIFT))
-		return false;
-	return true;
-}
-
-static inline u64 *nvmev_map_prp_list(dma_addr_t dma, void **base_out)
-{
-	phys_addr_t phys;
-
-	if (!nvmev_dma_to_phys_checked(dma, &phys))
-		return NULL;
-
-	*base_out = kmap_atomic(pfn_to_page(phys >> PAGE_SHIFT));
-	return (u64 *)((char *)(*base_out) + (phys & PAGE_OFFSET_MASK));
-}
-
-static void nvmev_prp_mark_pfn(u64 pfn, u16 sqid, u16 cid)
-{
-	struct nvmev_prp_inflight *entry;
-	unsigned long flags;
-
-	spin_lock_irqsave(&nvmev_prp_lock, flags);
-	hash_for_each_possible(nvmev_prp_ht, entry, hnode, pfn) {
-		if (entry->pfn == pfn) {
-			entry->count++;
-			if (printk_ratelimit()) {
-				NVMEV_IO_ERR("prp overlap: pfn=0x%llx prev sqid=%u cid=%u new sqid=%u cid=%u count=%u\n",
-					     pfn, entry->last_sqid, entry->last_cid, sqid, cid,
-					     entry->count);
-			}
-			entry->last_sqid = sqid;
-			entry->last_cid = cid;
-			spin_unlock_irqrestore(&nvmev_prp_lock, flags);
-			return;
-		}
-	}
-	spin_unlock_irqrestore(&nvmev_prp_lock, flags);
-
-	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
-	if (!entry)
-		return;
-	entry->pfn = pfn;
-	entry->count = 1;
-	entry->last_sqid = sqid;
-	entry->last_cid = cid;
-
-	spin_lock_irqsave(&nvmev_prp_lock, flags);
-	hash_add(nvmev_prp_ht, &entry->hnode, pfn);
-	spin_unlock_irqrestore(&nvmev_prp_lock, flags);
-}
-
-static void nvmev_prp_unmark_pfn(u64 pfn)
-{
-	struct nvmev_prp_inflight *entry;
-	unsigned long flags;
-
-	spin_lock_irqsave(&nvmev_prp_lock, flags);
-	hash_for_each_possible(nvmev_prp_ht, entry, hnode, pfn) {
-		if (entry->pfn == pfn) {
-			if (entry->count > 1) {
-				entry->count--;
-				spin_unlock_irqrestore(&nvmev_prp_lock, flags);
-				return;
-			}
-			hash_del(&entry->hnode);
-			spin_unlock_irqrestore(&nvmev_prp_lock, flags);
-			kfree(entry);
-			return;
-		}
-	}
-	spin_unlock_irqrestore(&nvmev_prp_lock, flags);
-}
-
-static void nvmev_prp_track_cmd(struct nvmev_submission_queue *sq, int sqid, int sq_entry, bool add)
-{
-	struct nvme_command *cmd;
-	size_t remaining;
-	int prp_offs = 0;
-	int prp2_offs = 0;
-	u64 paddr;
-	u64 *paddr_list = NULL;
-	void *list_base = NULL;
-	phys_addr_t phys;
-	u16 cid;
-
-	if (!nvmev_prp_track || !sq || !sq->sq)
-		return;
-
-	cmd = &sq_entry(sq_entry);
-	if (cmd->rw.opcode != nvme_cmd_write && cmd->rw.opcode != nvme_cmd_zone_append)
-		return;
-
-	cid = cmd->common.command_id;
-	remaining = (cmd->rw.length + 1) << 9;
-
-	while (remaining) {
-		size_t io_size;
-		size_t mem_offs = 0;
-
-		prp_offs++;
-		if (prp_offs == 1) {
-			paddr = cmd->rw.prp1;
-		} else if (prp_offs == 2) {
-			paddr = cmd->rw.prp2;
-			if (remaining > PAGE_SIZE) {
-				paddr_list = nvmev_map_prp_list(paddr, &list_base);
-				if (!paddr_list) {
-					NVMEV_IO_ERR("prp list map fail: sqid=%d cid=%u prp2=0x%llx\n",
-						     sqid, cid, (unsigned long long)paddr);
-					break;
-				}
-				paddr = paddr_list[prp2_offs++];
-			}
-		} else {
-			paddr = paddr_list[prp2_offs++];
-		}
-
-		if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
-			NVMEV_IO_ERR("prp map fail: sqid=%d cid=%u prp=0x%llx\n",
-				     sqid, cid, (unsigned long long)paddr);
-			break;
-		}
-
-		if (add)
-			nvmev_prp_mark_pfn(phys >> PAGE_SHIFT, sqid, cid);
-		else
-			nvmev_prp_unmark_pfn(phys >> PAGE_SHIFT);
-
-		io_size = min_t(size_t, remaining, PAGE_SIZE);
-		if (phys & PAGE_OFFSET_MASK) {
-			mem_offs = phys & PAGE_OFFSET_MASK;
-			if (io_size + mem_offs > PAGE_SIZE)
-				io_size = PAGE_SIZE - mem_offs;
-		}
-
-		remaining -= io_size;
-	}
-
-	if (list_base != NULL)
-		kunmap_atomic(list_base);
-}
-
-static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid, int sq_entry)
-{
-	if (unlikely(!sq || !sq->sq)) {
-		NVMEV_IO_ERR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
-		return 0;
-	}
+	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	size_t offset;
 	size_t length, remaining;
 	int prp_offs = 0;
 	int prp2_offs = 0;
 	u64 paddr;
 	u64 *paddr_list = NULL;
-	void *list_base = NULL;
-	phys_addr_t phys;
 	size_t nsid = sq_entry(sq_entry).rw.nsid - 1; // 0-based
-
-	NVMEV_IO_LOG("perform_io: sqid=%d sq_entry=%d opcode=0x%x nsid=%zu slba=%llu len=%u prp1=0x%llx prp2=0x%llx\n",
-		     sqid, sq_entry, sq_entry(sq_entry).rw.opcode, nsid,
-		     (unsigned long long)sq_entry(sq_entry).rw.slba,
-		     sq_entry(sq_entry).rw.length + 1,
-		     (unsigned long long)sq_entry(sq_entry).rw.prp1,
-		     (unsigned long long)sq_entry(sq_entry).rw.prp2);
-
-	nvmev_prp_track_cmd(sq, sqid, sq_entry, true);
 
 	offset = sq_entry(sq_entry).rw.slba << 9;
 	length = (sq_entry(sq_entry).rw.length + 1) << 9;
@@ -271,29 +81,20 @@ static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid,
 		} else if (prp_offs == 2) {
 			paddr = sq_entry(sq_entry).rw.prp2;
 			if (remaining > PAGE_SIZE) {
-				paddr_list = nvmev_map_prp_list(paddr, &list_base);
-				if (!paddr_list) {
-					NVMEV_IO_ERR("prp list map fail: sqid=%d sq_entry=%d prp2=0x%llx\n",
-						     sqid, sq_entry, (unsigned long long)paddr);
-					break;
-				}
+				paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
+					     (paddr & PAGE_OFFSET_MASK);
 				paddr = paddr_list[prp2_offs++];
 			}
 		} else {
 			paddr = paddr_list[prp2_offs++];
 		}
 
-		if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
-			NVMEV_IO_ERR("prp map fail: sqid=%d sq_entry=%d prp=0x%llx\n",
-				     sqid, sq_entry, (unsigned long long)paddr);
-			break;
-		}
-		vaddr = kmap_atomic(pfn_to_page(phys >> PAGE_SHIFT));
+		vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
 
-		if (phys & PAGE_OFFSET_MASK) {
-			mem_offs = phys & PAGE_OFFSET_MASK;
+		if (paddr & PAGE_OFFSET_MASK) {
+			mem_offs = paddr & PAGE_OFFSET_MASK;
 			if (io_size + mem_offs > PAGE_SIZE)
 				io_size = PAGE_SIZE - mem_offs;
 		}
@@ -311,8 +112,8 @@ static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid,
 		offset += io_size;
 	}
 
-	if (list_base != NULL)
-		kunmap_atomic(list_base);
+	if (paddr_list != NULL)
+		kunmap_atomic(paddr_list);
 
 	return length;
 }
@@ -320,12 +121,9 @@ static unsigned int __do_perform_io(struct nvmev_submission_queue *sq, int sqid,
 static u64 paddr_list[513] = {
 	0,
 }; // Not using index 0 to make max index == num_prp
-static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq, int sqid, int sq_entry)
+static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 {
-	if (unlikely(!sq || !sq->sq)) {
-		NVMEV_IO_ERR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
-		return 0;
-	}
+	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	size_t offset;
 	size_t length, remaining;
 	int prp_offs = 0;
@@ -333,19 +131,8 @@ static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq,
 	int num_prps = 0;
 	u64 paddr;
 	u64 *tmp_paddr_list = NULL;
-	void *list_base = NULL;
-	phys_addr_t phys;
 	size_t io_size;
 	size_t mem_offs = 0;
-
-	NVMEV_IO_LOG("perform_io_dma: sqid=%d sq_entry=%d opcode=0x%x slba=%llu len=%u prp1=0x%llx prp2=0x%llx\n",
-		     sqid, sq_entry, sq_entry(sq_entry).rw.opcode,
-		     (unsigned long long)sq_entry(sq_entry).rw.slba,
-		     sq_entry(sq_entry).rw.length + 1,
-		     (unsigned long long)sq_entry(sq_entry).rw.prp1,
-		     (unsigned long long)sq_entry(sq_entry).rw.prp2);
-
-	nvmev_prp_track_cmd(sq, sqid, sq_entry, true);
 
 	offset = sq_entry(sq_entry).rw.slba << 9;
 	length = (sq_entry(sq_entry).rw.length + 1) << 9;
@@ -358,38 +145,16 @@ static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq,
 
 		prp_offs++;
 		if (prp_offs == 1) {
-			paddr = sq_entry(sq_entry).rw.prp1;
-			if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
-				NVMEV_IO_ERR("prp map fail: sqid=%d sq_entry=%d prp1=0x%llx\n",
-					     sqid, sq_entry, (unsigned long long)paddr);
-				break;
-			}
-			paddr_list[prp_offs] = phys;
+			paddr_list[prp_offs] = sq_entry(sq_entry).rw.prp1;
 		} else if (prp_offs == 2) {
-			paddr = sq_entry(sq_entry).rw.prp2;
+			paddr_list[prp_offs] = sq_entry(sq_entry).rw.prp2;
 			if (remaining > PAGE_SIZE) {
-				tmp_paddr_list = nvmev_map_prp_list(paddr, &list_base);
-				if (!tmp_paddr_list) {
-					NVMEV_IO_ERR("prp list map fail: sqid=%d sq_entry=%d prp2=0x%llx\n",
-						     sqid, sq_entry, (unsigned long long)paddr);
-					break;
-				}
-				paddr = tmp_paddr_list[prp2_offs++];
+				tmp_paddr_list = kmap_atomic_pfn(PRP_PFN(paddr_list[prp_offs])) +
+						 (paddr_list[prp_offs] & PAGE_OFFSET_MASK);
+				paddr_list[prp_offs] = tmp_paddr_list[prp2_offs++];
 			}
-			if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
-				NVMEV_IO_ERR("prp map fail: sqid=%d sq_entry=%d prp2=0x%llx\n",
-					     sqid, sq_entry, (unsigned long long)paddr);
-				break;
-			}
-			paddr_list[prp_offs] = phys;
 		} else {
-			paddr = tmp_paddr_list[prp2_offs++];
-			if (!nvmev_dma_to_phys_checked(paddr, &phys)) {
-				NVMEV_IO_ERR("prp map fail: sqid=%d sq_entry=%d prp=0x%llx\n",
-					     sqid, sq_entry, (unsigned long long)paddr);
-				break;
-			}
-			paddr_list[prp_offs] = phys;
+			paddr_list[prp_offs] = tmp_paddr_list[prp2_offs++];
 		}
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
@@ -404,8 +169,8 @@ static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq,
 	}
 	num_prps = prp_offs;
 
-	if (list_base != NULL)
-		kunmap_atomic(list_base);
+	if (tmp_paddr_list != NULL)
+		kunmap_atomic(tmp_paddr_list);
 
 	remaining = length;
 	prp_offs = 1;
@@ -451,19 +216,37 @@ static unsigned int __do_perform_io_using_dma(struct nvmev_submission_queue *sq,
 	return length;
 }
 
-static bool __enqueue_io_req(struct nvmev_submission_queue *sq, int sqid, int cqid, int sq_entry,
-			     unsigned long long nsecs_start, struct nvmev_result *ret)
+static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long long nsecs_start,
+			     struct nvmev_result *ret)
 {
+	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
+
 	unsigned int proc_turn = __get_io_worker(sqid);
 	struct nvmev_proc_info *pi = &nvmev_vdev->proc_info[proc_turn];
 	unsigned int entry = pi->free_seq;
 
 	if (pi->proc_table[entry].next >= NR_MAX_PARALLEL_IO) {
 		WARN_ON_ONCE("IO queue is almost full");
+		if (printk_ratelimit())
+			NVMEV_ERROR("proc queue full sqid=%d entry=%u next=%u free_seq=%u\n",
+				    sqid, entry, pi->proc_table[entry].next, pi->free_seq);
+		{
+			struct nvmev_proc_table fallback = {
+				.sqid = sqid,
+				.cqid = cqid,
+				.sq_entry = sq_entry,
+				.command_id = sq_entry(sq_entry).common.command_id,
+				.status = ret->status,
+			};
+
+			if (io_using_dma)
+				__do_perform_io_using_dma(sqid, sq_entry);
+			else
+				__do_perform_io(sqid, sq_entry);
+			__fill_cq_result(&fallback);
+		}
 		pi->free_seq = entry;
-		NVMEV_IO_ERR("enqueue: queue full sqid=%d cqid=%d entry=%u\n",
-			     sqid, cqid, entry);
-		return false;
+		return;
 	}
 
 	if (++proc_turn == nvmev_vdev->config.nr_io_cpu)
@@ -472,18 +255,15 @@ static bool __enqueue_io_req(struct nvmev_submission_queue *sq, int sqid, int cq
 	pi->free_seq = pi->proc_table[entry].next;
 	BUG_ON(pi->free_seq >= NR_MAX_PARALLEL_IO);
 
-	NVMEV_IO_LOG("enqueue: worker=%s entry=%u opcode=0x%x sqid=%d cqid=%d sq_entry=%d cid=%u nsecs_start=%llu target_delta=%llu status=0x%x\n",
-		     pi->thread_name, entry, sq_entry(sq_entry).rw.opcode, sqid, cqid, sq_entry,
-		     sq_entry(sq_entry).common.command_id,
-		     nsecs_start, ret->nsecs_target - nsecs_start, ret->status);
+	NVMEV_DEBUG("%s/%u[%d], sq %d cq %d, entry %d %llu + %llu\n", pi->thread_name, entry,
+		    sq_entry(sq_entry).rw.opcode, sqid, cqid, sq_entry, nsecs_start,
+		    ret->nsecs_target - nsecs_start);
 
 	/////////////////////////////////
-	atomic_inc(&sq->refcnt);
 	pi->proc_table[entry].sqid = sqid;
 	pi->proc_table[entry].cqid = cqid;
 	pi->proc_table[entry].sq_entry = sq_entry;
 	pi->proc_table[entry].command_id = sq_entry(sq_entry).common.command_id;
-	pi->proc_table[entry].sq_ptr = sq;
 	pi->proc_table[entry].nsecs_start = nsecs_start;
 	pi->proc_table[entry].nsecs_enqueue = local_clock();
 	pi->proc_table[entry].nsecs_target = ret->nsecs_target;
@@ -494,6 +274,12 @@ static bool __enqueue_io_req(struct nvmev_submission_queue *sq, int sqid, int cq
 	pi->proc_table[entry].next = -1;
 
 	pi->proc_table[entry].writeback_cmd = false;
+	pi->proc_table[entry].writeback_lun_guard = false;
+	pi->proc_table[entry].writeback_ssd = NULL;
+	pi->proc_table[entry].writeback_ch = 0;
+	pi->proc_table[entry].writeback_lun = 0;
+	pi->proc_table[entry].completion_pcie_guard = ret->completion_pcie_guard;
+	pi->proc_table[entry].completion_ssd = ret->completion_ssd;
 	mb(); /* IO worker shall see the updated pi at once */
 
 	// (END) -> (START) order, nsecs target ascending order
@@ -529,11 +315,15 @@ static bool __enqueue_io_req(struct nvmev_submission_queue *sq, int sqid, int cq
 			pi->proc_table[curr].next = entry;
 		}
 	}
-	return true;
 }
 
-void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
-			      struct buffer *write_buffer, unsigned int buffs_to_release)
+static void __enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
+				       struct buffer *write_buffer,
+				       unsigned int buffs_to_release,
+				       void *writeback_ssd,
+				       unsigned int writeback_ch,
+				       unsigned int writeback_lun,
+				       bool writeback_lun_guard)
 {
 	unsigned int proc_turn = __get_io_worker(sqid);
 	struct nvmev_proc_info *pi = &nvmev_vdev->proc_info[proc_turn];
@@ -541,6 +331,17 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 
 	if (pi->proc_table[entry].next >= NR_MAX_PARALLEL_IO) {
 		WARN_ON_ONCE("IO queue is almost full");
+#if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS))
+		if (write_buffer && buffs_to_release) {
+			if (printk_ratelimit())
+				NVMEV_ERROR("writeback proc queue full; releasing %u bytes immediately to avoid write-buffer leak\n",
+					    buffs_to_release);
+			buffer_release(write_buffer, buffs_to_release);
+		}
+#else
+		(void)write_buffer;
+		(void)buffs_to_release;
+#endif
 		pi->free_seq = entry;
 		return;
 	}
@@ -565,9 +366,14 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 	pi->proc_table[entry].next = -1;
 
 	pi->proc_table[entry].writeback_cmd = true;
-	pi->proc_table[entry].sq_ptr = NULL;
 	pi->proc_table[entry].buffs_to_release = buffs_to_release;
 	pi->proc_table[entry].write_buffer = (void *)write_buffer;
+	pi->proc_table[entry].writeback_lun_guard = writeback_lun_guard;
+	pi->proc_table[entry].writeback_ssd = writeback_ssd;
+	pi->proc_table[entry].writeback_ch = writeback_ch;
+	pi->proc_table[entry].writeback_lun = writeback_lun;
+	pi->proc_table[entry].completion_pcie_guard = false;
+	pi->proc_table[entry].completion_ssd = NULL;
 	mb(); /* IO worker shall see the updated pi at once */
 
 	// (END) -> (START) order, nsecs target ascending order
@@ -602,6 +408,80 @@ void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
 			pi->proc_table[pi->proc_table[entry].next].prev = entry;
 			pi->proc_table[curr].next = entry;
 		}
+	}
+}
+
+void enqueue_writeback_io_req(int sqid, unsigned long long nsecs_target,
+			      struct buffer *write_buffer, unsigned int buffs_to_release)
+{
+	__enqueue_writeback_io_req(sqid, nsecs_target, write_buffer,
+				   buffs_to_release, NULL, 0, 0, false);
+}
+
+void enqueue_writeback_io_req_lun_guarded(int sqid,
+					  unsigned long long nsecs_target,
+					  struct buffer *write_buffer,
+					  unsigned int buffs_to_release,
+					  void *writeback_ssd,
+					  unsigned int writeback_ch,
+					  unsigned int writeback_lun)
+{
+	__enqueue_writeback_io_req(sqid, nsecs_target, write_buffer,
+				   buffs_to_release, writeback_ssd,
+				   writeback_ch, writeback_lun, true);
+}
+
+static void __reschedule_proc_entry(struct nvmev_proc_info *pi,
+				    unsigned int entry,
+				    unsigned long long nsecs_target)
+{
+	struct nvmev_proc_table *pe = &pi->proc_table[entry];
+	unsigned int prev = pe->prev;
+	unsigned int next = pe->next;
+	unsigned int curr;
+
+	if (prev != -1)
+		pi->proc_table[prev].next = next;
+	else
+		pi->io_seq = next;
+
+	if (next != -1)
+		pi->proc_table[next].prev = prev;
+	else
+		pi->io_seq_end = prev;
+
+	pe->prev = -1;
+	pe->next = -1;
+	pe->nsecs_target = nsecs_target;
+
+	if (pi->io_seq == -1) {
+		pi->io_seq = entry;
+		pi->io_seq_end = entry;
+		return;
+	}
+
+	curr = pi->io_seq_end;
+	while (curr != -1) {
+		if (pi->proc_table[curr].nsecs_target <= pi->proc_io_nsecs)
+			break;
+		if (pi->proc_table[curr].nsecs_target <= nsecs_target)
+			break;
+		curr = pi->proc_table[curr].prev;
+	}
+
+	if (curr == -1) {
+		pi->proc_table[pi->io_seq].prev = entry;
+		pe->next = pi->io_seq;
+		pi->io_seq = entry;
+	} else if (pi->proc_table[curr].next == -1) {
+		pe->prev = curr;
+		pi->io_seq_end = entry;
+		pi->proc_table[curr].next = entry;
+	} else {
+		pe->prev = curr;
+		pe->next = pi->proc_table[curr].next;
+		pi->proc_table[pe->next].prev = entry;
+		pi->proc_table[curr].next = entry;
 	}
 }
 
@@ -659,21 +539,27 @@ static void __reclaim_completed_reqs(void)
 static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
-	if (unlikely(!sq || !nvmev_sq_try_get(sq))) {
-		NVMEV_IO_ERR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
-		return false;
-	}
-	if (unlikely(!sq->sq)) {
-		NVMEV_IO_ERR("%s: sq[%d] is NULL (queue deleted?)\n", __func__, sqid);
-		nvmev_sq_put(sq);
-		return false;
-	}
 	unsigned long long nsecs_start = __get_wallclock();
 	struct nvme_command *cmd = &sq_entry(sq_entry);
+	uint32_t raw_nsid = cmd->common.nsid;
 #if (BASE_SSD == KV_PROTOTYPE)
 	uint32_t nsid = 0; // Some KVSSD programs give 0 as nsid for KV IO
+	if (unlikely(raw_nsid > nvmev_vdev->nr_ns)) {
+		if (printk_ratelimit())
+			NVMEV_ERROR("bad nsid=%u sqid=%d sqe=%d opcode=0x%x slba=%llu len=%u\n",
+				    raw_nsid, sqid, sq_entry, cmd->rw.opcode,
+				    (unsigned long long)cmd->rw.slba, cmd->rw.length + 1);
+		return false;
+	}
 #else
-	uint32_t nsid = cmd->common.nsid - 1;
+	uint32_t nsid = raw_nsid - 1;
+	if (unlikely(raw_nsid == 0 || raw_nsid > nvmev_vdev->nr_ns)) {
+		if (printk_ratelimit())
+			NVMEV_ERROR("bad nsid=%u sqid=%d sqe=%d opcode=0x%x slba=%llu len=%u\n",
+				    raw_nsid, sqid, sq_entry, cmd->rw.opcode,
+				    (unsigned long long)cmd->rw.slba, cmd->rw.length + 1);
+		return false;
+	}
 #endif
 	struct nvmev_ns *ns = &nvmev_vdev->ns[nsid];
 
@@ -686,14 +572,6 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 		.nsecs_target = nsecs_start,
 		.status = NVME_SC_SUCCESS,
 	};
-	unsigned long long proc_start;
-	unsigned long long proc_dur;
-
-	NVMEV_IO_LOG("io req: sqid=%d cqid=%d sq_entry=%d opcode=0x%x cid=%u nsid=%u slba=%llu len=%u prp1=0x%llx prp2=0x%llx\n",
-		     sqid, sq->cqid, sq_entry, cmd->common.opcode,
-		     cmd->common.command_id, cmd->common.nsid,
-		     (unsigned long long)cmd->rw.slba, cmd->rw.length + 1,
-		     (unsigned long long)cmd->rw.prp1, (unsigned long long)cmd->rw.prp2);
 
 #ifdef PERF_DEBUG
 	unsigned long long prev_clock = local_clock();
@@ -706,32 +584,26 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	static unsigned long long counter = 0;
 #endif
 
-	proc_start = local_clock();
-	if (!ns->proc_io_cmd(ns, &req, &ret))
+	if (!ns->proc_io_cmd(ns, &req, &ret)) {
+		if (printk_ratelimit())
+			NVMEV_ERROR("proc_io_cmd failed sqid=%d sqe=%d opcode=0x%x slba=%llu len=%u\n",
+				    sqid, sq_entry, cmd->rw.opcode,
+				    (unsigned long long)cmd->rw.slba, cmd->rw.length + 1);
 		return false;
-	proc_dur = local_clock() - proc_start;
-	if (nvmev_io_slow_ns && proc_dur > nvmev_io_slow_ns) {
-		NVMEV_IO_LOG("io slow: sqid=%d sq_entry=%d cid=%u opcode=0x%x nsid=%u dur_ns=%llu\n",
-			     sqid, sq_entry, cmd->common.command_id, cmd->common.opcode,
-			     cmd->common.nsid, proc_dur);
+	}
+	if (unlikely(ret.status != NVME_SC_SUCCESS)) {
+		if (printk_ratelimit())
+			NVMEV_ERROR("io error status=0x%x sqid=%d sqe=%d opcode=0x%x slba=%llu len=%u\n",
+				    ret.status, sqid, sq_entry, cmd->rw.opcode,
+				    (unsigned long long)cmd->rw.slba, cmd->rw.length + 1);
 	}
 	*io_size = (sq_entry(sq_entry).rw.length + 1) << 9;
-
-	NVMEV_IO_LOG("io proc done: sqid=%d sq_entry=%d cid=%u status=0x%x nsecs_target=%llu io_size=%zu\n",
-		     sqid, sq_entry, cmd->common.command_id, ret.status,
-		     ret.nsecs_target, *io_size);
 
 #ifdef PERF_DEBUG
 	prev_clock2 = local_clock();
 #endif
 
-	if (!__enqueue_io_req(sq, sqid, sq->cqid, sq_entry, nsecs_start, &ret)) {
-		NVMEV_IO_ERR("enqueue failed: sqid=%d sq_entry=%d cid=%u\n",
-			     sqid, sq_entry, cmd->common.command_id);
-		nvmev_sq_put(sq);
-		return false;
-	}
-	nvmev_sq_put(sq);
+	__enqueue_io_req(sqid, sq->cqid, sq_entry, nsecs_start, &ret);
 
 #ifdef PERF_DEBUG
 	prev_clock3 = local_clock();
@@ -761,29 +633,39 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 
 int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 {
+	uint64_t start_detect = ktime_get_ns();
+#if NVMEV_PROC_IO_SQ_BUDGET_NS > 0
+	uint64_t deadline = 0;
+#endif
+	int processed_count = 0;
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	int num_proc = new_db - old_db;
+	int max_proc = 0;
 	int seq;
 	int sq_entry = old_db;
 	int latest_db;
 
-	if (unlikely(!sq || !nvmev_sq_try_get(sq)))
+	if (unlikely(!sq))
 		return old_db;
 	if (unlikely(num_proc < 0))
 		num_proc += sq->queue_size;
 
-	NVMEV_IO_LOG("io sq: sqid=%d old_db=%d new_db=%d num_proc=%d qsize=%d\n",
-		     sqid, old_db, new_db, num_proc, sq->queue_size);
+	max_proc = num_proc;
+	if (NVMEV_PROC_IO_SQ_MAX_BATCH > 0 && max_proc > NVMEV_PROC_IO_SQ_MAX_BATCH)
+		max_proc = NVMEV_PROC_IO_SQ_MAX_BATCH;
 
-	for (seq = 0; seq < num_proc; seq++) {
+#if NVMEV_PROC_IO_SQ_BUDGET_NS > 0
+	deadline = start_detect + NVMEV_PROC_IO_SQ_BUDGET_NS;
+#endif
+
+	for (seq = 0; seq < max_proc; seq++) {
 		size_t io_size;
-		if (unlikely(READ_ONCE(sq->deleting))) {
-			NVMEV_IO_ERR("io sq: sqid=%d deleting set, stop at sq_entry=%d\n",
-				     sqid, sq_entry);
+		if (!__nvmev_proc_io(sqid, sq_entry, &io_size)) {
+			if (printk_ratelimit())
+				NVMEV_ERROR("proc_io failed sqid=%d sqe=%d new_db=%d old_db=%d\n",
+					    sqid, sq_entry, new_db, old_db);
 			break;
 		}
-		if (!__nvmev_proc_io(sqid, sq_entry, &io_size))
-			break;
 
 		if (++sq_entry == sq->queue_size) {
 			sq_entry = 0;
@@ -791,13 +673,32 @@ int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 		sq->stat.nr_dispatched++;
 		sq->stat.nr_in_flight++;
 		sq->stat.total_io += io_size;
+		processed_count++;
 
+#if NVMEV_PROC_IO_SQ_RESCHED_EVERY > 0
+		if ((processed_count % NVMEV_PROC_IO_SQ_RESCHED_EVERY) == 0)
+			cond_resched();
+#endif
+
+#if NVMEV_PROC_IO_SQ_BUDGET_NS > 0 && NVMEV_PROC_IO_SQ_TIME_CHECK_EVERY > 0
+		if (deadline &&
+		    (processed_count % NVMEV_PROC_IO_SQ_TIME_CHECK_EVERY) == 0 &&
+		    ktime_get_ns() >= deadline)
+			break;
+#endif
 	}
 	sq->stat.nr_dispatch++;
 	sq->stat.max_nr_in_flight = max_t(int, sq->stat.max_nr_in_flight, sq->stat.nr_in_flight);
 
-	latest_db = (old_db + seq) % sq->queue_size;
-	nvmev_sq_put(sq);
+	latest_db = (old_db + processed_count) % sq->queue_size;
+
+	uint64_t end_detect = ktime_get_ns();
+	if (end_detect - start_detect > 1000000000) { // > 1s
+		NVMEV_ERROR("SLOW_PATH: nvmev_proc_io_sq took %llu ns! Processed %d reqs. Avg: %llu ns/req\n",
+			    end_detect - start_detect, processed_count,
+			    processed_count ? (end_detect - start_detect)/processed_count : 0);
+	}
+
 	return latest_db;
 }
 
@@ -820,21 +721,13 @@ void nvmev_proc_io_cq(int cqid, int new_db, int old_db)
 	if (unlikely(new_db < 0 || new_db >= cq->queue_size))
 		new_db = old_db;
 
-	NVMEV_IO_LOG("io cq: cqid=%d old_db=%d new_db=%d qsize=%d cq_tail=%d\n",
-		     cqid, old_db, new_db, cq->queue_size, cq->cq_tail);
-
 	i = old_db;
 	while (i != new_db) {
 		uint16_t sqid = cq_entry(i).sq_id;
-		NVMEV_IO_LOG("io cq reap: cqid=%d idx=%d sqid=%u cid=%u status=0x%x\n",
-			     cqid, i, sqid,
-			     cq_entry(i).command_id,
-			     cq_entry(i).status >> 1);
 		if (sqid <= NR_MAX_IO_QUEUE) {
 			struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
-			if (likely(sq && nvmev_sq_try_get(sq))) {
+			if (likely(sq)) {
 				sq->stat.nr_in_flight--;
-				nvmev_sq_put(sq);
 			} else {
 				NVMEV_ERROR("[%s] sq null (cqid=%d idx=%d sqid=%u)\n",
 					     __FUNCTION__, cqid, i, sqid);
@@ -862,20 +755,7 @@ static void __fill_cq_result(struct nvmev_proc_table *proc_entry)
 	unsigned int result1 = proc_entry->result1;
 
 	struct nvmev_completion_queue *cq = nvmev_vdev->cqes[cqid];
-	struct nvmev_submission_queue *sq = proc_entry->sq_ptr;
-	int cq_head;
-
-	if (unlikely(!cq)) {
-		NVMEV_IO_ERR("%s: cq[%d] is NULL (queue deleted?)\n", __func__, cqid);
-		return;
-	}
-	cq_head = cq->cq_head;
-
-	NVMEV_IO_LOG("fill cqe: cqid=%d cq_head=%d phase=%d sqid=%d sq_entry=%d cid=%u status=0x%x result0=0x%x result1=0x%x\n",
-		     cqid, cq_head, cq->phase, sqid, sq_entry, command_id, status, result0, result1);
-
-	if (sq && sq->sq)
-		nvmev_prp_track_cmd(sq, sqid, sq_entry, false);
+	int cq_head = cq->cq_head;
 
 	spin_lock(&cq->entry_lock);
 	cq_entry(cq_head).command_id = command_id;
@@ -891,7 +771,6 @@ static void __fill_cq_result(struct nvmev_proc_table *proc_entry)
 	}
 
 	cq->cq_head = cq_head;
-	wmb();
 	cq->interrupt_ready = true;
 	spin_unlock(&cq->entry_lock);
 }
@@ -900,6 +779,7 @@ static int nvmev_kthread_io(void *data)
 {
 	struct nvmev_proc_info *pi = (struct nvmev_proc_info *)data;
 	struct nvmev_ns *ns;
+	uint64_t start_loop, end_loop;
 
 #ifdef PERF_DEBUG
 	static unsigned long long intr_clock[NR_MAX_IO_QUEUE + 1];
@@ -912,6 +792,7 @@ static int nvmev_kthread_io(void *data)
 		   cpu_to_node(smp_processor_id()));
 
 	while (!kthread_should_stop()) {
+		start_loop = ktime_get_ns();
 		unsigned long long curr_nsecs_wall = __get_wallclock();
 		unsigned long long curr_nsecs_local = local_clock();
 		long long delta = curr_nsecs_wall - curr_nsecs_local;
@@ -937,20 +818,20 @@ static int nvmev_kthread_io(void *data)
 				if (pe->writeback_cmd) {
 					;
 				} else if (io_using_dma) {
-					__do_perform_io_using_dma(pe->sq_ptr, pe->sqid, pe->sq_entry);
+					__do_perform_io_using_dma(pe->sqid, pe->sq_entry);
 				} else {
 #if (BASE_SSD == KV_PROTOTYPE)
-						struct nvmev_submission_queue *sq = pe->sq_ptr;
-						ns = &nvmev_vdev->ns[0];
-						if (sq && sq->sq &&
-						    ns->identify_io_cmd(ns, sq_entry(pe->sq_entry))) {
-							pe->result0 = ns->perform_io_cmd(
-								ns, &sq_entry(pe->sq_entry), &(pe->status));
-						} else {
-						__do_perform_io(pe->sq_ptr, pe->sqid, pe->sq_entry);
+					struct nvmev_submission_queue *sq =
+						nvmev_vdev->sqes[pe->sqid];
+					ns = &nvmev_vdev->ns[0];
+					if (ns->identify_io_cmd(ns, sq_entry(pe->sq_entry))) {
+						pe->result0 = ns->perform_io_cmd(
+							ns, &sq_entry(pe->sq_entry), &(pe->status));
+					} else {
+						__do_perform_io(pe->sqid, pe->sq_entry);
 					}
 #endif
-					__do_perform_io(pe->sq_ptr, pe->sqid, pe->sq_entry);
+					__do_perform_io(pe->sqid, pe->sq_entry);
 				}
 
 #ifdef PERF_DEBUG
@@ -959,28 +840,56 @@ static int nvmev_kthread_io(void *data)
 #endif
 				pe->is_copied = true;
 
-				NVMEV_IO_LOG("io copied: worker=%s entry=%u sqid=%d cqid=%d sq_entry=%d cid=%u\n",
-					     pi->thread_name, curr, pe->sqid, pe->cqid,
-					     pe->sq_entry, pe->command_id);
+				NVMEV_DEBUG("%s: copied %u, %d %d %d\n", pi->thread_name, curr,
+					    pe->sqid, pe->cqid, pe->sq_entry);
 			}
 
-			if (pe->nsecs_target <= curr_nsecs) {
-				if (pe->writeback_cmd) {
+				if (pe->nsecs_target <= curr_nsecs) {
+					if (pe->writeback_cmd) {
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS))
-					buffer_release((struct buffer *)pe->write_buffer,
-						       pe->buffs_to_release);
-#endif
-				} else {
-					__fill_cq_result(pe);
-					if (pe->sq_ptr) {
-						nvmev_sq_put(pe->sq_ptr);
-						pe->sq_ptr = NULL;
-					}
-				}
+						if (pe->writeback_lun_guard && pe->writeback_ssd) {
+							uint64_t lun_tail =
+								ssd_lun_next_idle_time((struct ssd *)pe->writeback_ssd,
+										       pe->writeback_ch,
+										       pe->writeback_lun);
 
-				NVMEV_IO_LOG("io completed: worker=%s entry=%u sqid=%d cqid=%d sq_entry=%d cid=%u status=0x%x\n",
-					     pi->thread_name, curr, pe->sqid, pe->cqid,
-					     pe->sq_entry, pe->command_id, pe->status);
+							if (lun_tail > curr_nsecs) {
+								unsigned int next = pe->next;
+								unsigned long long new_target =
+									max_t(unsigned long long,
+									      pe->nsecs_target,
+									      lun_tail);
+
+								__reschedule_proc_entry(pi, curr, new_target);
+								curr = next;
+								continue;
+							}
+						}
+							buffer_release((struct buffer *)pe->write_buffer,
+								       pe->buffs_to_release);
+#endif
+						} else {
+							if (pe->completion_pcie_guard && pe->completion_ssd) {
+								uint64_t pcie_tail =
+									ssd_pcie_next_idle_time((struct ssd *)pe->completion_ssd);
+
+								if (pcie_tail > curr_nsecs) {
+									unsigned int next = pe->next;
+									unsigned long long new_target =
+										max_t(unsigned long long,
+										      pe->nsecs_target,
+										      pcie_tail);
+
+									__reschedule_proc_entry(pi, curr, new_target);
+									curr = next;
+									continue;
+								}
+							}
+							__fill_cq_result(pe);
+						}
+
+				NVMEV_DEBUG("%s: completed %u, %d %d %d\n", pi->thread_name, curr,
+					    pe->sqid, pe->cqid, pe->sq_entry);
 
 #ifdef PERF_DEBUG
 				pe->nsecs_cq_filled = local_clock() + delta;
@@ -1014,9 +923,6 @@ static int nvmev_kthread_io(void *data)
 					prev_clock = local_clock();
 #endif
 					cq->interrupt_ready = false;
-					NVMEV_IO_LOG("irq: cqid=%d vector=%d cq_head=%d phase=%d\n",
-						     qidx, cq->irq_vector, cq->cq_head, cq->phase);
-					wmb();
 					nvmev_signal_irq(cq->irq_vector);
 
 #ifdef PERF_DEBUG
@@ -1035,6 +941,10 @@ static int nvmev_kthread_io(void *data)
 			}
 		}
 		cond_resched();
+		end_loop = ktime_get_ns();
+		if (end_loop - start_loop > 2000000000) { // > 2s
+			NVMEV_ERROR("SLOW_PATH: nvmev_kthread_io loop took %llu ns!\n", end_loop - start_loop);
+		}
 	}
 
 	return 0;
