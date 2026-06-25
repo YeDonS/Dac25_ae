@@ -6,7 +6,10 @@
  * variant repromotion and QLC rebalance are disabled, so the remaining
  * read-priority debt is SLC maintenance worker opportunities. Requeue skipped
  * opportunities immediately, force progress after eight consecutive yields,
- * and repay up to eight maintenance passes.
+ * and repay one atomic maintenance unit at a time. This keeps the norp ablation
+ * aligned with the audited non-preemptive submit-gate model: forced progress
+ * prevents starvation, but it must not hide priority bugs by issuing a large
+ * catch-up burst after a read window.
  */
 #define NVMEV_ENABLE_QLC_HOTCOLD 1
 #define NVMEV_ENABLE_QLC_REBALANCE 0
@@ -24,7 +27,10 @@
 #define NVMEV_LATENCY3_FORCE_AFTER_YIELDS 8U
 #endif
 #ifndef NVMEV_LATENCY3_FORCE_CATCHUP_MAX
-#define NVMEV_LATENCY3_FORCE_CATCHUP_MAX 8U
+#define NVMEV_LATENCY3_FORCE_CATCHUP_MAX 1U
+#endif
+#ifndef NVMEV_LATENCY3_FORCE_UNITS_PER_RUN
+#define NVMEV_LATENCY3_FORCE_UNITS_PER_RUN 1U
 #endif
 #ifndef NVMEV_LATENCY3_READ_WINDOW_GATE_TOKENS
 #define NVMEV_LATENCY3_READ_WINDOW_GATE_TOKENS 8U

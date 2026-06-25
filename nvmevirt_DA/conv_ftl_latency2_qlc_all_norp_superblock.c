@@ -6,9 +6,12 @@
  * variant repromotion and QLC rebalance are disabled, so the remaining
  * read-priority debt is SLC maintenance worker opportunities. Requeue skipped
  * opportunities immediately, force progress after eight consecutive yields,
- * and repay up to eight maintenance passes. V2 may keep multiple closed SBs in
- * MIG/GC_RDY/GC phase without an explicit in-flight SB cap so this run measures
- * the stronger per-die dispatcher.
+ * and repay one maintenance pass at a time. This keeps the norp ablation aligned
+ * with the audited non-preemptive submit-gate model: forced progress prevents
+ * starvation, but it must not hide priority bugs by issuing a large catch-up
+ * burst after a read window. V2 may keep multiple closed SBs in MIG/GC_RDY/GC
+ * phase without an explicit in-flight SB cap so this run measures the stronger
+ * per-die dispatcher.
  */
 #define NVMEV_ENABLE_QLC_HOTCOLD 1
 #define NVMEV_ENABLE_QLC_REBALANCE 0
@@ -26,7 +29,7 @@
 #define NVMEV_LATENCY2_FORCE_AFTER_YIELDS 8U
 #endif
 #ifndef NVMEV_LATENCY2_FORCE_CATCHUP_MAX
-#define NVMEV_LATENCY2_FORCE_CATCHUP_MAX 8U
+#define NVMEV_LATENCY2_FORCE_CATCHUP_MAX 1U
 #endif
 #ifndef NVMEV_LATENCY2_READ_WINDOW_GATE_TOKENS
 #define NVMEV_LATENCY2_READ_WINDOW_GATE_TOKENS 8U

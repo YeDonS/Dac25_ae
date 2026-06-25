@@ -693,9 +693,9 @@ def assert_qlc_all_norp_wrappers_show_latency_policy() -> None:
             f"latency{latency} qlc_all_norp wrapper must explicitly set the "
             "read-priority force threshold"
         )
-        assert f"#define NVMEV_LATENCY{latency}_FORCE_CATCHUP_MAX 8U" in source, (
+        assert f"#define NVMEV_LATENCY{latency}_FORCE_CATCHUP_MAX 1U" in source, (
             f"latency{latency} qlc_all_norp wrapper must explicitly cap "
-            "forced catch-up to eight skipped maintenance opportunities"
+            "forced catch-up to one maintenance opportunity"
         )
         assert f"#define NVMEV_LATENCY{latency}_READ_WINDOW_GATE_TOKENS 8U" in source, (
             f"latency{latency} qlc_all_norp wrapper must explicitly keep recent "
@@ -704,6 +704,10 @@ def assert_qlc_all_norp_wrappers_show_latency_policy() -> None:
     assert "#define NVMEV_LATENCY2_MAX_INFLIGHT_MAINT_SBS 0U" in lat2, (
         "latency2 qlc_all_norp wrapper must explicitly allow multiple V2 "
         "in-flight maintenance SBs for this stronger scheduler run"
+    )
+    assert "#define NVMEV_LATENCY3_FORCE_UNITS_PER_RUN 1U" in lat3, (
+        "latency3 qlc_all_norp wrapper must align forced progress with the "
+        "one-unit audited maintenance model"
     )
 
 
