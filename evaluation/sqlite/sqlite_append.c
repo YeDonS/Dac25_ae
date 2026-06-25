@@ -18,10 +18,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#endif
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -50,10 +57,14 @@
 #define HEAT_FILENAME_FMT        "sqlite_heat_%s.csv"
 #define ROW_STATS_FILENAME_FMT   "sqlite_row_%s.csv"
 #define TABLE_STATS_FILENAME_FMT "sqlite_table_%s.csv"
+#define TABLE_TIER_FILENAME_FMT  "sqlite_table_tier_%s.csv"
 #define DEFAULT_TAG              "default"
 #define MAX_TABLE_NAME           64
 #define NORMAL_MEAN_SENTINEL     (-1.0)
 #define NORMAL_STDDEV_SENTINEL   (-1.0)
+#define DEFAULT_FTL_HOST_PAGE_BYTES (4096ULL)
+#define DEFAULT_PAGE_TIER_PATH      "/sys/kernel/debug/nvmev/ftl0/page_tier"
+#define DEFAULT_ACCESS_COUNT_PATH   "/sys/kernel/debug/nvmev/ftl0/access_count"
 #define STR1_LEN                 65536
 #define STR2_LEN                 65536
 #define STR3_LEN                 65536
@@ -64,6 +75,12 @@
 #define DEFAULT_INTERLEAVE_ROWS  1000U
 #define DEFAULT_READS_PER_EVENT  1000U
 #define DEFAULT_COLD_SCAN_ITERS  3U
+#define PAGE_TIER_ZONE_COUNT     4U
+#define DEFAULT_LATENCY_PROFILE_PATH "/proc/nvmev/latency_profile"
+#define DEFAULT_INIT_PROFILE        "init-fast"
+#define DEFAULT_COLD_PROFILE        "normal"
+#define DEFAULT_READ_REPROMOTION_CTRL_PATH \
+	"/proc/nvmev/read_repromotion"
 
 typedef unsigned int UINT32;
 
@@ -93,6 +110,20 @@ static const struct option long_opts[] = {
 	{"scan-iters", required_argument, NULL, 1011},
 	{"interleave-rows", required_argument, NULL, 1012},
 	{"interleave-reads", required_argument, NULL, 1013},
+	{"strict-cold-per-select", no_argument, NULL, 1014},
+	{"page-tier-path", required_argument, NULL, 1015},
+	{"ftl-host-page-bytes", required_argument, NULL, 1016},
+	{"access-count-path", required_argument, NULL, 1017},
+	{"direct-io", no_argument, NULL, 1018},
+	{"fast-init-profile", no_argument, NULL, 1019},
+	{"latency-profile-path", required_argument, NULL, 1020},
+	{"init-latency-profile", required_argument, NULL, 1021},
+	{"cold-latency-profile", required_argument, NULL, 1022},
+	{"latency-profile-settle-ms", required_argument, NULL, 1023},
+	{"cold-full-read-mode", required_argument, NULL, 1024},
+	{"cold-full-read-iters", required_argument, NULL, 1025},
+	{"cold-disable-read-repromotion", no_argument, NULL, 1026},
+	{"read-repromotion-ctrl-path", required_argument, NULL, 1027},
 	{"help", no_argument, NULL, 'h'},
 	{NULL, 0, NULL, 0},
 };
@@ -115,6 +146,11 @@ enum trace_mode {
 	TRACE_MODE_NONE = 0,
 	TRACE_MODE_RECORD,
 	TRACE_MODE_REPLAY,
+};
+
+enum cold_full_read_mode {
+	COLD_FULL_READ_PER_TABLE = 0,
+	COLD_FULL_READ_FULL_SCAN,
 };
 
 struct workload_options {
@@ -145,6 +181,20 @@ struct workload_options {
 	bool reads_explicit;
 	unsigned int interleave_rows;
 	unsigned int init_reads_per_event;
+	bool strict_cold_per_select;
+	const char *page_tier_path;
+	unsigned long long ftl_host_page_bytes;
+	const char *access_count_path;
+	bool direct_io;
+	bool fast_init_profile;
+	const char *latency_profile_path;
+	const char *init_latency_profile;
+	const char *cold_latency_profile;
+	unsigned int latency_profile_settle_ms;
+	enum cold_full_read_mode cold_full_read_mode;
+	unsigned int cold_full_read_iters;
+	bool cold_disable_read_repromotion;
+	const char *read_repromotion_ctrl_path;
 };
 
 struct zipf_sampler {
@@ -186,6 +236,24 @@ struct table_state {
 	sqlite3_stmt *select_stmt;
 };
 
+struct page_tier_entry {
+	unsigned long long lpn;
+	unsigned int in_slc;
+	unsigned int qlc_zone;
+	unsigned int qlc_zone_known;
+};
+
+struct file_extent {
+	unsigned long long logical;
+	unsigned long long physical;
+	unsigned long long length;
+};
+
+struct access_count_entry {
+	unsigned long long lpn;
+	unsigned long long count;
+};
+
 static void join_path(char *dst, size_t len, const char *dir, const char *leaf);
 static const char *effective_tag(const struct workload_options *opts);
 static int build_trace_with_heat(enum distribution_type dist, unsigned int reads,
@@ -200,7 +268,9 @@ static void build_trace_path_for_dist(char *buf, size_t len,
 static void build_heat_path(char *buf, size_t len, const struct workload_options *opts);
 static void build_row_stats_path(char *buf, size_t len, const struct workload_options *opts);
 static void build_table_stats_path(char *buf, size_t len, const struct workload_options *opts);
+static void build_table_tier_path(char *buf, size_t len, const struct workload_options *opts);
 static void drop_page_cache(void);
+static void drop_dataset_cache(sqlite3 *db, const char *db_path);
 
 
 static int save_heat_csv(const char *path, const unsigned int *heat, unsigned int total_rows)
@@ -234,9 +304,10 @@ static double monotonic_sec(void)
 
 static void drop_page_cache(void)
 {
-	int rc = system("sync");
-	(void)rc;
-	FILE *fp = fopen("/proc/sys/vm/drop_caches", "w");
+	FILE *fp;
+
+	sync();
+	fp = fopen("/proc/sys/vm/drop_caches", "w");
 	if (!fp) {
 		perror("drop_caches");
 		return;
@@ -245,6 +316,259 @@ static void drop_page_cache(void)
 		perror("drop_caches write");
 	fclose(fp);
 }
+
+static void disable_file_readahead(const char *path)
+{
+#if defined(__linux__)
+	int fd;
+
+	if (!path || !*path)
+		return;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return;
+	posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+	close(fd);
+#else
+	(void)path;
+#endif
+}
+
+/* ================================================================
+ * O_DIRECT VFS wrapper — bypasses OS page cache so every read()
+ * reaches the block device (NVMeVirt FTL), making access_count
+ * accurately reflect the application-level Zipf heat pattern.
+ * ================================================================ */
+
+#define DIO_VFS_NAME "direct_io"
+#define DIO_ALIGN    4096
+
+struct dio_file {
+	sqlite3_file base;
+	sqlite3_file *pBase;
+	sqlite3_io_methods io;
+	int direct_fd;
+	void *aligned_buf;
+	size_t aligned_buf_sz;
+};
+
+static sqlite3_vfs g_dio_vfs;
+static unsigned int g_dio_maindb_open_ok;
+static unsigned int g_dio_maindb_open_fail;
+
+/* ---------- io_methods delegates ---------- */
+
+static int dio_close(sqlite3_file *f)
+{
+	struct dio_file *p = (struct dio_file *)f;
+	int rc;
+
+	if (p->direct_fd >= 0) {
+		close(p->direct_fd);
+		p->direct_fd = -1;
+	}
+	free(p->aligned_buf);
+	p->aligned_buf = NULL;
+	p->aligned_buf_sz = 0;
+	rc = p->pBase->pMethods->xClose(p->pBase);
+	p->base.pMethods = NULL;
+	return rc;
+}
+
+static int dio_read(sqlite3_file *f, void *zBuf, int iAmt, sqlite3_int64 iOfst)
+{
+	struct dio_file *p = (struct dio_file *)f;
+	void *abuf = NULL;
+	bool need_free = false;
+	ssize_t n;
+	sqlite3_int64 aligned_start;
+	size_t aligned_len, skip, avail;
+
+	if (p->direct_fd < 0 || iAmt <= 0)
+		goto fallback;
+
+	aligned_start = iOfst & ~((sqlite3_int64)(DIO_ALIGN - 1));
+	skip = (size_t)(iOfst - aligned_start);
+	aligned_len = ((skip + (size_t)iAmt + DIO_ALIGN - 1) / DIO_ALIGN) * DIO_ALIGN;
+
+	if (p->aligned_buf && aligned_len <= p->aligned_buf_sz) {
+		abuf = p->aligned_buf;
+	} else {
+		if (posix_memalign(&abuf, DIO_ALIGN, aligned_len) != 0)
+			goto fallback;
+		need_free = true;
+	}
+
+	n = pread(p->direct_fd, abuf, aligned_len, (off_t)aligned_start);
+	if (n < 0) {
+		if (need_free) free(abuf);
+		goto fallback;
+	}
+	if ((size_t)n < skip + (size_t)iAmt) {
+		avail = (size_t)n > skip ? (size_t)n - skip : 0;
+		if (avail > 0)
+			memcpy(zBuf, (char *)abuf + skip, avail);
+		memset((char *)zBuf + avail, 0, (size_t)iAmt - avail);
+		if (need_free) free(abuf);
+		return SQLITE_IOERR_SHORT_READ;
+	}
+
+	memcpy(zBuf, (char *)abuf + skip, (size_t)iAmt);
+	if (need_free) free(abuf);
+	return SQLITE_OK;
+
+fallback:
+	return p->pBase->pMethods->xRead(p->pBase, zBuf, iAmt, iOfst);
+}
+
+static int dio_write(sqlite3_file *f, const void *b, int n, sqlite3_int64 o)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xWrite(p->pBase, b, n, o); }
+
+static int dio_truncate(sqlite3_file *f, sqlite3_int64 s)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xTruncate(p->pBase, s); }
+
+static int dio_sync(sqlite3_file *f, int fl)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xSync(p->pBase, fl); }
+
+static int dio_file_size(sqlite3_file *f, sqlite3_int64 *ps)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xFileSize(p->pBase, ps); }
+
+static int dio_lock(sqlite3_file *f, int lv)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xLock(p->pBase, lv); }
+
+static int dio_unlock(sqlite3_file *f, int lv)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xUnlock(p->pBase, lv); }
+
+static int dio_check_reserved(sqlite3_file *f, int *pr)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xCheckReservedLock(p->pBase, pr); }
+
+static int dio_file_control(sqlite3_file *f, int op, void *pa)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xFileControl(p->pBase, op, pa); }
+
+static int dio_sector_size(sqlite3_file *f)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xSectorSize(p->pBase); }
+
+static int dio_device_chars(sqlite3_file *f)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xDeviceCharacteristics(p->pBase); }
+
+static int dio_shm_map(sqlite3_file *f, int pg, int sz, int ext, void volatile **pp)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xShmMap(p->pBase, pg, sz, ext, pp); }
+
+static int dio_shm_lock(sqlite3_file *f, int off, int n, int fl)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xShmLock(p->pBase, off, n, fl); }
+
+static void dio_shm_barrier(sqlite3_file *f)
+{ struct dio_file *p = (struct dio_file *)f; p->pBase->pMethods->xShmBarrier(p->pBase); }
+
+static int dio_shm_unmap(sqlite3_file *f, int del)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xShmUnmap(p->pBase, del); }
+
+static int dio_fetch(sqlite3_file *f, sqlite3_int64 ofst, int amt, void **pp)
+{
+	struct dio_file *p = (struct dio_file *)f;
+	if (p->direct_fd >= 0) {
+		*pp = NULL;
+		return SQLITE_OK;
+	}
+	return p->pBase->pMethods->xFetch(p->pBase, ofst, amt, pp);
+}
+
+static int dio_unfetch(sqlite3_file *f, sqlite3_int64 ofst, void *ptr)
+{ struct dio_file *p = (struct dio_file *)f; return p->pBase->pMethods->xUnfetch(p->pBase, ofst, ptr); }
+
+/* ---------- VFS xOpen ---------- */
+
+static int dio_open(sqlite3_vfs *pVfs, const char *zName, sqlite3_file *pFile,
+		    int flags, int *pOutFlags)
+{
+	struct dio_file *p = (struct dio_file *)pFile;
+	sqlite3_vfs *pOrig = (sqlite3_vfs *)pVfs->pAppData;
+	const sqlite3_io_methods *base_m;
+	int rc;
+
+	memset(p, 0, sizeof(*p));
+	p->pBase = (sqlite3_file *)((char *)p + sizeof(struct dio_file));
+	p->direct_fd = -1;
+
+	rc = pOrig->xOpen(pOrig, zName, p->pBase, flags, pOutFlags);
+	if (rc != SQLITE_OK) {
+		p->base.pMethods = NULL;
+		return rc;
+	}
+
+	base_m = p->pBase->pMethods;
+	if (!base_m) {
+		p->base.pMethods = NULL;
+		return SQLITE_OK;
+	}
+
+	memset(&p->io, 0, sizeof(p->io));
+	p->io.iVersion    = base_m->iVersion;
+	p->io.xClose      = dio_close;
+	p->io.xRead       = dio_read;
+	p->io.xWrite      = dio_write;
+	p->io.xTruncate   = dio_truncate;
+	p->io.xSync       = dio_sync;
+	p->io.xFileSize   = dio_file_size;
+	p->io.xLock       = dio_lock;
+	p->io.xUnlock     = dio_unlock;
+	p->io.xCheckReservedLock = dio_check_reserved;
+	p->io.xFileControl       = dio_file_control;
+	p->io.xSectorSize        = dio_sector_size;
+	p->io.xDeviceCharacteristics = dio_device_chars;
+	if (base_m->iVersion >= 2) {
+		p->io.xShmMap     = dio_shm_map;
+		p->io.xShmLock    = dio_shm_lock;
+		p->io.xShmBarrier = dio_shm_barrier;
+		p->io.xShmUnmap   = dio_shm_unmap;
+	}
+	if (base_m->iVersion >= 3) {
+		p->io.xFetch   = dio_fetch;
+		p->io.xUnfetch = dio_unfetch;
+	}
+	p->base.pMethods = &p->io;
+
+	if (zName && (flags & SQLITE_OPEN_MAIN_DB)) {
+		p->direct_fd = open(zName, O_RDONLY | O_DIRECT | O_CLOEXEC);
+		if (p->direct_fd < 0) {
+			g_dio_maindb_open_fail++;
+			fprintf(stderr, "[dio] O_DIRECT open failed for %s: %s (reads fall back to buffered)\n",
+				zName, strerror(errno));
+		} else {
+			g_dio_maindb_open_ok++;
+			fprintf(stderr, "[dio] O_DIRECT enabled for %s (fd=%d)\n", zName, p->direct_fd);
+			p->aligned_buf_sz = DIO_ALIGN;
+			if (posix_memalign(&p->aligned_buf, DIO_ALIGN, p->aligned_buf_sz) != 0) {
+				p->aligned_buf = NULL;
+				p->aligned_buf_sz = 0;
+			}
+		}
+	}
+
+	return SQLITE_OK;
+}
+
+static int register_dio_vfs(void)
+{
+	sqlite3_vfs *pBase = sqlite3_vfs_find(NULL);
+
+	if (!pBase) {
+		fprintf(stderr, "[dio] no default VFS found\n");
+		return -1;
+	}
+
+	memcpy(&g_dio_vfs, pBase, sizeof(sqlite3_vfs));
+	g_dio_vfs.zName     = DIO_VFS_NAME;
+	g_dio_vfs.szOsFile  = (int)(sizeof(struct dio_file) + pBase->szOsFile);
+	g_dio_vfs.xOpen     = dio_open;
+	g_dio_vfs.pAppData  = pBase;
+	g_dio_maindb_open_ok = 0;
+	g_dio_maindb_open_fail = 0;
+
+	return sqlite3_vfs_register(&g_dio_vfs, 0);
+}
+
+/* ================================================================ */
 
 static unsigned int next_rand(unsigned int *state)
 {
@@ -263,6 +587,18 @@ static void usage(const char *prog)
 		"  %s --mode init [--table-count N] [--rows-per-table N]\n"
 		"                 [--target-bytes SZ] [--reads N]\n"
 		"                 [--interleave-rows N] [--interleave-reads N]\n"
+		"                 [--strict-cold-per-select] [--direct-io]\n"
+		"                 [--page-tier-path PATH] [--ftl-host-page-bytes N]\n"
+		"                 [--access-count-path PATH]\n"
+		"                 [--fast-init-profile]\n"
+		"                 [--latency-profile-path PATH]\n"
+		"                 [--init-latency-profile NAME]\n"
+		"                 [--cold-latency-profile NAME]\n"
+		"                 [--latency-profile-settle-ms N]\n"
+		"                 [--cold-full-read-mode per-table|full-scan]\n"
+		"                 [--cold-full-read-iters N]\n"
+		"                 [--cold-disable-read-repromotion]\n"
+		"                 [--read-repromotion-ctrl-path PATH]\n"
 		"                 [--zipf-seed S] [--exp-seed S] [--normal-seed S]\n"
 		"                 [--tag NAME] [--trace-dir DIR]\n"
 		"  %s --mode read --distribution zipf|exp|uniform|normal|sequential\n"
@@ -272,6 +608,111 @@ static void usage(const char *prog)
 		"                 [--human-log] [--suppress-report]\n"
 		"  %s --mode scan [--scan-iters N]\n",
 		prog, prog, prog);
+}
+
+static int write_string_file(const char *path, const char *value)
+{
+	FILE *fp;
+
+	if (!path || !*path || !value || !*value)
+		return -EINVAL;
+
+	fp = fopen(path, "w");
+	if (!fp)
+		return -errno;
+
+	if (fprintf(fp, "%s\n", value) < 0) {
+		int saved = errno ? -errno : -EIO;
+		fclose(fp);
+		return saved;
+	}
+
+	if (fclose(fp) != 0)
+		return -errno;
+
+	return 0;
+}
+
+static const char *cold_full_read_mode_name(enum cold_full_read_mode mode)
+{
+	switch (mode) {
+	case COLD_FULL_READ_FULL_SCAN:
+		return "full-scan";
+	case COLD_FULL_READ_PER_TABLE:
+	default:
+		return "per-table";
+	}
+}
+
+static enum cold_full_read_mode parse_cold_full_read_mode(const char *value)
+{
+	if (!value || !*value)
+		return COLD_FULL_READ_PER_TABLE;
+	if (strcasecmp(value, "full-scan") == 0 || strcasecmp(value, "full_scan") == 0)
+		return COLD_FULL_READ_FULL_SCAN;
+	if (strcasecmp(value, "per-table") == 0 || strcasecmp(value, "per_table") == 0)
+		return COLD_FULL_READ_PER_TABLE;
+
+	fprintf(stderr, "Unknown cold full read mode '%s'\n", value);
+	exit(EXIT_FAILURE);
+}
+
+static int set_read_repromotion_state(const struct workload_options *opts,
+				      bool enabled, const char *phase)
+{
+	const char *value = enabled ? "1" : "0";
+	int rc;
+
+	if (!opts || !opts->read_repromotion_ctrl_path || !opts->read_repromotion_ctrl_path[0])
+		return -EINVAL;
+
+	rc = write_string_file(opts->read_repromotion_ctrl_path, value);
+	if (rc != 0) {
+		fprintf(stderr,
+			"[sqlite_init] failed to set read repromotion '%s' for %s via %s (%d)\n",
+			enabled ? "on" : "off",
+			phase ? phase : "phase",
+			opts->read_repromotion_ctrl_path,
+			rc);
+		return rc;
+	}
+
+	printf("[sqlite_init] read_repromotion=%s phase=%s path=%s\n",
+	       enabled ? "on" : "off",
+	       phase ? phase : "phase",
+	       opts->read_repromotion_ctrl_path);
+	return 0;
+}
+
+static int maybe_switch_latency_profile(const struct workload_options *opts,
+					const char *profile,
+					const char *phase)
+{
+	int rc;
+
+	if (!opts || !opts->fast_init_profile)
+		return 0;
+	if (!profile || !*profile)
+		return 0;
+
+	rc = write_string_file(opts->latency_profile_path, profile);
+	if (rc != 0) {
+		fprintf(stderr,
+			"[sqlite_init] failed to set latency profile '%s' for %s via %s (%d)\n",
+			profile, phase ? phase : "phase",
+			opts->latency_profile_path ? opts->latency_profile_path : "(null)",
+			rc);
+		return rc;
+	}
+
+	printf("[sqlite_init] latency_profile=%s phase=%s path=%s\n",
+	       profile, phase ? phase : "phase",
+	       opts->latency_profile_path ? opts->latency_profile_path : "(null)");
+
+	if (opts->latency_profile_settle_ms > 0)
+		usleep((useconds_t)opts->latency_profile_settle_ms * 1000U);
+
+	return 0;
 }
 
 static void copy_text(char *dst, size_t len, const char *src)
@@ -301,6 +742,47 @@ static int cmp_double(const void *a, const void *b)
 	if (da < db)
 		return -1;
 	if (da > db)
+		return 1;
+	return 0;
+}
+
+static int cmp_u64_asc(const void *a, const void *b)
+{
+	unsigned long long ua = *(const unsigned long long *)a;
+	unsigned long long ub = *(const unsigned long long *)b;
+
+	if (ua < ub)
+		return -1;
+	if (ua > ub)
+		return 1;
+	return 0;
+}
+
+static bool page_tier_zone_is_fast(unsigned int zone)
+{
+	return zone == 0U || zone == 1U;
+}
+
+static int cmp_tier_entry_lpn(const void *a, const void *b)
+{
+	const struct page_tier_entry *ea = a;
+	const struct page_tier_entry *eb = b;
+
+	if (ea->lpn < eb->lpn)
+		return -1;
+	if (ea->lpn > eb->lpn)
+		return 1;
+	return 0;
+}
+
+static int cmp_access_entry_lpn(const void *a, const void *b)
+{
+	const struct access_count_entry *ea = a;
+	const struct access_count_entry *eb = b;
+
+	if (ea->lpn < eb->lpn)
+		return -1;
+	if (ea->lpn > eb->lpn)
 		return 1;
 	return 0;
 }
@@ -1079,13 +1561,15 @@ static int run_read_event(unsigned int event_id,
 			  const struct dataset_layout *layout,
 			  struct table_state *tables,
 			  unsigned int table_count,
+			  sqlite3 *db,
+			  const char *db_path,
+			  bool strict_cold_per_select,
 			  const unsigned int *read_plan,
 			  double *table_latency,
 			  unsigned long long *table_read_ops,
 			  double *elapsed_out)
 {
 	double start = monotonic_sec();
-	sqlite3 *db = NULL;
 
 	(void)layout;
 
@@ -1107,6 +1591,8 @@ static int run_read_event(unsigned int event_id,
 		for (unsigned int iter = 0; iter < reads; ++iter) {
 			int rc;
 			double iter_start, iter_end;
+			if (strict_cold_per_select)
+				drop_dataset_cache(db, db_path);
 
 			sqlite3_reset(stmt);
 			sqlite3_clear_bindings(stmt);
@@ -1209,7 +1695,9 @@ static int write_row_stats_csv(const char *path, const struct dataset_layout *la
 }
 
 static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layout,
-				 unsigned int iterations)
+				 enum cold_full_read_mode mode,
+				 unsigned int iterations, const unsigned int *read_plan,
+				 double *per_table_out)
 {
 	unsigned int runs = iterations ? iterations : 1U;
 	double total = 0.0;
@@ -1217,15 +1705,30 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 	if (!db || !layout)
 		return 0.0;
 
+	if (per_table_out) {
+		for (unsigned int t = 0; t < layout->table_count; ++t)
+			per_table_out[t] = 0.0;
+	}
+
 	for (unsigned int iter = 0; iter < runs; ++iter) {
-		drop_page_cache();
 		double start = monotonic_sec();
+
+		if (mode == COLD_FULL_READ_FULL_SCAN)
+			drop_page_cache();
 
 		for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
 			char sql[256];
 			char table_name[MAX_TABLE_NAME];
 			sqlite3_stmt *stmt = NULL;
 			int rc;
+			double tbl_start, tbl_end;
+			unsigned int reads = read_plan ? read_plan[tbl] : 1U;
+
+			if (reads == 0)
+				continue;
+
+			if (mode == COLD_FULL_READ_PER_TABLE)
+				drop_page_cache();
 
 			build_table_name(table_name, sizeof(table_name), tbl);
 			snprintf(sql, sizeof(sql),
@@ -1237,15 +1740,37 @@ static double run_cold_full_read(sqlite3 *db, const struct dataset_layout *layou
 				return 0.0;
 			}
 
-			while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
-				;
-			if (rc != SQLITE_DONE)
-				fprintf(stderr, "Cold read failed for %s: %s\n", table_name,
-					sqlite3_errmsg(db));
+			tbl_start = monotonic_sec();
+			for (unsigned int r = 0; r < reads; ++r) {
+				sqlite3_reset(stmt);
+				while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
+					;
+				if (rc != SQLITE_DONE) {
+					fprintf(stderr, "Cold read failed for %s: %s\n",
+						table_name, sqlite3_errmsg(db));
+					break;
+				}
+			}
+			tbl_end = monotonic_sec();
+
 			sqlite3_finalize(stmt);
+
+			if (per_table_out)
+				per_table_out[tbl] += tbl_end - tbl_start;
 		}
 
-		total += monotonic_sec() - start;
+		{
+			double elapsed = monotonic_sec() - start;
+
+			total += elapsed;
+			printf("[sqlite_cold_full_read] mode=%s iter=%u/%u time=%.6fs\n",
+			       cold_full_read_mode_name(mode), iter + 1, runs, elapsed);
+		}
+	}
+
+	if (per_table_out && runs > 1) {
+		for (unsigned int t = 0; t < layout->table_count; ++t)
+			per_table_out[t] /= runs;
 	}
 
 	return runs ? total / runs : 0.0;
@@ -1277,6 +1802,672 @@ static int write_table_latency_csv(const char *path, const struct dataset_layout
 	}
 
 	fclose(fp);
+	return 0;
+}
+
+static int load_page_tier_entries(const char *path, struct page_tier_entry **entries_out,
+				  size_t *count_out)
+{
+	FILE *fp;
+	struct page_tier_entry *entries = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+	char line[128];
+
+	if (entries_out)
+		*entries_out = NULL;
+	if (count_out)
+		*count_out = 0;
+	if (!path || !*path)
+		return 0;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		unsigned long long lpn;
+		unsigned int in_slc;
+		int qlc_zone = -1;
+		int scanned;
+		struct page_tier_entry *tmp;
+
+		/* Backward compatible: accept both "lpn in_slc" and "lpn in_slc qlc_zone". */
+		scanned = sscanf(line, "%llu %u %d", &lpn, &in_slc, &qlc_zone);
+		if (scanned < 2)
+			continue;
+
+		if (count == cap) {
+			size_t new_cap = cap ? cap * 2 : 4096;
+			tmp = realloc(entries, new_cap * sizeof(*entries));
+			if (!tmp) {
+				free(entries);
+				fclose(fp);
+				return -ENOMEM;
+			}
+			entries = tmp;
+			cap = new_cap;
+		}
+
+		entries[count].lpn = lpn;
+		entries[count].in_slc = in_slc ? 1U : 0U;
+		if (scanned >= 3 && qlc_zone >= 0 && qlc_zone < (int)PAGE_TIER_ZONE_COUNT) {
+			entries[count].qlc_zone = (unsigned int)qlc_zone;
+			entries[count].qlc_zone_known = 1U;
+		} else {
+			entries[count].qlc_zone = 0U;
+			entries[count].qlc_zone_known = 0U;
+		}
+		count++;
+	}
+
+	fclose(fp);
+	if (!entries || count == 0) {
+		free(entries);
+		return 0;
+	}
+
+	qsort(entries, count, sizeof(*entries), cmp_tier_entry_lpn);
+	size_t unique = 1;
+	for (size_t i = 1; i < count; ++i) {
+		if (entries[i].lpn != entries[unique - 1].lpn)
+			entries[unique++] = entries[i];
+		else
+			entries[unique - 1] = entries[i];
+	}
+
+	if (entries_out)
+		*entries_out = entries;
+	else
+		free(entries);
+	if (count_out)
+		*count_out = unique;
+	return 0;
+}
+
+static bool lookup_page_tier(const struct page_tier_entry *entries, size_t count,
+			     unsigned long long lpn, unsigned int *in_slc_out,
+			     unsigned int *qlc_zone_out, bool *qlc_zone_known_out)
+{
+	size_t lo = 0;
+	size_t hi = count;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (entries[mid].lpn < lpn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	if (lo >= count || entries[lo].lpn != lpn)
+		return false;
+	if (in_slc_out)
+		*in_slc_out = entries[lo].in_slc;
+	if (qlc_zone_out)
+		*qlc_zone_out = entries[lo].qlc_zone;
+	if (qlc_zone_known_out)
+		*qlc_zone_known_out = entries[lo].qlc_zone_known ? true : false;
+	return true;
+}
+
+static int load_access_count_entries(const char *path, struct access_count_entry **entries_out,
+				     size_t *count_out)
+{
+	FILE *fp;
+	struct access_count_entry *entries = NULL;
+	size_t count = 0;
+	size_t cap = 0;
+	char line[128];
+
+	if (entries_out)
+		*entries_out = NULL;
+	if (count_out)
+		*count_out = 0;
+	if (!path || !*path)
+		return 0;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		unsigned long long lpn;
+		unsigned long long acc;
+		struct access_count_entry *tmp;
+
+		if (sscanf(line, "%llu %llu", &lpn, &acc) != 2)
+			continue;
+
+		if (count == cap) {
+			size_t new_cap = cap ? cap * 2 : 4096;
+			tmp = realloc(entries, new_cap * sizeof(*entries));
+			if (!tmp) {
+				free(entries);
+				fclose(fp);
+				return -ENOMEM;
+			}
+			entries = tmp;
+			cap = new_cap;
+		}
+
+		entries[count].lpn = lpn;
+		entries[count].count = acc;
+		count++;
+	}
+
+	fclose(fp);
+	if (!entries || count == 0) {
+		free(entries);
+		return 0;
+	}
+
+	qsort(entries, count, sizeof(*entries), cmp_access_entry_lpn);
+	size_t unique = 1;
+	for (size_t i = 1; i < count; ++i) {
+		if (entries[i].lpn != entries[unique - 1].lpn)
+			entries[unique++] = entries[i];
+		else
+			entries[unique - 1] = entries[i];
+	}
+
+	if (entries_out)
+		*entries_out = entries;
+	else
+		free(entries);
+	if (count_out)
+		*count_out = unique;
+	return 0;
+}
+
+static bool lookup_access_count(const struct access_count_entry *entries, size_t count,
+				unsigned long long lpn, unsigned long long *acc_out)
+{
+	size_t lo = 0;
+	size_t hi = count;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (entries[mid].lpn < lpn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	if (lo >= count || entries[lo].lpn != lpn)
+		return false;
+	if (acc_out)
+		*acc_out = entries[lo].count;
+	return true;
+}
+
+static unsigned long long percentile_u64_from_sorted(const unsigned long long *vals, size_t count,
+						      double p)
+{
+	if (!vals || count == 0)
+		return 0ULL;
+	if (p <= 0.0)
+		return vals[0];
+	if (p >= 1.0)
+		return vals[count - 1];
+
+	size_t idx = (size_t)floor((double)(count - 1) * p);
+	if (idx >= count)
+		idx = count - 1;
+	return vals[idx];
+}
+
+static int append_lpn_value(unsigned long long lpn, unsigned long long **lpn_vec,
+			    size_t *lpn_count, size_t *lpn_cap)
+{
+	if (!lpn_vec || !lpn_count || !lpn_cap)
+		return -EINVAL;
+
+	if (*lpn_count == *lpn_cap) {
+		size_t new_cap = *lpn_cap ? (*lpn_cap * 2) : 4096;
+		unsigned long long *tmp = realloc(*lpn_vec, new_cap * sizeof(**lpn_vec));
+
+		if (!tmp)
+			return -ENOMEM;
+
+		*lpn_vec = tmp;
+		*lpn_cap = new_cap;
+	}
+
+	(*lpn_vec)[(*lpn_count)++] = lpn;
+	return 0;
+}
+
+static int append_lpn_range(unsigned long long lpn_start, unsigned long long lpn_end,
+			    unsigned long long **lpn_vec, size_t *lpn_count, size_t *lpn_cap)
+{
+	for (unsigned long long lpn = lpn_start; lpn <= lpn_end; ++lpn) {
+		int rc = append_lpn_value(lpn, lpn_vec, lpn_count, lpn_cap);
+		if (rc != 0)
+			return rc;
+	}
+
+	return 0;
+}
+
+static unsigned long long detect_partition_offset_bytes(const char *path)
+{
+#if defined(__linux__)
+	struct stat st;
+	char sysfs[128];
+	FILE *fp;
+	unsigned long long start_sector = 0;
+
+	if (!path || stat(path, &st) != 0)
+		return 0;
+
+	snprintf(sysfs, sizeof(sysfs), "/sys/dev/block/%u:%u/start",
+		 major(st.st_dev), minor(st.st_dev));
+
+	fp = fopen(sysfs, "r");
+	if (!fp)
+		return 0;
+
+	if (fscanf(fp, "%llu", &start_sector) != 1)
+		start_sector = 0;
+	fclose(fp);
+	return start_sector * 512ULL;
+#else
+	(void)path;
+	return 0;
+#endif
+}
+
+static int load_file_extents(const char *path, struct file_extent **extents_out,
+			     size_t *extent_count_out)
+{
+#if defined(__linux__) && defined(FS_IOC_FIEMAP)
+	int fd = -1;
+	struct fiemap *fm = NULL;
+	struct file_extent *extents = NULL;
+	size_t extent_count = 0;
+	uint32_t cap = 4096;
+	int rc = -1;
+
+	if (extents_out)
+		*extents_out = NULL;
+	if (extent_count_out)
+		*extent_count_out = 0;
+	if (!path || !*path)
+		return -EINVAL;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+
+	while (1) {
+		size_t bytes = sizeof(*fm) + (size_t)cap * sizeof(struct fiemap_extent);
+		bool done = false;
+
+		free(fm);
+		fm = calloc(1, bytes);
+		if (!fm) {
+			rc = -ENOMEM;
+			goto out;
+		}
+
+		fm->fm_start = 0;
+		fm->fm_length = ~0ULL;
+		fm->fm_flags = FIEMAP_FLAG_SYNC;
+		fm->fm_extent_count = cap;
+
+		if (ioctl(fd, FS_IOC_FIEMAP, fm) < 0) {
+			rc = -errno;
+			goto out;
+		}
+
+		extent_count = fm->fm_mapped_extents;
+		if (extent_count == 0) {
+			rc = 0;
+			goto out;
+		}
+
+		if (extent_count < cap)
+			done = true;
+		if (!done && (fm->fm_extents[extent_count - 1].fe_flags & FIEMAP_EXTENT_LAST))
+			done = true;
+
+		if (done)
+			break;
+
+		if (cap >= (1U << 20)) {
+			rc = -E2BIG;
+			goto out;
+		}
+		cap *= 2;
+	}
+
+	extents = calloc(extent_count, sizeof(*extents));
+	if (!extents) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	for (size_t i = 0; i < extent_count; ++i) {
+		extents[i].logical = fm->fm_extents[i].fe_logical;
+		extents[i].physical = fm->fm_extents[i].fe_physical;
+		extents[i].length = fm->fm_extents[i].fe_length;
+	}
+
+	if (extents_out)
+		*extents_out = extents;
+	else
+		free(extents);
+	extents = NULL;
+	if (extent_count_out)
+		*extent_count_out = extent_count;
+	rc = 0;
+
+out:
+	free(extents);
+	free(fm);
+	if (fd >= 0)
+		close(fd);
+	return rc;
+#else
+	(void)path;
+	if (extents_out)
+		*extents_out = NULL;
+	if (extent_count_out)
+		*extent_count_out = 0;
+	return -ENOTSUP;
+#endif
+}
+
+static int append_file_range_lpns(const struct file_extent *extents, size_t extent_count,
+				  size_t *cursor_io, unsigned long long file_byte_start,
+				  unsigned long long file_byte_end,
+				  unsigned long long host_page_bytes,
+				  unsigned long long **lpn_vec,
+				  size_t *lpn_count, size_t *lpn_cap)
+{
+	unsigned long long pos = file_byte_start;
+	size_t cursor;
+
+	if (!extents || extent_count == 0 || !cursor_io || !host_page_bytes)
+		return -EINVAL;
+
+	cursor = *cursor_io;
+	while (pos <= file_byte_end) {
+		while (cursor < extent_count) {
+			unsigned long long ex_end = extents[cursor].logical + extents[cursor].length;
+			if (ex_end <= pos)
+				cursor++;
+			else
+				break;
+		}
+
+		if (cursor >= extent_count)
+			return -ENOENT;
+		if (extents[cursor].logical > pos)
+			return -ENOENT;
+
+		unsigned long long local_off = pos - extents[cursor].logical;
+		unsigned long long ex_remain = extents[cursor].length - local_off;
+		unsigned long long need = file_byte_end - pos + 1ULL;
+		unsigned long long take = ex_remain < need ? ex_remain : need;
+		unsigned long long phys_start = extents[cursor].physical + local_off;
+		unsigned long long phys_end = phys_start + take - 1ULL;
+		unsigned long long lpn_start = phys_start / host_page_bytes;
+		unsigned long long lpn_end = phys_end / host_page_bytes;
+		int rc = append_lpn_range(lpn_start, lpn_end, lpn_vec, lpn_count, lpn_cap);
+		if (rc != 0)
+			return rc;
+
+		pos += take;
+	}
+
+	*cursor_io = cursor;
+	return 0;
+}
+
+static int write_table_tier_csv(const char *path, const char *db_path, sqlite3 *db,
+				const struct dataset_layout *layout,
+				const double *cold_per_table,
+				const struct page_tier_entry *tiers, size_t tier_count,
+				const struct access_count_entry *access_entries,
+				size_t access_entry_count,
+				unsigned long long host_page_bytes)
+{
+	FILE *fp = NULL;
+	sqlite3_stmt *stmt = NULL;
+	sqlite3_stmt *pragma_stmt = NULL;
+	struct file_extent *extents = NULL;
+	size_t extent_count = 0;
+	unsigned int page_size = 4096;
+	unsigned long long *lpn_vec = NULL;
+	unsigned long long *acc_vec = NULL;
+	size_t lpn_cap = 0;
+	size_t acc_cap = 0;
+	bool use_fiemap = false;
+	unsigned long long fiemap_fallback_pages = 0;
+	int rc;
+
+	if (!path || !path[0] || !db_path || !db_path[0] || !db || !layout)
+		return 0;
+
+	if (host_page_bytes == 0)
+		host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
+
+	fp = fopen(path, "w");
+	if (!fp) {
+		perror("fopen table tier");
+		return -1;
+	}
+
+	fprintf(fp,
+		"table_id,table_name,db_pages,distinct_ftl_lpn,slc_lpn,qlc_lpn,"
+		"qlc_fast_lpn,qlc_slow_lpn,qlc_zone_unknown_lpn,unknown_lpn,"
+		"acc_mean,acc_p50,acc_p90,acc_p99,acc_max,acc_missing_lpn,"
+		"slc_ratio_known,qlc_fast_ratio_known,qlc_slow_ratio_known,"
+		"cold_time_sec,cold_throughput_mb_s\n");
+
+	rc = sqlite3_prepare_v2(db, "PRAGMA page_size;", -1, &pragma_stmt, NULL);
+	if (rc == SQLITE_OK && sqlite3_step(pragma_stmt) == SQLITE_ROW) {
+		int ps = sqlite3_column_int(pragma_stmt, 0);
+		if (ps > 0)
+			page_size = (unsigned int)ps;
+	}
+	if (pragma_stmt)
+		sqlite3_finalize(pragma_stmt);
+
+	rc = load_file_extents(db_path, &extents, &extent_count);
+	if (rc == 0 && extent_count > 0) {
+		unsigned long long part_off = detect_partition_offset_bytes(db_path);
+
+		use_fiemap = true;
+		if (part_off > 0) {
+			for (size_t i = 0; i < extent_count; ++i)
+				extents[i].physical += part_off;
+			fprintf(stderr,
+				"[table_tier] partition offset %llu bytes (%llu FTL pages) applied to FIEMAP extents\n",
+				part_off, part_off / host_page_bytes);
+		}
+	} else {
+		fprintf(stderr,
+			"FIEMAP unavailable for %s (rc=%d), fallback to logical offset mapping\n",
+			db_path, rc);
+	}
+
+	rc = sqlite3_prepare_v2(db, "SELECT pageno FROM dbstat WHERE name = ? ORDER BY pageno;", -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "prepare dbstat failed: %s\n", sqlite3_errmsg(db));
+		free(extents);
+		fclose(fp);
+		return -1;
+	}
+
+	for (unsigned int tbl = 0; tbl < layout->table_count; ++tbl) {
+		char table_name[MAX_TABLE_NAME];
+		size_t lpn_count = 0;
+		size_t acc_count = 0;
+		size_t extent_cursor = 0;
+		unsigned long long db_pages = 0;
+		unsigned long long slc_lpn = 0;
+		unsigned long long qlc_lpn = 0;
+		unsigned long long qlc_fast_lpn = 0;
+		unsigned long long qlc_slow_lpn = 0;
+		unsigned long long qlc_zone_unknown_lpn = 0;
+		unsigned long long unknown_lpn = 0;
+		unsigned long long acc_sum = 0;
+		unsigned long long acc_p50 = 0;
+		unsigned long long acc_p90 = 0;
+		unsigned long long acc_p99 = 0;
+		unsigned long long acc_max = 0;
+		unsigned long long acc_missing_lpn = 0;
+
+		build_table_name(table_name, sizeof(table_name), tbl);
+		sqlite3_reset(stmt);
+		sqlite3_clear_bindings(stmt);
+		sqlite3_bind_text(stmt, 1, table_name, -1, SQLITE_STATIC);
+
+		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+			int pageno = sqlite3_column_int(stmt, 0);
+			unsigned long long file_byte_start;
+			unsigned long long file_byte_end;
+			unsigned long long lpn_start;
+			unsigned long long lpn_end;
+			int map_rc;
+
+			if (pageno <= 0)
+				continue;
+
+			db_pages++;
+			file_byte_start = (unsigned long long)(pageno - 1) * (unsigned long long)page_size;
+			file_byte_end = file_byte_start + (unsigned long long)page_size - 1ULL;
+
+			if (use_fiemap) {
+				map_rc = append_file_range_lpns(extents, extent_count, &extent_cursor,
+								file_byte_start, file_byte_end,
+								host_page_bytes,
+								&lpn_vec, &lpn_count, &lpn_cap);
+				if (map_rc == 0)
+					continue;
+
+				fiemap_fallback_pages++;
+			}
+
+			lpn_start = file_byte_start / host_page_bytes;
+			lpn_end = file_byte_end / host_page_bytes;
+			map_rc = append_lpn_range(lpn_start, lpn_end, &lpn_vec, &lpn_count, &lpn_cap);
+			if (map_rc != 0) {
+				free(lpn_vec);
+				sqlite3_finalize(stmt);
+				free(extents);
+				fclose(fp);
+				return map_rc;
+			}
+		}
+
+		if (rc != SQLITE_DONE) {
+			fprintf(stderr, "dbstat step failed for %s: %s\n", table_name, sqlite3_errmsg(db));
+			free(lpn_vec);
+			sqlite3_finalize(stmt);
+			free(extents);
+			fclose(fp);
+			return -1;
+		}
+
+		if (lpn_count > 0) {
+			qsort(lpn_vec, lpn_count, sizeof(*lpn_vec), cmp_u64_asc);
+			size_t unique = 1;
+			for (size_t i = 1; i < lpn_count; ++i) {
+				if (lpn_vec[i] != lpn_vec[unique - 1])
+					lpn_vec[unique++] = lpn_vec[i];
+			}
+			lpn_count = unique;
+		}
+
+		if (lpn_count > acc_cap) {
+			unsigned long long *tmp = realloc(acc_vec, lpn_count * sizeof(*acc_vec));
+			if (!tmp) {
+				free(lpn_vec);
+				free(acc_vec);
+				sqlite3_finalize(stmt);
+				free(extents);
+				fclose(fp);
+				return -ENOMEM;
+			}
+			acc_vec = tmp;
+			acc_cap = lpn_count;
+		}
+
+		for (size_t i = 0; i < lpn_count; ++i) {
+			unsigned int in_slc = 0;
+			unsigned int qlc_zone = 0;
+			bool qlc_zone_known = false;
+			unsigned long long acc = 0;
+			if (tiers && tier_count > 0 &&
+			    lookup_page_tier(tiers, tier_count, lpn_vec[i], &in_slc,
+					     &qlc_zone, &qlc_zone_known)) {
+				if (in_slc) {
+					slc_lpn++;
+				} else {
+					qlc_lpn++;
+					if (!qlc_zone_known)
+						qlc_zone_unknown_lpn++;
+					else if (page_tier_zone_is_fast(qlc_zone))
+						qlc_fast_lpn++;
+					else
+						qlc_slow_lpn++;
+				}
+			} else {
+				unknown_lpn++;
+			}
+
+			if (access_entries && access_entry_count > 0 &&
+			    lookup_access_count(access_entries, access_entry_count, lpn_vec[i], &acc)) {
+				/* value is set via lookup */
+			} else {
+				acc_missing_lpn++;
+				acc = 0;
+			}
+
+			acc_vec[acc_count++] = acc;
+			acc_sum += acc;
+		}
+
+		if (acc_count > 0) {
+			qsort(acc_vec, acc_count, sizeof(*acc_vec), cmp_u64_asc);
+			acc_p50 = percentile_u64_from_sorted(acc_vec, acc_count, 0.50);
+			acc_p90 = percentile_u64_from_sorted(acc_vec, acc_count, 0.90);
+			acc_p99 = percentile_u64_from_sorted(acc_vec, acc_count, 0.99);
+			acc_max = acc_vec[acc_count - 1];
+		}
+
+		double known = (double)(slc_lpn + qlc_lpn);
+		double qlc_known = (double)(qlc_fast_lpn + qlc_slow_lpn);
+		double slc_ratio = known > 0.0 ? (double)slc_lpn / known : 0.0;
+		double qlc_fast_ratio = qlc_known > 0.0 ? (double)qlc_fast_lpn / qlc_known : 0.0;
+		double qlc_slow_ratio = qlc_known > 0.0 ? (double)qlc_slow_lpn / qlc_known : 0.0;
+		double acc_mean = acc_count > 0 ? (double)acc_sum / (double)acc_count : 0.0;
+		double cold_time = cold_per_table ? cold_per_table[tbl] : 0.0;
+		double tbl_bytes_mb = (double)layout->rows_per_table[tbl] * ROW_PAYLOAD_BYTES /
+				      (1024.0 * 1024.0);
+		double cold_tp = cold_time > 0.0 ? tbl_bytes_mb / cold_time : 0.0;
+
+		fprintf(fp, "%u,%s,%llu,%zu,%llu,%llu,%llu,%llu,%llu,%llu,%.9f,%llu,%llu,%llu,%llu,%llu,%.9f,%.9f,%.9f,%.9f,%.2f\n",
+			tbl, table_name, db_pages, lpn_count, slc_lpn, qlc_lpn,
+			qlc_fast_lpn, qlc_slow_lpn, qlc_zone_unknown_lpn, unknown_lpn,
+			acc_mean, acc_p50, acc_p90, acc_p99, acc_max, acc_missing_lpn,
+			slc_ratio, qlc_fast_ratio, qlc_slow_ratio, cold_time, cold_tp);
+	}
+
+	free(lpn_vec);
+	free(acc_vec);
+	sqlite3_finalize(stmt);
+	free(extents);
+	fclose(fp);
+	if (fiemap_fallback_pages > 0) {
+		fprintf(stderr,
+			"table_tier used logical fallback for %llu pages (fiemap gaps/errors)\n",
+			fiemap_fallback_pages);
+	}
 	return 0;
 }
 
@@ -1358,7 +2549,10 @@ static void drop_dataset_cache(sqlite3 *db, const char *db_path)
 		if (rc != SQLITE_OK)
 			fprintf(stderr, "sqlite3_db_cacheflush failed: %s\n", sqlite3_errstr(rc));
 		sqlite3_db_release_memory(db);
+		sqlite3_exec(db, "PRAGMA shrink_memory;", NULL, NULL, NULL);
 	}
+
+	drop_page_cache();
 
 	if (!db_path || !db_path[0])
 		return;
@@ -1370,11 +2564,8 @@ static void drop_dataset_cache(sqlite3 *db, const char *db_path)
 	}
 
 #if defined(__linux__)
-	int err = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-	if (err != 0) {
-		errno = err;
-		perror("posix_fadvise");
-	}
+	posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+	posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 #elif defined(F_NOCACHE)
 	int flag = 1;
 	if (fcntl(fd, F_NOCACHE, &flag) == -1)
@@ -1412,10 +2603,19 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	char db_path[PATH_MAX];
 	char row_stats_path[PATH_MAX];
 	char table_stats_path[PATH_MAX];
+	char table_tier_path[PATH_MAX];
 	double total_read_time = 0.0;
 	double cold_read_time = 0.0;
+	unsigned int cold_read_iters = opts->cold_full_read_iters ? opts->cold_full_read_iters : 1U;
+	double *cold_per_table = NULL;
+	struct page_tier_entry *tier_entries = NULL;
+	size_t tier_entry_count = 0;
+	struct access_count_entry *access_entries = NULL;
+	size_t access_entry_count = 0;
 	unsigned int *heat = NULL;
 	bool txn_active = false;
+	bool fast_profile_applied = false;
+	bool read_repromotion_toggled = false;
 	int rc = -1;
 
 	if (!heat_out)
@@ -1424,13 +2624,30 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	if (reads_per_event == 0)
 		reads_per_event = DEFAULT_READS_PER_EVENT;
 
+	if (opts->fast_init_profile) {
+		rc = maybe_switch_latency_profile(opts, opts->init_latency_profile, "init-start");
+		if (rc != 0)
+			return rc;
+		fast_profile_applied = true;
+	}
+
 	build_db_path(db_path, sizeof(db_path), opts);
 	unlink(db_path);
 
-	rc = sqlite3_open(db_path, &db);
+	if (opts->direct_io && register_dio_vfs() == 0) {
+		rc = sqlite3_open_v2(db_path, &db,
+				     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+				     DIO_VFS_NAME);
+	} else {
+		if (opts->direct_io)
+			fprintf(stderr, "[dio] VFS registration failed, falling back to buffered I/O\n");
+		rc = sqlite3_open(db_path, &db);
+	}
 	if (rc != SQLITE_OK) {
-		fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
-		return -1;
+		fprintf(stderr, "Cannot open database: %s\n",
+			db ? sqlite3_errmsg(db) : "sqlite open failed");
+		rc = -1;
+		goto out;
 	}
 
 	rc = sqlite3_exec(db, "PRAGMA journal_mode = off;", NULL, NULL, NULL);
@@ -1445,12 +2662,15 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		goto out;
 	}
 
+	disable_file_readahead(db_path);
+
 	rc = prepare_table_states(db, layout, opts, &tables, &total_rows);
 	if (rc != 0)
 		goto out;
 
 	build_row_stats_path(row_stats_path, sizeof(row_stats_path), opts);
 	build_table_stats_path(table_stats_path, sizeof(table_stats_path), opts);
+	build_table_tier_path(table_tier_path, sizeof(table_tier_path), opts);
 
 	active = malloc(table_count * sizeof(*active));
 	table_latency = calloc(table_count, sizeof(double));
@@ -1465,9 +2685,18 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	active_count = table_count;
 
 	printf("[sqlite_init] config tables=%u total_rows=%llu row_pages=%u interleave_rows=%u "
-	       "read_ops_per_event=%u\n",
+	       "read_ops_per_event=%u strict_cold_per_select=%u direct_io=%u fast_init_profile=%u\n",
 	       table_count, total_rows, (unsigned int)LPN_PER_ROW, interleave_rows,
-	       reads_per_event);
+	       reads_per_event, opts->strict_cold_per_select ? 1U : 0U,
+	       opts->direct_io ? 1U : 0U, opts->fast_init_profile ? 1U : 0U);
+	printf("[sqlite_init] cold_read_config mode=%s iters=%u read_repromotion=%s ctrl_path=%s\n",
+	       cold_full_read_mode_name(opts->cold_full_read_mode), cold_read_iters,
+	       opts->cold_disable_read_repromotion ? "off" : "on",
+	       opts->read_repromotion_ctrl_path ? opts->read_repromotion_ctrl_path : "(null)");
+	if (opts->direct_io) {
+		printf("[sqlite_init] dio_main_db_open_ok=%u dio_main_db_open_fail=%u\n",
+		       g_dio_maindb_open_ok, g_dio_maindb_open_fail);
+	}
 
 	rc = build_table_read_plan(layout, opts, reads_per_event, &read_plan);
 	if (rc != 0)
@@ -1532,10 +2761,14 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 				sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
 			txn_active = false;
 			rows_since_commit = 0;
-			drop_dataset_cache(db, db_path);
+			if (!opts->direct_io)
+				drop_dataset_cache(db, db_path);
 
 			read_events++;
-			rc = run_read_event(read_events, layout, tables, table_count, read_plan,
+			rc = run_read_event(read_events, layout, tables, table_count,
+					    db, db_path,
+					    opts->direct_io ? false : opts->strict_cold_per_select,
+					    read_plan,
 					    table_latency, table_read_ops, &event_elapsed);
 			if (rc != 0)
 				goto out;
@@ -1557,7 +2790,33 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 		txn_active = false;
 	}
 
-	cold_read_time = run_cold_full_read(db, layout, DEFAULT_COLD_SCAN_ITERS);
+	if (fast_profile_applied) {
+		rc = maybe_switch_latency_profile(opts, opts->cold_latency_profile, "cold-read");
+		if (rc != 0)
+			goto out;
+		fast_profile_applied = false;
+	}
+
+	cold_per_table = calloc(table_count ? table_count : 1U, sizeof(double));
+	if (cold_read_iters > 1 && !opts->cold_disable_read_repromotion) {
+		fprintf(stderr,
+			"[sqlite_init] warning: cold_full_read_iters=%u with read repromotion enabled may mutate layout across iterations\n",
+			cold_read_iters);
+	}
+	if (opts->cold_disable_read_repromotion) {
+		rc = set_read_repromotion_state(opts, false, "cold-read-start");
+		if (rc != 0)
+			goto out;
+		read_repromotion_toggled = true;
+	}
+	cold_read_time = run_cold_full_read(db, layout, opts->cold_full_read_mode,
+					    cold_read_iters, read_plan, cold_per_table);
+	if (read_repromotion_toggled) {
+		rc = set_read_repromotion_state(opts, true, "cold-read-end");
+		if (rc != 0)
+			goto out;
+		read_repromotion_toggled = false;
+	}
 
 	heat = materialize_row_heat(layout, tables);
 	if (!heat) {
@@ -1572,24 +2831,77 @@ static int run_interleaved_init(const struct dataset_layout *layout,
 	printf("[sqlite_init] row_stats=%s table_stats=%s\n",
 	       row_stats_path, table_stats_path);
 
+	if (load_page_tier_entries(opts->page_tier_path, &tier_entries, &tier_entry_count) != 0) {
+		fprintf(stderr, "Failed to load page tier map %s, continue with unknown tiers\n",
+			opts->page_tier_path ? opts->page_tier_path : "(null)");
+		tier_entries = NULL;
+		tier_entry_count = 0;
+	}
+	if (load_access_count_entries(opts->access_count_path,
+				      &access_entries, &access_entry_count) != 0) {
+		fprintf(stderr, "Failed to load access count map %s, continue without acc stats\n",
+			opts->access_count_path ? opts->access_count_path : "(null)");
+		access_entries = NULL;
+		access_entry_count = 0;
+	}
+	if (write_table_tier_csv(table_tier_path, db_path, db, layout, cold_per_table,
+				 tier_entries, tier_entry_count,
+				 access_entries, access_entry_count,
+				 opts->ftl_host_page_bytes) != 0) {
+		fprintf(stderr, "Failed to write table tier stats %s\n", table_tier_path);
+	} else {
+		printf("[sqlite_init] table_tier=%s page_tier_entries=%zu access_entries=%zu\n",
+		       table_tier_path, tier_entry_count, access_entry_count);
+	}
+
 	report_cold_tail_latency(layout, tables, table_latency, table_read_ops);
 
-	double cold_bytes_mb = (double)layout->total_rows * ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+	double cold_bytes_mb = 0.0;
+	for (unsigned int tbl = 0; tbl < table_count; ++tbl) {
+		unsigned int tbl_reads = read_plan ? read_plan[tbl] : 1U;
+		cold_bytes_mb += (double)layout->rows_per_table[tbl] * tbl_reads *
+				 ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+	}
 	double cold_throughput = cold_read_time > 0.0 ? cold_bytes_mb / cold_read_time : 0.0;
 
 	printf("[sqlite_init] tag=%s tables=%u total_rows=%u read_events=%u "
-	       "interleaved_read_time=%.6fs cold_full_read_avg=%.6fs (iters=%u) cold_full_read_tp=%.2fMB/s db=%s\n",
+	       "interleaved_read_time=%.6fs cold_full_read=%.6fs cold_full_read_tp=%.2fMB/s "
+	       "cold_mode=%s cold_iters=%u cold_read_repromotion=%s db=%s\n",
 	       effective_tag(opts), layout->table_count, layout->total_rows, read_events,
-	       total_read_time, cold_read_time, DEFAULT_COLD_SCAN_ITERS,
-	       cold_throughput, db_path);
+	       total_read_time, cold_read_time, cold_throughput,
+	       cold_full_read_mode_name(opts->cold_full_read_mode), cold_read_iters,
+	       opts->cold_disable_read_repromotion ? "off" : "on", db_path);
+
+	if (cold_per_table) {
+		for (unsigned int tbl = 0; tbl < table_count; ++tbl) {
+			char name[MAX_TABLE_NAME];
+			unsigned int tbl_reads = read_plan ? read_plan[tbl] : 1U;
+			double tbl_bytes_mb = (double)layout->rows_per_table[tbl] * tbl_reads *
+					      ROW_PAYLOAD_BYTES / (1024.0 * 1024.0);
+			double tbl_tp = cold_per_table[tbl] > 0.0 ?
+					tbl_bytes_mb / cold_per_table[tbl] : 0.0;
+
+			build_table_name(name, sizeof(name), tbl);
+			printf("[sqlite_cold_table] table=%s rows=%u time=%.6fs throughput=%.2fMB/s\n",
+			       name, layout->rows_per_table[tbl],
+			       cold_per_table[tbl], tbl_tp);
+		}
+	}
 
 	*heat_out = heat;
 	heat = NULL;
 	rc = 0;
 
 out:
+	if (read_repromotion_toggled)
+		set_read_repromotion_state(opts, true, "cleanup");
+	if (fast_profile_applied)
+		maybe_switch_latency_profile(opts, opts->cold_latency_profile, "cleanup");
 	if (heat)
 		free(heat);
+	free(access_entries);
+	free(tier_entries);
+	free(cold_per_table);
 	free(read_plan);
 	free(active);
 	free(table_latency);
@@ -2287,6 +3599,20 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 	opts->reads_explicit = false;
 	opts->interleave_rows = DEFAULT_INTERLEAVE_ROWS;
 	opts->init_reads_per_event = DEFAULT_READS_PER_EVENT;
+	opts->strict_cold_per_select = true;
+	opts->page_tier_path = DEFAULT_PAGE_TIER_PATH;
+	opts->ftl_host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
+	opts->access_count_path = DEFAULT_ACCESS_COUNT_PATH;
+	opts->direct_io = false;
+	opts->fast_init_profile = false;
+	opts->latency_profile_path = DEFAULT_LATENCY_PROFILE_PATH;
+	opts->init_latency_profile = DEFAULT_INIT_PROFILE;
+	opts->cold_latency_profile = DEFAULT_COLD_PROFILE;
+	opts->latency_profile_settle_ms = 0;
+	opts->cold_full_read_mode = COLD_FULL_READ_PER_TABLE;
+	opts->cold_full_read_iters = 1;
+	opts->cold_disable_read_repromotion = false;
+	opts->read_repromotion_ctrl_path = DEFAULT_READ_REPROMOTION_CTRL_PATH;
 
 	while ((c = getopt_long(argc, argv, "m:d:r:a:l:s:o:H:M:S:Uh", long_opts, NULL)) != -1) {
 		switch (c) {
@@ -2388,10 +3714,56 @@ static void configure_options(int argc, char **argv, struct workload_options *op
 		case 1013:
 			opts->init_reads_per_event = (unsigned int)strtoul(optarg, NULL, 10);
 			break;
-		case 'h':
-		default:
-			usage(argv[0]);
-			exit(EXIT_FAILURE);
+		case 1014:
+			opts->strict_cold_per_select = true;
+			break;
+		case 1015:
+			opts->page_tier_path = optarg;
+			break;
+		case 1016:
+			opts->ftl_host_page_bytes = parse_size_arg(optarg);
+			if (opts->ftl_host_page_bytes == 0)
+				opts->ftl_host_page_bytes = DEFAULT_FTL_HOST_PAGE_BYTES;
+			break;
+		case 1017:
+			opts->access_count_path = optarg;
+			break;
+		case 1018:
+			opts->direct_io = true;
+			break;
+		case 1019:
+			opts->fast_init_profile = true;
+			break;
+		case 1020:
+			opts->latency_profile_path = optarg;
+			break;
+		case 1021:
+			opts->init_latency_profile = optarg;
+			break;
+			case 1022:
+				opts->cold_latency_profile = optarg;
+				break;
+			case 1023:
+				opts->latency_profile_settle_ms = (unsigned int)strtoul(optarg, NULL, 10);
+				break;
+			case 1024:
+				opts->cold_full_read_mode = parse_cold_full_read_mode(optarg);
+				break;
+			case 1025:
+				opts->cold_full_read_iters = (unsigned int)strtoul(optarg, NULL, 10);
+				if (opts->cold_full_read_iters == 0)
+					opts->cold_full_read_iters = 1;
+				break;
+			case 1026:
+				opts->cold_disable_read_repromotion = true;
+				break;
+			case 1027:
+				opts->read_repromotion_ctrl_path = optarg;
+				break;
+			case 'h':
+			default:
+				usage(argv[0]);
+				exit(EXIT_FAILURE);
 		}
 	}
 
@@ -2490,5 +3862,13 @@ static void build_table_stats_path(char *buf, size_t len, const struct workload_
 	char filename[128];
 
 	snprintf(filename, sizeof(filename), TABLE_STATS_FILENAME_FMT, effective_tag(opts));
+	join_path(buf, len, RESULT_FOLDER, filename);
+}
+
+static void build_table_tier_path(char *buf, size_t len, const struct workload_options *opts)
+{
+	char filename[128];
+
+	snprintf(filename, sizeof(filename), TABLE_TIER_FILENAME_FMT, effective_tag(opts));
 	join_path(buf, len, RESULT_FOLDER, filename);
 }

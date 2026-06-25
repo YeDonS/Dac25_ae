@@ -113,11 +113,7 @@ int pqueue_insert(pqueue_t *q, void *d)
 	/* allocate more memory if necessary */
 	if (q->size >= q->avail) {
 		NVMEV_ERROR("Need more space in pqueue\n");
-		// newsize = q->size + q->step;
-		// if (!(tmp = realloc(q->d, sizeof(void *) * newsize)))
-		//     return 1;
-		// q->d = tmp;
-		// q->avail = newsize;
+		return 1;
 	}
 
 	/* insert item */

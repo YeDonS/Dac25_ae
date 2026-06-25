@@ -188,7 +188,7 @@ grep QLC_PROG_LATENCY ../nvmevirt_DA/ssd_config.h
 
 ### Successful Initialization
 ```
-[nvmev] SLC blocks per plane: 1638 (20%), QLC blocks per plane: 6554 (80%)
+[nvmev] SLC blocks per plane: 512 (20%), QLC blocks per plane: 1920 (80%)
 [nvmev] Hybrid SLC/QLC storage initialized
 ```
 

@@ -1,0 +1,100 @@
+; NVMeVirt latency-maintenance mixed fio template.
+;
+; Intended runner:
+;   bash evaluation/fio_fragment_die_latency_mixed.sh
+;
+; Workload shape:
+;   1. The runner writes the 8 GiB initialized region in 512 MiB chunks by
+;      default.
+;   2. After each write chunk, the runner generates a guarded distribution-read
+;      warmup over that just-written chunk before the next write chunk.
+;   3. The measured phase is two concurrent jobs: reads over the initialized
+;      0-8 GiB region and writes over a separate region starting at 8 GiB.
+;
+; Standalone default is approximately read:write = 10:1 with normal reads
+; and a fixed 5 GiB measured write budget.
+; The runner generates the actual per-ratio/per-distribution jobfile.
+; fio 3.16 computes a non-zero-offset working range as size - offset, so
+; offset=8G with a 5G write range must use size=13G.
+
+[global]
+ioengine=libaio
+direct=1
+thread=1
+group_reporting=0
+time_based=0
+norandommap=1
+randrepeat=0
+invalidate=1
+bs=4k
+iodepth=32
+filename=/dev/nvme0n1
+
+[init_write_8g]
+description=Init: sequentially write the entire 8 GiB mixed-test region.
+rw=write
+offset=0
+size=8G
+io_size=8G
+iodepth=32
+numjobs=1
+stonewall
+
+[prewarm_seq_read]
+description=Warmup: sequentially read the full initialized region once.
+rw=read
+offset=0
+size=8G
+io_size=8G
+iodepth=32
+numjobs=1
+stonewall
+
+[prewarm_dist_read]
+description=Warmup: distribution-shaped random reads over the initialized region.
+rw=randread
+random_distribution=normal:20
+offset=0
+size=8G
+io_size=40G
+iodepth=32
+numjobs=1
+stonewall
+
+[enter_test_phase]
+description=Runner hook: enable FTL test_phase immediately before measurement.
+rw=read
+offset=0
+size=4k
+io_size=4k
+iodepth=1
+numjobs=1
+stonewall
+
+[measure_reads]
+description=Measured phase reads: distribution-shaped reads from init-only region.
+rw=randread
+random_distribution=normal:20
+offset=0
+size=8G
+io_size=50G
+iodepth=32
+numjobs=1
+write_lat_log=lat_v2_mixed_read
+write_bw_log=lat_v2_mixed_read
+write_iops_log=lat_v2_mixed_read
+log_avg_msec=1000
+
+[measure_writes]
+description=Measured phase writes: random writes to a separate non-read region.
+rw=randwrite
+random_distribution=normal:20
+offset=8G
+size=13G
+io_size=5G
+iodepth=32
+numjobs=1
+write_lat_log=lat_v2_mixed_write
+write_bw_log=lat_v2_mixed_write
+write_iops_log=lat_v2_mixed_write
+log_avg_msec=1000
