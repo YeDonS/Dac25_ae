@@ -7,6 +7,10 @@
 #include <linux/spinlock.h>
 #include <linux/seqlock.h>
 #include <linux/atomic.h>
+#include <linux/workqueue.h>
+#include <linux/math64.h>
+#include <linux/seq_file.h>
+#include <linux/limits.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "ssd.h"
@@ -14,6 +18,25 @@
 struct dentry;
 
 #define QLC_ZONE_COUNT 4
+#define NVMEV_TEST_PHASE_READ_REQ_LAT_BINS 64
+
+enum nvmev_slc_sb_fold_state {
+	NVMEV_SLC_FOLD_IDLE = 0,
+	NVMEV_SLC_FOLD_FOLDING = 1,
+	NVMEV_SLC_FOLD_GC_READY = 2,
+	NVMEV_SLC_FOLD_GCING = 3,
+	NVMEV_SLC_FOLD_DEFERRED = 4,
+};
+
+enum nvmev_die_change_reason {
+	NVMEV_DIE_CHANGE_NONE = 0,
+	NVMEV_DIE_CHANGE_HOST_APPEND,
+	NVMEV_DIE_CHANGE_HOST_OVERWRITE,
+	NVMEV_DIE_CHANGE_GC,
+	NVMEV_DIE_CHANGE_SLC_TO_QLC,
+	NVMEV_DIE_CHANGE_REPROMOTE,
+	NVMEV_DIE_CHANGE_QLC_REBALANCE,
+};
 
 struct convparams {
 	uint32_t gc_thres_lines;
@@ -70,6 +93,8 @@ struct heat_tracking {
 	uint64_t *access_count;     /* 每个 LPN 的访问计数 */
 	uint64_t *last_access_time; /* 每个 LPN 的最后访问时间 */
 	uint64_t *write_epoch;      /* 最近写入序号 */
+	uint64_t *write_heat_epoch; /* LPN 最近写入时的全局 heat epoch */
+	uint64_t *write_read_guard_epoch; /* test phase read-window guard epoch */
 	uint32_t migration_threshold; /* 迁移阈值 */
 };
 
@@ -80,6 +105,132 @@ struct migration_mgmt {
 	bool migration_in_progress;       /* 迁移进行标志 */
 };
 
+enum nvmev_chain_alloc_reason {
+	NVMEV_CHAIN_ALLOC_REASON_NO_PREV = 0,
+	NVMEV_CHAIN_ALLOC_REASON_PREV_CHAIN_INVALID = 1,
+	NVMEV_CHAIN_ALLOC_REASON_CAPACITY = 2,
+};
+
+enum nvmev_chain_cold_method {
+	NVMEV_CHAIN_COLD_METHOD_BLOCK = 1,
+	NVMEV_CHAIN_COLD_METHOD_CHUNK = 2,
+};
+
+struct nvmev_chain_alloc_event {
+	uint64_t seq;
+	uint64_t lpn;
+	uint64_t prev_link_lpn;
+	uint32_t chain_id;
+	uint32_t prev_chain_id;
+	uint16_t seed_die;
+	uint8_t is_append;
+	uint8_t is_overwrite;
+	uint8_t reason;
+};
+
+struct nvmev_chain_cold_event {
+	uint64_t seq;
+	uint64_t heat_sum;
+	uint32_t chain_id;
+	uint32_t die;
+	uint32_t blk;
+	uint32_t pages_moved;
+	uint32_t heat_pages;
+	uint32_t cold_pages;
+	uint32_t owned_pages;
+	uint8_t ch;
+	uint8_t lun;
+	uint8_t pl;
+	uint8_t method;
+};
+
+struct nvmev_gc_victim_event {
+	uint64_t seq;
+	uint32_t die;
+	uint32_t blk;
+	uint32_t owner_chain;
+	uint32_t vpc;
+	uint32_t ipc;
+	uint8_t is_slc;
+	uint8_t high_purity;
+};
+
+#define NVMEV_MAP_ENTRY_BYTES 8U
+#define NVMEV_MAP_TPAGE_BYTES 4096U
+#define NVMEV_MAP_ENTRIES_PER_TPAGE (NVMEV_MAP_TPAGE_BYTES / NVMEV_MAP_ENTRY_BYTES)
+#define NVMEV_MAP_CMT_BYTES (8ULL << 20)
+#define NVMEV_MAP_CACHE_ENTRIES_PER_SLOT NVMEV_MAP_ENTRIES_PER_TPAGE
+#define NVMEV_MAP_CMT_SLOTS (NVMEV_MAP_CMT_BYTES / \
+	(NVMEV_MAP_ENTRY_BYTES * NVMEV_MAP_CACHE_ENTRIES_PER_SLOT))
+#define NVMEV_MAP_EVICT_SCAN 64U
+#define NVMEV_MAP_HEAT_DECAY_INTERVAL 100000ULL
+#define NVMEV_MAP_RESIDENCY_LOG_ENTRIES 4096U
+#define NVMEV_MAP_META_TIER_SLC 0U
+#define NVMEV_MAP_META_TIER_QLC 1U
+
+struct nvmev_map_gtd_entry {
+	struct ppa ppa;
+	uint16_t dirty_entries;
+	uint8_t tier;
+	uint8_t valid;
+};
+
+struct nvmev_map_cache_entry {
+	uint64_t tpage_id; /* page-level CMT: this is the owner LPN */
+	struct ppa *entries;
+	bool valid;
+	bool dirty;
+	uint16_t heat;
+	struct list_head lru_node;
+};
+
+struct nvmev_map_residency_event {
+	uint64_t seq;
+	uint64_t hits;
+	uint32_t dram_bp;
+	uint32_t flash_bp;
+};
+
+struct nvmev_map_cache {
+	spinlock_t lock;
+	struct nvmev_map_cache_entry *entries;
+	struct ppa *entry_storage;
+	uint32_t *slot_index;
+	struct nvmev_map_gtd_entry *gtd;
+	struct ppa *flash_entries;
+	struct nvmev_map_residency_event *residency_events;
+	struct list_head lru;
+	uint32_t nr_entries;
+	uint32_t used_entries;
+	uint32_t free_cursor;
+	uint32_t gtd_entries;
+	uint32_t residency_event_head;
+	uint32_t residency_event_count;
+	uint32_t slc_log_entries_pending;
+	uint64_t cmt_budget_bytes;
+	uint64_t meta_alloc_seq;
+	uint64_t access_seq;
+	uint64_t residency_event_seq;
+	bool initialized;
+	bool hotcold;
+	atomic64_t lookups;
+	atomic64_t hits;
+	atomic64_t misses;
+	atomic64_t evictions;
+	atomic64_t dirty_evictions;
+	atomic64_t metadata_reads;
+	atomic64_t metadata_writes;
+	atomic64_t metadata_read_ns;
+	atomic64_t metadata_write_ns;
+	atomic64_t slc_dram_hits;
+	atomic64_t heat_decays;
+	atomic64_t gtd_lookups;
+	atomic64_t qlc_flash_reads;
+	atomic64_t slc_meta_log_writes;
+	atomic64_t qlc_meta_folds;
+	atomic64_t qlc_meta_writes;
+};
+
 struct conv_ftl {
 	struct ssd *ssd;
 
@@ -87,9 +238,14 @@ struct conv_ftl {
 	struct ppa *maptbl; /* page level mapping table */
 	uint64_t *rmap; /* reverse mapptbl, assume it's stored in OOB */
 	seqlock_t maptbl_lock; /* serialize maptbl/rmap updates with low-overhead readers */
+	struct nvmev_map_cache map_cache; /* simulator CMT for flash-resident L2P variants */
 	struct write_flow_control wfc;
 	//66f1 - 删除了冲突的旧 line_mgmt 结构
 	uint32_t lunpointer;
+	uint32_t bg_slc_rr_die;      /* baseline/no2: RR selector for internal writes targeting SLC */
+	uint32_t bg_slc_rr_pages;    /* pages already placed on current internal SLC RR die */
+	uint32_t bg_qlc_rr_die;      /* baseline/no2: RR selector for internal writes targeting QLC */
+	uint32_t bg_qlc_rr_pages;    /* pages already placed on current internal QLC RR die */
 	uint32_t die_count;
 
 	/* SLC/QLC 混合存储相关字段 */
@@ -103,12 +259,18 @@ struct conv_ftl {
 	struct line_mgmt *slc_lunlm;          /* per-die SLC line pools */
 	struct write_pointer *slc_lunwp;
 	struct write_pointer *gc_slc_lunwp;
+	struct write_pointer *baseline_slc_active_wps; /* baseline host SB slots: [slot][die] */
+	uint32_t *baseline_active_sb_blk;     /* baseline slot -> active SLC SB blk_id, U32_MAX if free */
+	uint32_t baseline_active_sb_cursor;   /* baseline RR/fill cursor over host-active SB slots */
 	struct write_pointer slc_wp;
 	struct write_pointer gc_wp;
 	
 	struct line_mgmt *qlc_lunlm;          /* per-die QLC line pools */
 	struct write_pointer *qlc_lunwp;      /* per-die QLC write pointers */
 	struct write_pointer *gc_qlc_lunwp;   /* per-die QLC GC write pointers */
+	struct write_pointer *baseline_qlc_active_wps; /* baseline QLC SB slots: [slot][die] */
+	uint32_t *baseline_qlc_active_sb_blk; /* baseline slot -> active QLC SB blk_id */
+	uint32_t baseline_qlc_active_sb_cursor;
 	uint32_t qlc_zone_offsets[QLC_ZONE_COUNT];/* 每个zone在block中的起始页 */
 	uint32_t qlc_zone_limits[QLC_ZONE_COUNT]; /* 每个zone允许写入的页数 */
 	uint32_t qlc_zone_rr_cursor;             /* 无机制版本：线性填充所用的轮询游标 */
@@ -116,8 +278,9 @@ struct conv_ftl {
 	struct write_pointer qlc_gc_wp;
 
 	uint32_t slc_gc_free_thres_high;
+	uint32_t slc_gc_free_thres_low;
 	uint32_t qlc_gc_free_thres_high;
-	uint32_t slc_target_watermark;        /* 迁移目标水位线（高水位触发后回落到此值） */
+	uint32_t slc_target_watermark;        /* 迁移目标剩余行数（触发后尽量回补到此值） */
 	uint32_t slc_repromote_guard_lines;   /* QLC->SLC 回迁的安全预留行数 */
 
 	/* 热数据跟踪和迁移管理 */
@@ -126,6 +289,19 @@ struct conv_ftl {
 
 	/* 页面元数据 - 记录页面是否在 SLC 中 */
 	bool *page_in_slc;           /* 标记页面是否在 SLC 中 */
+	uint64_t *slc_resident_lpns; /* per-die dense resident LPN set for SLC cold migration */
+	uint32_t *slc_resident_slot; /* LPN -> slot in slc_resident_lpns, U32_MAX if absent */
+	uint32_t *slc_die_resident_count;  /* 当前每个 die 的 SLC resident 页数 */
+	uint32_t *slc_die_resident_cursor; /* 每个 die 的冷迁移扫描游标 */
+	uint32_t slc_migration_scan_cursor; /* SB-level cold migration 扫描游标 */
+	uint8_t *slc_sb_fold_state;       /* per-SB partial fold state */
+	uint32_t *slc_sb_fold_next_idx;   /* next die*pages_per_block+pg to scan */
+	uint32_t slc_migration_no_progress_scan_visits; /* no-progress migration scanned SBs */
+	uint32_t slc_migration_no_progress_victim_q;    /* victim_q when cooldown was armed */
+	uint64_t slc_migration_no_progress_epoch;       /* heat epoch when cooldown was armed */
+	uint64_t slc_migration_no_progress_cold_thresh_x10; /* cold threshold when cooldown was armed */
+	bool slc_migration_no_progress_active;          /* skip repeated no-progress scans */
+	uint32_t slc_resident_capacity_per_die; /* 每个 die 的 resident set 容量 */
 	uint64_t *qlc_page_wcnt;     /* 每个 LPN 写入到 QLC 的次数 */
 	uint64_t qlc_total_wcnt;     /* 写入到 QLC 的总次数 */
 	uint64_t qlc_unique_pages;   /* 曾写入 QLC 的唯一 LPN 数 */
@@ -141,17 +317,293 @@ struct conv_ftl {
 	uint64_t global_valid_pg_cnt;     /* 全局有效页总数 */
 	uint64_t migration_read_path_count;    /* 读路径触发迁移次数 */
 	uint64_t migration_read_path_time_ns;  /* 读路径迁移耗时累计 */
+	uint64_t qlc_promote_cursor;      /* QLC 内部 slow->fast 扫描游标 */
+	uint64_t qlc_demote_cursor;       /* QLC 内部 fast->slow 扫描游标 */
+	uint32_t qlc_promote_die_cursor;  /* affinity variants: die-batched promote start die */
+	uint32_t qlc_demote_die_cursor;   /* affinity variants: die-batched demote start die */
+	uint32_t qlc_rebalance_period_writes;  /* 每多少次主机写触发一次内部重平衡 */
+	uint32_t qlc_rebalance_promote_budget; /* 每轮 slow->fast 预算页数 */
+	uint32_t qlc_rebalance_demote_budget;  /* 每轮 fast->slow 预算页数 */
+	bool qlc_fast_drain_active;            /* fast 区达到高水位时 slow-hot promotion 需要 swap */
+	uint64_t *qlc_rebalance_cooldown_until; /* LPN -> host-read seq before next QLC rebalance move */
+	uint64_t qlc_fast_count;              /* 当前在 fast zone (L/CL) 的 QLC 页数 */
+	uint64_t qlc_slow_count;              /* 当前在 slow zone (U/CU) 的 QLC 页数 */
+	bool enable_read_repromotion;         /* 是否允许读路径触发 QLC->SLC 回迁 */
+
+	/* 后台迁移 workqueue（回迁 + QLC 内部迁移异步执行） */
+	struct workqueue_struct *bg_migration_wq;
+	struct work_struct repromotion_work;
+	struct work_struct qlc_rebalance_work;
+	struct delayed_work latency3_repromotion_delayed_work;
+	struct delayed_work latency3_qlc_rebalance_delayed_work;
+	/* SLC maintenance worker state. Baseline accounts foreground SLC
+	 * migration/GC in conv_write() completion time; latency uses these fields
+	 * for BG/URGENT async maintenance and accounts only foreground stalls. */
+	struct work_struct slc_maint_work;
+	struct delayed_work latency3_slc_maint_delayed_work;
+	uint64_t slc_maint_runs;
+	uint64_t slc_maint_pages;
+	uint64_t fg_maint_latest_ns;          /* foreground SLC maintenance completion time */
+	atomic64_t total_host_reads;
+	uint32_t repromote_period_reads;       /* 每多少次主机读触发一次回迁 worker */
+	uint32_t repromote_budget_per_run;     /* 每轮回迁最多处理多少页 */
+
+	/* 异步回迁请求环形队列 */
+	spinlock_t repromote_queue_lock;
+#define REPROMOTE_QUEUE_SIZE 32
+	uint64_t repromote_lpns[REPROMOTE_QUEUE_SIZE];
+	struct ppa repromote_ppas[REPROMOTE_QUEUE_SIZE];
+	uint32_t repromote_head;
+	uint32_t repromote_tail;
+	uint32_t repromote_die_cursor;    /* batched repromotion cursor (chain-first when enabled) */
+	uint32_t *qlc_closed_repromote_blk; /* closed QLC SB queue: physical blk id */
+	uint32_t *qlc_closed_sb_die_mask;   /* qlc blk_idx -> dies closed for this QLC SB */
+	uint8_t *qlc_closed_repromote_queued; /* qlc blk_idx already queued */
+	uint32_t qlc_closed_repromote_head;
+	uint32_t qlc_closed_repromote_tail;
+	uint32_t qlc_closed_repromote_count;
+	uint32_t qlc_closed_repromote_size;
 
 	/* 统计信息 */
 	uint64_t slc_write_cnt;      /* SLC 写入计数 */
 	uint64_t qlc_write_cnt;      /* QLC 写入计数 */
 	uint64_t migration_cnt;      /* 迁移计数 */
 	uint64_t total_host_writes;  /* 总写入块数 */
+	uint64_t die_aff_append_requests;   /* append hint requested */
+	uint64_t die_aff_append_effective;  /* append hint landed on requested die */
+	uint64_t die_aff_overwrite_requests;  /* overwrite hint requested */
+	uint64_t die_aff_overwrite_effective; /* overwrite hint landed on requested die */
+	uint16_t *lpn_initial_die;          /* first die ever assigned to this LPN */
+	uint8_t *lpn_die_changed;           /* current mapping differs from initial die */
+	uint8_t *lpn_die_change_reason;     /* reason for the current changed state */
+		uint32_t *lpn_chain_id;             /* inferred append-chain id per LPN */
+		uint8_t *chain_slc_next_die;        /* next SLC die for this chain's private RR */
+		uint8_t *chain_qlc_next_die;        /* next QLC die for this chain's private RR */
+		uint8_t *chain_slc_rr_pages;        /* pages already placed on current SLC die */
+		uint8_t *chain_qlc_rr_pages;        /* pages already placed on current QLC die */
+		uint32_t *chain_slc_page_count;     /* exact current SLC resident pages per chain */
+		uint64_t *chain_last_slc_touch;     /* last SLC touch time per chain */
+		struct write_pointer **chain_host_slc_wps; /* lazily allocated per-chain/per-die host SLC WPs */
+		uint32_t chain_capacity;            /* max number of chains tracked */
+		uint32_t next_chain_id;             /* next chain id to allocate */
+		uint32_t *blk_owner_chain;          /* dominant chain id per physical block */
+		uint16_t *blk_owner_pages;          /* pages in block that belong to dominant chain */
+		uint16_t *blk_valid_pages;          /* valid pages currently tracked in block */
+		uint16_t *blk_mixed_pages;          /* pages not belonging to dominant chain */
+		uint16_t *blk_active_wp_refs;       /* open host chain-private SLC writers per block */
+		/* superblock-level state machine (SLC only).
+		 * Indexed by blk_id (0..slc_blks_per_pl-1). A superblock spans the
+		 * SAME blk_id across all dies. Single state per blk_id is sufficient
+		 * because all dies of a chain SB are reserved together. */
+		uint8_t  *slc_sb_state;             /* NVMEV_SB_FREE / NVMEV_SB_ACTIVE / NVMEV_SB_CLOSED */
+		uint8_t  *slc_sb_active_counted;    /* ACTIVE SBs that consume the host/chain active cap */
+		uint32_t *slc_sb_owner_chain;       /* first chain to write into this SB (parasitic writers don't change owner) */
+			uint16_t *slc_sb_die_full_mask;     /* bit i: die i has filled its portion of this SB */
+			uint8_t  *slc_sb_migrated_victim;   /* SBs processed by SLC->QLC migration and eligible for SLC GC */
+			uint8_t  *slc_sb_maint_state;       /* SLC maintenance exclusion: idle/migrating/queued/gcing */
+			uint8_t  *slc_sb_recent_guard;      /* recently closed SBs protected from cold migration */
+		uint32_t *slc_sb_generation;        /* increments when an SB starts a new lifecycle */
+		uint8_t  *qlc_sb_state;             /* QLC SB state, indexed by qlc blk idx */
+		uint8_t  *qlc_sb_active_counted;    /* QLC ACTIVE SBs that consume the active cap */
+		uint32_t *qlc_sb_owner_chain;       /* owner chain for QLC active SBs */
+		uint16_t *qlc_sb_die_closed_mask;   /* bit i: die i closed its QLC portion */
+		uint32_t *slc_recent_guard_ring_blk;
+		uint32_t *slc_recent_guard_ring_gen;
+		uint32_t *chain_cur_active_sb;      /* chain_id -> current ACTIVE SB blk_id (U32_MAX if none) */
+		uint32_t *chain_cur_active_qlc_sb;  /* chain_id -> current ACTIVE QLC SB blk_id */
+		struct write_pointer **chain_host_qlc_wps; /* lazily allocated per-chain/per-die host QLC WPs */
+		uint32_t  active_sb_count;          /* number of ACTIVE SBs counted against the host/chain cap */
+		uint32_t  qlc_active_sb_count;      /* number of ACTIVE QLC SBs counted against the cap */
+		uint32_t  slc_sb_migrated_victim_count;
+		uint32_t  slc_recent_guard_ring_size;
+		uint32_t  slc_recent_guard_ring_head;
+		/* chain-triggered repromotion: per-chain host read counter; when it
+		 * crosses the threshold the bg worker scans this chain's QLC pages
+		 * for hot ones and rewrites them back to SLC in a batch. */
+		uint64_t *chain_host_read_count;
+		uint64_t *chain_repromote_cursor;   /* incremental scan cursor (LPN) per chain */
+		uint64_t lpn_initial_die_tracked;   /* LPNs that have ever been assigned an initial die */
+	uint64_t lpn_current_die_changed;   /* currently mapped LPNs whose die != initial die */
+	uint64_t lpn_changed_host_append;
+	uint64_t lpn_changed_host_overwrite;
+	uint64_t lpn_changed_gc;
+	uint64_t lpn_changed_slc_to_qlc;
+	uint64_t lpn_changed_repromote;
+	uint64_t lpn_changed_qlc_rebalance;
+	uint64_t chain_chunk_migration_attempts;
+	uint64_t chain_chunk_migration_pages;
+	uint64_t chain_block_migration_attempts;
+	uint64_t chain_block_migration_pages;
+	uint64_t chain_block_migration_skip_budget;
+	uint64_t chain_gc_to_qlc_pages;
+	uint64_t slc_sb_migration_attempts;
+	uint64_t slc_sb_migration_pages;
+	uint64_t slc_sb_migration_victim_enqueues;
+	uint64_t slc_sb_migration_victim_dequeues;
+	uint64_t slc_sb_migration_victim_stale;
+	uint64_t slc_sb_fold_partial;
+	uint64_t slc_sb_fold_resumes;
+	uint64_t slc_sb_fold_completed;
+	uint64_t slc_sb_fold_deferred_recent;
+	uint64_t slc_sb_fold_yield_read_prio;
+	uint64_t slc_sb_recent_guard_skips;
+	uint64_t slc_sb_recent_guard_forced;
+	uint64_t slc_sb_gc_count;
+	uint64_t slc_sb_gc_valid_pages;
+	uint64_t slc_sb_gc_invalid_pages;
+	uint64_t slc_sb_gc_erase_ops;
+	uint64_t slc_sb_gc_erase_time_ns;
+	uint64_t slc_sb_gc_tier_empty;
+	uint64_t slc_sb_gc_tier_pure_cold;
+	uint64_t slc_sb_gc_tier_mixed;
+	uint64_t slc_sb_gc_tier_fallback;
+	uint64_t hard_no_victim_count;
+	uint64_t active_sealed_for_hard;
+	uint64_t active_sealed_for_alloc_fail;
+	uint64_t active_seal_migrated_pages;
+	uint64_t active_seal_no_migrate;
+	uint64_t victim_pq_insert_fail;
+	uint64_t victim_pq_duplicate_avoided;
+	uint64_t victim_pq_corrupt_pos;
+	uint64_t victim_pq_max_size;
+	uint64_t repromote_chain_alloc_pages;
+	uint64_t repromote_gc_pool_pages;
+	uint64_t repromote_skip_active_cap;
+	uint64_t qlc_closed_repromote_enqueues;
+	uint64_t qlc_closed_repromote_dequeues;
+	uint64_t qlc_closed_repromote_drops;
+	uint64_t qlc_closed_repromote_scans;
+	uint64_t qlc_closed_repromote_pages;
+	uint64_t chain_slc_die_reroute_count;
+	uint64_t chain_alloc_no_prev;
+	uint64_t chain_alloc_prev_chain_invalid;
+	uint64_t chain_alloc_capacity_fail;
+	bool test_phase_active;                 /* whether cold-test phase is active */
+	atomic64_t test_phase_read_reqs;        /* read requests observed during test phase */
+	atomic64_t test_phase_overwrite_reqs;   /* overwrite requests observed during test phase */
+	atomic64_t test_phase_bg_repromote_ops; /* QLC->SLC repromotions during test phase */
+	atomic64_t test_phase_bg_qlc_rebalance_ops; /* QLC internal migrations during test phase */
+	atomic64_t test_phase_read_bg_conflicts;    /* read overlapped bg migration/repromotion */
+	atomic64_t test_phase_read_begin_bg_active; /* host read began while bg op was active */
+	atomic64_t test_phase_bg_begin_read_active; /* bg op began while host read was active */
+	atomic64_t test_phase_read_overwrite_conflicts; /* read overlapped overwrite */
+	atomic64_t test_phase_read_die_conflicts;   /* reads delayed because target die was busy */
+	atomic64_t test_phase_read_die_wait_ns;     /* cumulative die-busy wait added to reads */
+	atomic64_t test_phase_read_die_read_conflicts;
+	atomic64_t test_phase_read_die_read_wait_ns;
+	atomic64_t test_phase_read_die_bg_conflicts;
+	atomic64_t test_phase_read_die_bg_wait_ns;
+	atomic64_t test_phase_read_ch_conflicts;
+	atomic64_t test_phase_read_ch_wait_ns;
+	atomic64_t test_phase_read_ch_read_conflicts;
+	atomic64_t test_phase_read_ch_read_wait_ns;
+	atomic64_t test_phase_read_ch_bg_conflicts;
+	atomic64_t test_phase_read_ch_bg_wait_ns;
+	atomic64_t test_phase_read_pcie_conflicts;
+	atomic64_t test_phase_read_pcie_wait_ns;
+	atomic64_t test_phase_read_pcie_read_conflicts;
+	atomic64_t test_phase_read_pcie_read_wait_ns;
+	atomic64_t test_phase_read_pcie_bg_conflicts;
+	atomic64_t test_phase_read_pcie_bg_wait_ns;
+	atomic64_t test_phase_read_lp_bypass_ops;   /* legacy ABI: zero in non-preemptive model */
+	atomic64_t test_phase_read_lp_bypass_ns;    /* legacy ABI: zero in non-preemptive model */
+	atomic64_t test_phase_host_read_nand_ops;   /* foreground NAND reads issued by host reads */
+	atomic64_t test_phase_host_read_slc_ops;    /* host read NAND ops served from SLC */
+	atomic64_t test_phase_host_read_qlc_ops;    /* host read NAND ops served from QLC */
+	atomic64_t test_phase_host_read_phys_slc_ops; /* host read NAND ops whose NAND block is SLC */
+	atomic64_t test_phase_host_read_phys_qlc_ops; /* host read NAND ops whose NAND block is QLC */
+	atomic64_t test_phase_host_read_tier_mismatch_ops; /* is_slc_block disagrees with NAND block type */
+	atomic64_t test_phase_host_read_slc_pages;  /* active test-phase 4KB pages served from SLC */
+	atomic64_t test_phase_host_read_qlc_pages;  /* active test-phase 4KB pages served from QLC */
+	atomic64_t test_phase_host_read_phys_slc_pages; /* active test-phase 4KB pages whose NAND block is SLC */
+	atomic64_t test_phase_host_read_phys_qlc_pages; /* active test-phase 4KB pages whose NAND block is QLC */
+	atomic64_t test_phase_host_read_tier_mismatch_pages; /* active test-phase page-level tier mismatch */
+	atomic64_t test_phase_read_nand_bg_overlap_ops; /* foreground read NAND ops issued while bg active */
+	atomic64_t test_phase_host_write_pages;     /* host logical pages written during test phase */
+	atomic64_t test_phase_host_write_nand_ops;  /* foreground NAND writes issued by host writes */
+	atomic64_t test_phase_write_early_completion_reqs; /* writes completed before NAND program completion */
+	atomic64_t test_phase_slc_to_qlc_nand_reads;  /* internal SLC->QLC migration reads */
+	atomic64_t test_phase_slc_to_qlc_nand_writes; /* internal SLC->QLC migration writes */
+	atomic64_t test_phase_repromote_nand_reads;   /* internal QLC->SLC repromotion reads */
+	atomic64_t test_phase_repromote_nand_writes;  /* internal QLC->SLC repromotion writes */
+	atomic64_t test_phase_guard_read_reqs;        /* read requests used by recent-write guard */
+	atomic64_t test_phase_guard_epoch;            /* current read-window guard epoch */
+	atomic64_t test_phase_recent_guard_skips;     /* SLC->QLC migration pages skipped by guard */
+	atomic64_t test_phase_recent_guard_forced;    /* guarded pages migrated under SLC pressure */
+	atomic64_t test_phase_last_read_ktime_ns;     /* host read arrival wall-clock for read-priority bg yield */
+	atomic64_t test_phase_read_priority_busy_until_ns; /* simulated read service window end */
+	atomic64_t test_phase_read_priority_gate_tokens; /* bg-maint yield opportunities after recent reads */
+	atomic64_t test_phase_last_read_issue_ns;   /* last simulated host read issue time */
+	atomic64_t test_phase_read_issue_gap_count; /* monotonic issue-time gaps observed */
+	atomic64_t test_phase_read_issue_gap_sum_ns; /* sum of monotonic issue-time gaps */
+	atomic64_t test_phase_read_issue_gap_max_ns; /* max monotonic issue-time gap */
+	atomic64_t test_phase_read_issue_same_time; /* reads with same issue time as previous */
+	atomic64_t test_phase_read_issue_backwards; /* issue-time order inversions under concurrency */
+	atomic64_t test_phase_read_priority_yields;   /* bg workers yielded to foreground reads */
+	atomic64_t test_phase_read_priority_delayed_requeues; /* yielded work was delayed before retry */
+	atomic64_t test_phase_read_priority_forced_progress_runs; /* pressure forced one bg maintenance run */
+	atomic64_t test_phase_read_req_lat_count;     /* host read request latency samples */
+	atomic64_t test_phase_read_req_lat_sum_ns;    /* cumulative host read request latency */
+	atomic64_t test_phase_read_req_lat_max_ns;    /* max host read request latency */
+	atomic64_t test_phase_read_req_lat_hist[NVMEV_TEST_PHASE_READ_REQ_LAT_BINS];
+	atomic64_t test_phase_read_priority_gate_entries; /* bg workers entered read-priority gate */
+	atomic64_t test_phase_read_priority_should_yield_checks;
+	atomic64_t test_phase_read_priority_should_yield_true;
+	atomic64_t test_phase_read_priority_should_yield_force_blocked;
+	atomic64_t test_phase_read_priority_should_yield_gate_closed;
+	atomic64_t test_phase_read_priority_should_yield_window_closed;
+	atomic64_t test_phase_read_priority_window_active_read_hits;
+	atomic64_t test_phase_read_priority_window_busy_hits;
+	atomic64_t test_phase_read_priority_window_quiet_hits;
+	atomic64_t test_phase_read_priority_token_empty;
+	atomic64_t test_phase_read_priority_token_window_hits;
+	atomic_t test_phase_active_reads;       /* currently active host reads */
+	atomic_t test_phase_active_overwrites;  /* currently active overwrite writes */
+	atomic_t test_phase_active_bg_ops;      /* currently active bg migration ops */
+	atomic_t latency3_bg_read_priority_gate; /* only latency3: enable bg read-priority checks */
+	atomic_t latency3_read_priority_yield_streak; /* only latency3: consecutive bg read-priority yields */
+	atomic_t latency3_read_priority_force_active; /* only latency3: suppress nested yield checks during forced run */
+	uint64_t test_phase_host_writes_start;
+	uint64_t test_phase_slc_sb_migration_pages_start;
+	uint64_t test_phase_slc_sb_gc_valid_pages_start;
+	uint64_t test_phase_slc_sb_gc_invalid_pages_start;
+	uint64_t test_phase_qlc_closed_repromote_pages_start;
+	uint64_t heat_epoch;                    /* read/preheat epoch for cold migration guard */
 	atomic64_t slc_resident_page_cnt; /* 当前驻留在 SLC 的页面数 */
 	atomic_t slc_recover_lock;        /* 序列化 SLC 回收 */
+	spinlock_t event_log_lock;        /* 保护调试事件环形日志 */
+	struct nvmev_chain_alloc_event *chain_alloc_events;
+	struct nvmev_chain_cold_event *chain_cold_events;
+	struct nvmev_gc_victim_event *gc_victim_events;
+	uint32_t chain_alloc_event_head;
+	uint32_t chain_alloc_event_count;
+	uint32_t chain_cold_event_head;
+	uint32_t chain_cold_event_count;
+	uint32_t gc_victim_event_head;
+	uint32_t gc_victim_event_count;
+	uint64_t chain_alloc_event_seq;
+	uint64_t chain_cold_event_seq;
+	uint64_t gc_victim_event_seq;
 	struct dentry *debug_dir;          /* per-instance debugfs directory */
 	struct dentry *debug_access_count; /* debugfs entry for access counter */
-	struct dentry *debug_access_inject; /* debugfs entry for counter injection */
+		struct dentry *debug_access_inject; /* debugfs entry for counter injection */
+			struct dentry *debug_page_tier;    /* debugfs entry for mapped page tier */
+			struct dentry *debug_page_tier_raw; /* debugfs entry for raw tier diagnostics */
+		struct dentry *debug_page_die;     /* debugfs entry for mapped page die */
+		struct dentry *debug_page_chain;   /* debugfs entry for mapped page chain */
+		struct dentry *debug_page_die_transition; /* debugfs entry for initial/current die transitions */
+	struct dentry *debug_die_affinity_stats; /* debugfs entry for die-affinity counters */
+	struct dentry *debug_lpn_die_change_stats; /* debugfs entry for current die-change counts */
+	struct dentry *debug_test_phase;   /* debugfs entry for toggling test phase */
+	struct dentry *debug_test_phase_stats; /* debugfs entry for test phase counters */
+	struct dentry *debug_heat_epoch;   /* debugfs entry for advancing heat epoch */
+	struct dentry *debug_read_repromotion; /* debugfs entry for read repromotion toggle */
+	struct dentry *debug_map_cache_stats; /* debugfs entry for CMT hit/miss counters */
+	struct dentry *debug_map_residency_csv; /* debugfs CSV entry for mapping residency snapshots */
+	struct dentry *debug_chain_alloc_events; /* debugfs entry for chain allocation events */
+	struct dentry *debug_chain_cold_events; /* debugfs entry for cold migration picks */
+	struct dentry *debug_gc_victim_events; /* debugfs entry for gc victim picks */
+	struct dentry *debug_superblock_stats; /* debugfs entry for superblock health/cost counters */
 	
 	/* 初始化状态标记 */
 	bool maptbl_initialized;     /* 映射表是否初始化成功 */
@@ -173,7 +625,41 @@ struct conv_ftl {
 	bool threads_should_stop;                /* 线程停止标志 */
 	
 	/* 水位线控制 - 基于剩余空间数量 */
-	uint32_t slc_high_watermark;             /* SLC 高水位线: 剩余空间低于此值时触发迁移 */
+	uint32_t slc_high_watermark;             /* SLC 迁移阈值: 剩余行数低于此值时触发迁移 */
+
+	/* [LATENCY v2] per-die maintenance task FIFO + idle-die dispatcher.
+	 *
+	 * 仅 conv_ftl_latency_superblock.c 在 V2 模式下初始化和使用; 其他变体不分配
+	 * (字段保持 NULL/0)。每 die 有独立任务队列, worker 按当前 idle slack 排序
+	 * 选择 die, 跳过当前有 host I/O 排队或 channel 满的 die。
+	 *
+	 * 任务粒度: per-die SB portion (一条 SB 在某个 die 上的部分), 远小于
+	 * V1 的"整 SB 一次跑完", 因此单个 task 占 die 的仿真时间 ~200µs 而不是
+	 * 整 SB 的几 ms。host I/O 可以在 task 之间见缝插针。 */
+	struct list_head *maint_die_q;          /* size = die_count */
+	spinlock_t       *maint_die_locks;
+	uint32_t         *maint_die_qlen;
+	uint8_t          *maint_sb_phase;       /* size = slc_blks_per_pl */
+	#define MAINT_SB_PHASE_IDLE    0
+	#define MAINT_SB_PHASE_MIG     1        /* 正在 split-migrate */
+	#define MAINT_SB_PHASE_GC_RDY  2        /* 等 GC pop */
+	#define MAINT_SB_PHASE_GC      3        /* 正在 split-GC */
+	uint16_t         *maint_sb_pending_dies;/* 当前 phase 还剩多少 die 没做 */
+	atomic_t         *die_host_demand;      /* per-die: host I/O in flight count */
+	uint64_t maint_v2_runs;
+	uint64_t maint_v2_idle_picks;            /* 选中 die 时已空闲 ns */
+	uint64_t maint_v2_no_slack_skips;        /* 没找到任何空闲 die 跳过 */
+	uint64_t maint_v2_ch_busy_skips;
+	uint64_t maint_v2_demand_skips;
+	uint64_t maint_v2_emergency_overrides;
+	uint64_t maint_v2_tasks_done;
+	uint64_t maint_v2_tasks_requeued;
+	uint64_t maint_v2_tasks_yielded;
+	uint64_t maint_v2_stale_tasks;
+	uint64_t maint_v2_no_progress_runs;
+	atomic_t maint_v2_backlog_tasks;
+	atomic_t maint_v2_backlog_max;
+	uint32_t maint_v2_hard_skip_count;
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
@@ -185,5 +671,445 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req,
 			   struct nvmev_result *ret);
 
 void nvmev_debugfs_cleanup_root(void);
+
+static inline unsigned int
+nvmev_test_phase_read_req_lat_bucket(uint64_t lat_ns)
+{
+	unsigned int bucket = 0;
+
+	while (lat_ns >>= 1)
+		bucket++;
+	if (bucket >= NVMEV_TEST_PHASE_READ_REQ_LAT_BINS)
+		bucket = NVMEV_TEST_PHASE_READ_REQ_LAT_BINS - 1;
+	return bucket;
+}
+
+static inline uint64_t
+nvmev_test_phase_read_req_lat_bucket_upper_ns(unsigned int bucket)
+{
+	if (bucket >= 63)
+		return U64_MAX;
+	return (1ULL << (bucket + 1)) - 1ULL;
+}
+
+static inline void
+nvmev_test_phase_read_req_lat_reset(struct conv_ftl *conv_ftl)
+{
+	unsigned int i;
+
+	if (!conv_ftl)
+		return;
+
+	atomic64_set(&conv_ftl->test_phase_read_req_lat_count, 0);
+	atomic64_set(&conv_ftl->test_phase_read_req_lat_sum_ns, 0);
+	atomic64_set(&conv_ftl->test_phase_read_req_lat_max_ns, 0);
+	for (i = 0; i < NVMEV_TEST_PHASE_READ_REQ_LAT_BINS; i++)
+		atomic64_set(&conv_ftl->test_phase_read_req_lat_hist[i], 0);
+}
+
+static inline void
+nvmev_test_phase_read_req_lat_note(struct conv_ftl *conv_ftl, uint64_t lat_ns)
+{
+	unsigned int bucket;
+	s64 old_max;
+
+	if (!conv_ftl)
+		return;
+
+	atomic64_inc(&conv_ftl->test_phase_read_req_lat_count);
+	atomic64_add(lat_ns, &conv_ftl->test_phase_read_req_lat_sum_ns);
+	old_max = atomic64_read(&conv_ftl->test_phase_read_req_lat_max_ns);
+	while (lat_ns > (uint64_t)old_max) {
+		s64 prev = atomic64_cmpxchg(&conv_ftl->test_phase_read_req_lat_max_ns,
+					    old_max, (s64)lat_ns);
+
+		if (prev == old_max)
+			break;
+		old_max = prev;
+	}
+	bucket = nvmev_test_phase_read_req_lat_bucket(lat_ns);
+	atomic64_inc(&conv_ftl->test_phase_read_req_lat_hist[bucket]);
+}
+
+static inline void
+nvmev_atomic64_update_max(atomic64_t *target, uint64_t value)
+{
+	s64 old;
+
+	if (!target)
+		return;
+
+	old = atomic64_read(target);
+	while (value > (uint64_t)old) {
+		s64 prev = atomic64_cmpxchg(target, old, (s64)value);
+
+		if (prev == old)
+			break;
+		old = prev;
+	}
+}
+
+static inline void
+nvmev_test_phase_note_read_issue(struct conv_ftl *conv_ftl, uint64_t issue_ns)
+{
+	s64 old_issue;
+
+	if (!conv_ftl || !issue_ns)
+		return;
+
+	old_issue = atomic64_read(&conv_ftl->test_phase_last_read_issue_ns);
+	while (true) {
+		s64 prev = atomic64_cmpxchg(
+			&conv_ftl->test_phase_last_read_issue_ns,
+			old_issue, (s64)issue_ns);
+
+		if (prev == old_issue)
+			break;
+		old_issue = prev;
+	}
+
+	if (!old_issue)
+		return;
+	if (issue_ns == (uint64_t)old_issue) {
+		atomic64_inc(&conv_ftl->test_phase_read_issue_same_time);
+	} else if (issue_ns > (uint64_t)old_issue) {
+		uint64_t gap = issue_ns - (uint64_t)old_issue;
+
+		atomic64_inc(&conv_ftl->test_phase_read_issue_gap_count);
+		atomic64_add(gap, &conv_ftl->test_phase_read_issue_gap_sum_ns);
+		nvmev_atomic64_update_max(
+			&conv_ftl->test_phase_read_issue_gap_max_ns, gap);
+	} else {
+		atomic64_inc(&conv_ftl->test_phase_read_issue_backwards);
+	}
+}
+
+static inline void
+nvmev_test_phase_extend_read_priority_window(struct conv_ftl *conv_ftl,
+					     uint64_t busy_until_ns)
+{
+	s64 old_until;
+
+	if (!conv_ftl || !busy_until_ns)
+		return;
+
+	old_until = atomic64_read(&conv_ftl->test_phase_read_priority_busy_until_ns);
+	while (busy_until_ns > (uint64_t)old_until) {
+		s64 prev = atomic64_cmpxchg(
+			&conv_ftl->test_phase_read_priority_busy_until_ns,
+			old_until, (s64)busy_until_ns);
+
+		if (prev == old_until)
+			break;
+		old_until = prev;
+	}
+}
+
+static inline void
+nvmev_test_phase_refresh_read_priority_tokens(struct conv_ftl *conv_ftl,
+					      uint64_t tokens)
+{
+	s64 old_tokens;
+
+	if (!conv_ftl || !tokens)
+		return;
+
+	old_tokens = atomic64_read(&conv_ftl->test_phase_read_priority_gate_tokens);
+	while (tokens > (uint64_t)old_tokens) {
+		s64 prev = atomic64_cmpxchg(
+			&conv_ftl->test_phase_read_priority_gate_tokens,
+			old_tokens, (s64)tokens);
+
+		if (prev == old_tokens)
+			break;
+		old_tokens = prev;
+	}
+}
+
+static inline bool
+nvmev_test_phase_consume_read_priority_token(struct conv_ftl *conv_ftl)
+{
+	s64 old_tokens;
+
+	if (!conv_ftl)
+		return false;
+
+	old_tokens = atomic64_read(&conv_ftl->test_phase_read_priority_gate_tokens);
+	while (old_tokens > 0) {
+		s64 prev = atomic64_cmpxchg(
+			&conv_ftl->test_phase_read_priority_gate_tokens,
+			old_tokens, old_tokens - 1);
+
+		if (prev == old_tokens)
+			return true;
+		old_tokens = prev;
+	}
+	return false;
+}
+
+static inline uint64_t
+nvmev_test_phase_read_req_lat_percentile_ns(struct conv_ftl *conv_ftl,
+					    uint64_t count, uint32_t pct_milli)
+{
+	uint64_t target;
+	uint64_t seen = 0;
+	unsigned int i;
+
+	if (!conv_ftl || !count)
+		return 0;
+	if (pct_milli > 1000)
+		pct_milli = 1000;
+	target = div64_u64(count * pct_milli + 999ULL, 1000ULL);
+	if (!target)
+		target = 1;
+
+	for (i = 0; i < NVMEV_TEST_PHASE_READ_REQ_LAT_BINS; i++) {
+		seen += (uint64_t)atomic64_read(&conv_ftl->test_phase_read_req_lat_hist[i]);
+		if (seen >= target)
+			return nvmev_test_phase_read_req_lat_bucket_upper_ns(i);
+	}
+	return (uint64_t)atomic64_read(&conv_ftl->test_phase_read_req_lat_max_ns);
+}
+
+static inline void
+nvmev_test_phase_read_prio_diag_reset(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+
+	atomic64_set(&conv_ftl->test_phase_read_priority_gate_entries, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_should_yield_checks, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_should_yield_true, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_should_yield_force_blocked, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_should_yield_gate_closed, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_should_yield_window_closed, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_window_active_read_hits, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_window_busy_hits, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_window_quiet_hits, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_token_empty, 0);
+	atomic64_set(&conv_ftl->test_phase_read_priority_token_window_hits, 0);
+}
+
+static inline void
+nvmev_test_phase_read_req_lat_seq_print(struct seq_file *m, struct conv_ftl *conv_ftl)
+{
+	uint64_t count;
+	uint64_t sum;
+	uint64_t avg;
+	unsigned int i;
+
+	if (!m || !conv_ftl)
+		return;
+
+	count = (uint64_t)atomic64_read(&conv_ftl->test_phase_read_req_lat_count);
+	sum = (uint64_t)atomic64_read(&conv_ftl->test_phase_read_req_lat_sum_ns);
+	avg = count ? div64_u64(sum, count) : 0;
+	seq_printf(m, "read_req_latency_count %llu\n",
+		   (unsigned long long)count);
+	seq_printf(m, "read_req_latency_avg_ns %llu\n",
+		   (unsigned long long)avg);
+	seq_printf(m, "read_req_latency_p50_ns %llu\n",
+		   (unsigned long long)nvmev_test_phase_read_req_lat_percentile_ns(
+			   conv_ftl, count, 500));
+	seq_printf(m, "read_req_latency_p95_ns %llu\n",
+		   (unsigned long long)nvmev_test_phase_read_req_lat_percentile_ns(
+			   conv_ftl, count, 950));
+	seq_printf(m, "read_req_latency_p99_ns %llu\n",
+		   (unsigned long long)nvmev_test_phase_read_req_lat_percentile_ns(
+			   conv_ftl, count, 990));
+	seq_printf(m, "read_req_latency_p999_ns %llu\n",
+		   (unsigned long long)nvmev_test_phase_read_req_lat_percentile_ns(
+			   conv_ftl, count, 999));
+	seq_printf(m, "read_req_latency_max_ns %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_req_lat_max_ns));
+	seq_printf(m, "read_req_latency_hist_bins %u\n",
+		   NVMEV_TEST_PHASE_READ_REQ_LAT_BINS);
+	for (i = 0; i < NVMEV_TEST_PHASE_READ_REQ_LAT_BINS; i++) {
+		seq_printf(m, "read_req_latency_hist_bin_%02u_upper_ns %llu\n",
+			   i,
+			   (unsigned long long)
+			   nvmev_test_phase_read_req_lat_bucket_upper_ns(i));
+		seq_printf(m, "read_req_latency_hist_bin_%02u_count %lld\n",
+			   i,
+			   atomic64_read(&conv_ftl->test_phase_read_req_lat_hist[i]));
+	}
+}
+
+static inline void
+nvmev_test_phase_read_prio_diag_seq_print(struct seq_file *m, struct conv_ftl *conv_ftl)
+{
+	if (!m || !conv_ftl)
+		return;
+
+	seq_puts(m, "read_priority_model nonpreemptive_submit_gate\n");
+	seq_printf(m, "read_priority_gate_entries %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_gate_entries));
+	seq_printf(m, "read_priority_should_yield_checks %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_should_yield_checks));
+	seq_printf(m, "read_priority_should_yield_true %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_should_yield_true));
+	seq_printf(m, "read_priority_should_yield_force_blocked %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_should_yield_force_blocked));
+	seq_printf(m, "read_priority_should_yield_gate_closed %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_should_yield_gate_closed));
+	seq_printf(m, "read_priority_should_yield_window_closed %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_should_yield_window_closed));
+	seq_printf(m, "read_priority_window_active_read_hits %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_window_active_read_hits));
+	seq_printf(m, "read_priority_window_busy_hits %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_window_busy_hits));
+	seq_printf(m, "read_priority_window_quiet_hits %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_window_quiet_hits));
+	seq_printf(m, "read_priority_token_empty %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_token_empty));
+	seq_printf(m, "read_priority_gate_current %d\n",
+		   atomic_read(&conv_ftl->latency3_bg_read_priority_gate));
+	seq_printf(m, "read_priority_force_current %d\n",
+		   atomic_read(&conv_ftl->latency3_read_priority_force_active));
+	seq_printf(m, "read_priority_yield_streak_current %d\n",
+		   atomic_read(&conv_ftl->latency3_read_priority_yield_streak));
+	seq_printf(m, "read_priority_busy_until_ns %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_busy_until_ns));
+	seq_printf(m, "read_priority_gate_tokens_current %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_gate_tokens));
+	seq_printf(m, "read_priority_token_window_hits %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_priority_token_window_hits));
+}
+
+static inline void nvmev_test_phase_read_wait_reset(struct conv_ftl *conv_ftl)
+{
+	if (!conv_ftl)
+		return;
+
+#define NVMEV_RESET_READ_WAIT(field) atomic64_set(&conv_ftl->field, 0)
+	NVMEV_RESET_READ_WAIT(test_phase_read_die_conflicts);
+	NVMEV_RESET_READ_WAIT(test_phase_read_die_wait_ns);
+	NVMEV_RESET_READ_WAIT(test_phase_read_die_read_conflicts);
+	NVMEV_RESET_READ_WAIT(test_phase_read_die_read_wait_ns);
+	NVMEV_RESET_READ_WAIT(test_phase_read_die_bg_conflicts);
+	NVMEV_RESET_READ_WAIT(test_phase_read_die_bg_wait_ns);
+	NVMEV_RESET_READ_WAIT(test_phase_read_ch_conflicts);
+	NVMEV_RESET_READ_WAIT(test_phase_read_ch_wait_ns);
+	NVMEV_RESET_READ_WAIT(test_phase_read_ch_read_conflicts);
+	NVMEV_RESET_READ_WAIT(test_phase_read_ch_read_wait_ns);
+	NVMEV_RESET_READ_WAIT(test_phase_read_ch_bg_conflicts);
+	NVMEV_RESET_READ_WAIT(test_phase_read_ch_bg_wait_ns);
+	NVMEV_RESET_READ_WAIT(test_phase_read_pcie_conflicts);
+	NVMEV_RESET_READ_WAIT(test_phase_read_pcie_wait_ns);
+	NVMEV_RESET_READ_WAIT(test_phase_read_pcie_read_conflicts);
+	NVMEV_RESET_READ_WAIT(test_phase_read_pcie_read_wait_ns);
+	NVMEV_RESET_READ_WAIT(test_phase_read_pcie_bg_conflicts);
+	NVMEV_RESET_READ_WAIT(test_phase_read_pcie_bg_wait_ns);
+#undef NVMEV_RESET_READ_WAIT
+}
+
+static inline void nvmev_test_phase_bind_read_wait(struct nand_cmd *ncmd,
+						    struct conv_ftl *conv_ftl)
+{
+	if (!ncmd || !conv_ftl)
+		return;
+
+#define NVMEV_BIND_READ_WAIT(cmd_field, ftl_field) \
+	ncmd->cmd_field = &conv_ftl->ftl_field
+	NVMEV_BIND_READ_WAIT(tracked_read_die_conflicts, test_phase_read_die_conflicts);
+	NVMEV_BIND_READ_WAIT(tracked_read_die_wait_ns, test_phase_read_die_wait_ns);
+	NVMEV_BIND_READ_WAIT(tracked_read_die_read_conflicts, test_phase_read_die_read_conflicts);
+	NVMEV_BIND_READ_WAIT(tracked_read_die_read_wait_ns, test_phase_read_die_read_wait_ns);
+	NVMEV_BIND_READ_WAIT(tracked_read_die_bg_conflicts, test_phase_read_die_bg_conflicts);
+	NVMEV_BIND_READ_WAIT(tracked_read_die_bg_wait_ns, test_phase_read_die_bg_wait_ns);
+	NVMEV_BIND_READ_WAIT(tracked_read_ch_conflicts, test_phase_read_ch_conflicts);
+	NVMEV_BIND_READ_WAIT(tracked_read_ch_wait_ns, test_phase_read_ch_wait_ns);
+	NVMEV_BIND_READ_WAIT(tracked_read_ch_read_conflicts, test_phase_read_ch_read_conflicts);
+	NVMEV_BIND_READ_WAIT(tracked_read_ch_read_wait_ns, test_phase_read_ch_read_wait_ns);
+	NVMEV_BIND_READ_WAIT(tracked_read_ch_bg_conflicts, test_phase_read_ch_bg_conflicts);
+	NVMEV_BIND_READ_WAIT(tracked_read_ch_bg_wait_ns, test_phase_read_ch_bg_wait_ns);
+	NVMEV_BIND_READ_WAIT(tracked_read_pcie_conflicts, test_phase_read_pcie_conflicts);
+	NVMEV_BIND_READ_WAIT(tracked_read_pcie_wait_ns, test_phase_read_pcie_wait_ns);
+	NVMEV_BIND_READ_WAIT(tracked_read_pcie_read_conflicts, test_phase_read_pcie_read_conflicts);
+	NVMEV_BIND_READ_WAIT(tracked_read_pcie_read_wait_ns, test_phase_read_pcie_read_wait_ns);
+	NVMEV_BIND_READ_WAIT(tracked_read_pcie_bg_conflicts, test_phase_read_pcie_bg_conflicts);
+	NVMEV_BIND_READ_WAIT(tracked_read_pcie_bg_wait_ns, test_phase_read_pcie_bg_wait_ns);
+	NVMEV_BIND_READ_WAIT(tracked_read_lp_bypass_ops, test_phase_read_lp_bypass_ops);
+	NVMEV_BIND_READ_WAIT(tracked_read_lp_bypass_ns, test_phase_read_lp_bypass_ns);
+#undef NVMEV_BIND_READ_WAIT
+}
+
+static inline void nvmev_test_phase_read_wait_seq_print(struct seq_file *m,
+						 struct conv_ftl *conv_ftl)
+{
+	if (!m || !conv_ftl)
+		return;
+
+#define NVMEV_PRINT_READ_WAIT(name, field) \
+	seq_printf(m, name " %lld\n", atomic64_read(&conv_ftl->field))
+	NVMEV_PRINT_READ_WAIT("read_die_read_conflicts", test_phase_read_die_read_conflicts);
+	NVMEV_PRINT_READ_WAIT("read_die_read_wait_ns", test_phase_read_die_read_wait_ns);
+	NVMEV_PRINT_READ_WAIT("read_die_bg_conflicts", test_phase_read_die_bg_conflicts);
+	NVMEV_PRINT_READ_WAIT("read_die_bg_wait_ns", test_phase_read_die_bg_wait_ns);
+	NVMEV_PRINT_READ_WAIT("read_ch_conflicts", test_phase_read_ch_conflicts);
+	NVMEV_PRINT_READ_WAIT("read_ch_wait_ns", test_phase_read_ch_wait_ns);
+	NVMEV_PRINT_READ_WAIT("read_ch_read_conflicts", test_phase_read_ch_read_conflicts);
+	NVMEV_PRINT_READ_WAIT("read_ch_read_wait_ns", test_phase_read_ch_read_wait_ns);
+	NVMEV_PRINT_READ_WAIT("read_ch_bg_conflicts", test_phase_read_ch_bg_conflicts);
+	NVMEV_PRINT_READ_WAIT("read_ch_bg_wait_ns", test_phase_read_ch_bg_wait_ns);
+	NVMEV_PRINT_READ_WAIT("read_pcie_conflicts", test_phase_read_pcie_conflicts);
+	NVMEV_PRINT_READ_WAIT("read_pcie_wait_ns", test_phase_read_pcie_wait_ns);
+	NVMEV_PRINT_READ_WAIT("read_pcie_read_conflicts", test_phase_read_pcie_read_conflicts);
+	NVMEV_PRINT_READ_WAIT("read_pcie_read_wait_ns", test_phase_read_pcie_read_wait_ns);
+	NVMEV_PRINT_READ_WAIT("read_pcie_bg_conflicts", test_phase_read_pcie_bg_conflicts);
+	NVMEV_PRINT_READ_WAIT("read_pcie_bg_wait_ns", test_phase_read_pcie_bg_wait_ns);
+#undef NVMEV_PRINT_READ_WAIT
+}
+
+static inline void nvmev_bg_backlog_seq_print(struct seq_file *m,
+					      struct conv_ftl *conv_ftl)
+{
+	uint32_t head, tail, repromote_backlog;
+
+	if (!m || !conv_ftl)
+		return;
+	spin_lock(&conv_ftl->repromote_queue_lock);
+	head = conv_ftl->repromote_head;
+	tail = conv_ftl->repromote_tail;
+	repromote_backlog = tail >= head ? tail - head :
+		REPROMOTE_QUEUE_SIZE - head + tail;
+	spin_unlock(&conv_ftl->repromote_queue_lock);
+
+	seq_printf(m, "bg_repromote_backlog %u\n", repromote_backlog);
+	seq_printf(m, "bg_repromote_backlog_capacity %u\n",
+		   REPROMOTE_QUEUE_SIZE - 1);
+	seq_printf(m, "bg_qlc_closed_backlog %u\n",
+		   READ_ONCE(conv_ftl->qlc_closed_repromote_count));
+	seq_printf(m, "bg_qlc_closed_backlog_capacity %u\n",
+		   READ_ONCE(conv_ftl->qlc_closed_repromote_size));
+	seq_printf(m, "bg_slc_gc_backlog %u\n",
+		   READ_ONCE(conv_ftl->slc_sb_migrated_victim_count));
+	seq_printf(m, "bg_active_ops %d\n",
+		   atomic_read(&conv_ftl->test_phase_active_bg_ops));
+}
+
+static inline void
+nvmev_test_phase_read_overlap_seq_print(struct seq_file *m, struct conv_ftl *conv_ftl)
+{
+	if (!m || !conv_ftl)
+		return;
+
+	seq_printf(m, "read_begin_bg_active %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_begin_bg_active));
+	seq_printf(m, "bg_begin_read_active %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_bg_begin_read_active));
+	seq_printf(m, "last_read_issue_ns %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_last_read_issue_ns));
+	seq_printf(m, "read_issue_gap_count %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_issue_gap_count));
+	seq_printf(m, "read_issue_gap_sum_ns %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_issue_gap_sum_ns));
+	seq_printf(m, "read_issue_gap_max_ns %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_issue_gap_max_ns));
+	seq_printf(m, "read_issue_same_time %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_issue_same_time));
+	seq_printf(m, "read_issue_backwards %lld\n",
+		   atomic64_read(&conv_ftl->test_phase_read_issue_backwards));
+}
 
 #endif

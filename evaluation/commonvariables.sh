@@ -1,8 +1,8 @@
 ####################
 #Modify the following values to suit your system
-DATA_NAME="nvme4n1"
+DATA_NAME="nvme0n1"
 JOURNAL_NAME="sdb"
-NUMADOMAIN=2
+NUMADOMAIN=0
 ####################
 
 DATA_PAT_NAME=""$DATA_NAME"p1"

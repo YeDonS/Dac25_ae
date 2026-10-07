@@ -3,11 +3,14 @@
 #ifndef _CHANNEL_MODEL_H
 #define _CHANNEL_MODEL_H
 
+#include <linux/spinlock.h>
+
 /* Macros for channel model */
 #define NR_CREDIT_ENTRIES (1024 * 1024)
 #define UNIT_TIME_INTERVAL (2000ULL) //ns
 #define UNIT_XFER_SIZE (128ULL) //bytes
 #define UNIT_XFER_CREDITS (1) //credits needed to transfer data(UNIT_XFER_SIZE)
+#define CHMODEL_SCAN_LIMIT (4096U)
 
 #define SIZE_OF_CREDIT_T 1
 
@@ -33,7 +36,9 @@ struct channel_model {
 	uint32_t max_credits;
 	uint32_t command_credits;
 	uint32_t xfer_lat; /*XKB NAND CH transfer time in nanoseconds*/
-	credit_t avail_credits[NR_CREDIT_ENTRIES];
+	uint64_t overflow_tail; /* serialized tail for requests beyond credit-ring horizon */
+	credit_t *avail_credits;
+	spinlock_t lock;
 };
 
 #define BANDWIDTH_TO_TX_TIME(MB_S) (((UNIT_XFER_SIZE)*NS_PER_SEC(1)) / (MB(MB_S)))
@@ -41,5 +46,5 @@ struct channel_model {
 	(MB(MB_S) * UNIT_TIME_INTERVAL / NS_PER_SEC(1) / UNIT_XFER_SIZE * UNIT_XFER_CREDITS)
 
 uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64_t length);
-void chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/);
+int chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/);
 #endif

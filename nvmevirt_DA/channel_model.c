@@ -13,31 +13,48 @@ static inline unsigned long long __get_wallclock(void)
 	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
 }
 
-void chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/)
+int chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/)
 {
-	ch->head = 0;
-	ch->valid_len = 0;
-	ch->cur_time = 0;
+	size_t bytes = sizeof(credit_t) * NR_CREDIT_ENTRIES;
+
+	memset(ch, 0, sizeof(*ch));
+	ch->avail_credits = kvzalloc(bytes, GFP_KERNEL);
+	if (!ch->avail_credits) {
+		NVMEV_ERROR("Failed to allocate channel performance model memory (%zu bytes)\n",
+			    bytes);
+		return -ENOMEM;
+	}
+
 	ch->max_credits = BANDWIDTH_TO_MAX_CREDITS(bandwidth);
-	ch->command_credits = 0;
 	ch->xfer_lat = BANDWIDTH_TO_TX_TIME(bandwidth);
 
-	MEMSET(&(ch->avail_credits[0]), ch->max_credits, NR_CREDIT_ENTRIES);
+	spin_lock_init(&ch->lock);
+	MEMSET(ch->avail_credits, ch->max_credits, NR_CREDIT_ENTRIES);
 
 	NVMEV_INFO("[%s] bandwidth %llu max_credits %u tx_time %u\n", __FUNCTION__, bandwidth,
 		   ch->max_credits, ch->xfer_lat);
+
+	return 0;
 }
 
 uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64_t length)
 {
 	uint64_t cur_time = __get_wallclock();
+	uint64_t start_detect = ktime_get_ns();
 	uint32_t pos, next_pos;
 	uint32_t remaining_credits, consumed_credits;
 	uint32_t default_delay, delay = 0;
+	uint32_t scanned_slots = 0;
 	uint32_t valid_length;
 	uint64_t total_latency;
 	uint32_t units_to_xfer = DIV_ROUND_UP(length, UNIT_XFER_SIZE);
 	uint32_t cur_time_offs, request_time_offs;
+	uint64_t request_time_offs64;
+
+	if (!ch || !ch->avail_credits)
+		return request_time;
+
+	spin_lock(&ch->lock);
 
 	// Search current time index and move head to it
 	cur_time_offs = (cur_time / UNIT_TIME_INTERVAL) - (ch->cur_time / UNIT_TIME_INTERVAL);
@@ -58,23 +75,35 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 
 	if (ch->valid_len > NR_CREDIT_ENTRIES) {
 		NVMEV_ERROR("[%s] Invalid valid_len 0x%x\n", __FUNCTION__, ch->valid_len);
+		spin_unlock(&ch->lock);
 		NVMEV_ASSERT(0);
 	}
 
 	if (request_time < cur_time) {
 		NVMEV_DEBUG("[%s] Reqeust time is before the current time 0x%llx 0x%llx\n",
 			    __FUNCTION__, request_time, cur_time);
+		spin_unlock(&ch->lock);
 		return request_time; // return minimum delay
 	}
+
+	if (ch->overflow_tail <= cur_time)
+		ch->overflow_tail = 0;
+	if (ch->overflow_tail > request_time)
+		request_time = ch->overflow_tail;
 
 	//Search request time index
-	request_time_offs = (request_time / UNIT_TIME_INTERVAL) - (cur_time / UNIT_TIME_INTERVAL);
+	request_time_offs64 = (request_time / UNIT_TIME_INTERVAL) -
+			      (cur_time / UNIT_TIME_INTERVAL);
 
-	if (request_time_offs >= NR_CREDIT_ENTRIES) {
-		NVMEV_ERROR("[%s] Need to increase array size 0x%llx 0x%llx 0x%x\n", __FUNCTION__,
-			    request_time, cur_time, request_time_offs);
-		return request_time; // return minimum delay
+	if (request_time_offs64 >= NR_CREDIT_ENTRIES) {
+		uint64_t start = max_t(uint64_t, request_time, ch->overflow_tail);
+		uint64_t end = start + (uint64_t)ch->xfer_lat * units_to_xfer;
+
+		ch->overflow_tail = end;
+		spin_unlock(&ch->lock);
+		return end;
 	}
+	request_time_offs = (uint32_t)request_time_offs64;
 
 	pos = (ch->head + request_time_offs) % NR_CREDIT_ENTRIES;
 	remaining_credits = units_to_xfer * UNIT_XFER_CREDITS;
@@ -84,6 +113,22 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 	delay = 0;
 
 	while (1) {
+		if (scanned_slots++ >= CHMODEL_SCAN_LIMIT) {
+			uint32_t extra_slots =
+				DIV_ROUND_UP(remaining_credits, ch->max_credits);
+
+			if (printk_ratelimit())
+				NVMEV_ERROR("[%s] credit scan capped req=0x%llx cur=0x%llx offs=0x%x valid_len=0x%x remaining=%u\n",
+					    __FUNCTION__, request_time, cur_time,
+					    request_time_offs, ch->valid_len,
+					    remaining_credits);
+			delay += extra_slots;
+			ch->overflow_tail = max_t(uint64_t, ch->overflow_tail,
+				request_time + (uint64_t)(delay + 1) *
+				UNIT_TIME_INTERVAL);
+			remaining_credits = 0;
+			break;
+		}
 		consumed_credits = (remaining_credits <= ch->avail_credits[pos]) ?
 					   remaining_credits :
 					   ch->avail_credits[pos];
@@ -97,8 +142,18 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 				delay++;
 				pos = next_pos;
 			} else {
-				NVMEV_ERROR("[%s] No free entry 0x%llx 0x%llx 0x%x\n", __FUNCTION__,
-					    request_time, cur_time, request_time_offs);
+				uint32_t extra_slots =
+					DIV_ROUND_UP(remaining_credits, ch->max_credits);
+
+				if (printk_ratelimit())
+					NVMEV_ERROR("[%s] credit horizon overflow req=0x%llx cur=0x%llx offs=0x%x valid_len=0x%x\n",
+						    __FUNCTION__, request_time, cur_time,
+						    request_time_offs, ch->valid_len);
+				delay += extra_slots;
+				ch->overflow_tail = max_t(uint64_t, ch->overflow_tail,
+					request_time + (uint64_t)(delay + 1) *
+					UNIT_TIME_INTERVAL);
+				remaining_credits = 0;
 				break;
 			}
 		} else
@@ -111,10 +166,18 @@ uint64_t chmodel_request(struct channel_model *ch, uint64_t request_time, uint64
 	if (valid_length > ch->valid_len)
 		ch->valid_len = valid_length;
 
+	spin_unlock(&ch->lock);
+
 	// check if array is small..
 	delay = (delay > default_delay) ? (delay - default_delay) : 0;
 
 	total_latency = (ch->xfer_lat * units_to_xfer) + (delay * UNIT_TIME_INTERVAL);
+
+	uint64_t end_detect = ktime_get_ns();
+	if (end_detect - start_detect > 100000000) { // > 100ms
+		NVMEV_ERROR("SLOW_PATH: chmodel_request took %llu ns! MEMSET? valid_len=%u\n",
+			    end_detect - start_detect, ch->valid_len);
+	}
 
 	return request_time + total_latency;
 }

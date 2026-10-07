@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include "nvmev.h"
-#include "pci.h"
 #include "conv_ftl.h"
 #if 0  // Force disabled ZNS support
 #include "zns_ftl.h"
@@ -12,120 +11,8 @@
 #define cq_entry(entry_id) \
 	queue->nvme_cq[CQ_ENTRY_TO_PAGE_NUM(entry_id)][CQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
 
-#include <linux/mm.h> /* for pfn_valid, page_address */
-#include <linux/dma-mapping.h>
-#include <linux/iommu.h>
-
-#define NVMEV_ADMIN_LOG(string, args...) NVMEV_INFO("admin: " string, ##args)
-#define NVMEV_ADMIN_ERR(string, args...) NVMEV_ERROR("admin: " string, ##args)
-
-/* Safe PRP translation:
- * - Translates DMA addr -> phys (IOMMU aware)
- * - Guards overflow on addr+len
- * - Returns NULL on any check failure so callers can bail early
- */
-static inline bool nvmev_dma_to_phys(dma_addr_t dma, phys_addr_t *phys_out)
-{
-#ifdef CONFIG_IOMMU_API
-	struct iommu_domain *domain;
-
-	if (nvmev_vdev && nvmev_vdev->pdev) {
-		domain = iommu_get_domain_for_dev(&nvmev_vdev->pdev->dev);
-		if (domain) {
-			phys_addr_t phys = iommu_iova_to_phys(domain, dma);
-			if (!phys && dma)
-				return false;
-			*phys_out = phys;
-			return true;
-		}
-	}
-#endif
-	*phys_out = (phys_addr_t)dma;
-	return true;
-}
-
-static inline void *nvmev_prp_address_offset(u64 prp, unsigned int page_off, size_t len)
-{
-	dma_addr_t dma, dma_end;
-	phys_addr_t phys;
-	u64 phys_end;
-	struct page *page;
-	void *kaddr;
-
-	if (!nvmev_vdev || !nvmev_vdev->pdev)
-		return NULL;
-
-	dma = prp + ((u64)page_off << PAGE_SHIFT);
-	dma_end = dma + len - 1;
-
-	/* overflow or zero length */
-	if (len == 0 || dma_end < dma) {
-		NVMEV_ADMIN_ERR("prp invalid len/overflow: prp=0x%llx off=%u len=%zu\n",
-				(unsigned long long)prp, page_off, len);
-		return NULL;
-	}
-
-	if (!nvmev_dma_to_phys(dma, &phys)) {
-		NVMEV_ADMIN_ERR("prp dma->phys fail: prp=0x%llx off=%u len=%zu dma=0x%llx\n",
-				(unsigned long long)prp, page_off, len,
-				(unsigned long long)dma);
-		return NULL;
-	}
-	phys_end = phys + len - 1;
-	if (phys_end < phys) {
-		NVMEV_ADMIN_ERR("prp phys overflow: prp=0x%llx off=%u len=%zu phys=0x%llx\n",
-				(unsigned long long)prp, page_off, len,
-				(unsigned long long)phys);
-		return NULL;
-	}
-
-	if (!pfn_valid(phys >> PAGE_SHIFT)) {
-		NVMEV_ADMIN_ERR("prp pfn invalid: prp=0x%llx off=%u len=%zu phys=0x%llx pfn=0x%llx\n",
-				(unsigned long long)prp, page_off, len,
-				(unsigned long long)phys,
-				(unsigned long long)(phys >> PAGE_SHIFT));
-		return NULL;
-	}
-
-	page = pfn_to_page(phys >> PAGE_SHIFT);
-	kaddr = page_address(page);
-	if (!kaddr) {
-		NVMEV_ADMIN_ERR("prp page_address null: prp=0x%llx off=%u len=%zu phys=0x%llx\n",
-				(unsigned long long)prp, page_off, len,
-				(unsigned long long)phys);
-		return NULL;
-	}
-
-	NVMEV_ADMIN_LOG("prp ok: prp=0x%llx off=%u len=%zu dma=0x%llx phys=0x%llx kaddr=%px ref=%d\n",
-			(unsigned long long)prp, page_off, len,
-			(unsigned long long)dma, (unsigned long long)phys,
-			kaddr, page_count(page));
-	return kaddr + (phys & ~PAGE_MASK);
-}
-
-#define prp_address_offset(prp, offset) nvmev_prp_address_offset((prp), (offset), PAGE_SIZE)
-#define prp_address_len(prp, len)      nvmev_prp_address_offset((prp), 0, (len))
-
-static inline void nvmev_admin_complete(struct nvmev_admin_queue *queue, int cq_head,
-					int entry_id, u16 status)
-{
-	cq_entry(cq_head).command_id = sq_entry(entry_id).common.command_id;
-	cq_entry(cq_head).sq_id = 0;
-	cq_entry(cq_head).sq_head = entry_id;
-	cq_entry(cq_head).status = queue->phase | (status << 1);
-
-	NVMEV_ADMIN_LOG("cqe: opcode=0x%x cid=%u sq_head=%d cq_head=%d phase=%d status=0x%x\n",
-			sq_entry(entry_id).common.opcode,
-			sq_entry(entry_id).common.command_id,
-			entry_id, cq_head, queue->phase, status);
-}
-
-static inline void nvmev_admin_complete_err(struct nvmev_admin_queue *queue, int cq_head,
-					    int entry_id, u16 status)
-{
-	nvmev_admin_complete(queue, cq_head, entry_id, status);
-	cq_entry(cq_head).result0 = 0;
-}
+#define prp_address_offset(prp, offset) (page_address(pfn_to_page(prp >> PAGE_SHIFT) + offset) + (prp & ~PAGE_MASK))
+#define prp_address(prp) prp_address_offset(prp, 0)
 
 static void __nvmev_admin_create_cq(int eid, int cq_head)
 {
@@ -162,14 +49,6 @@ static void __nvmev_admin_create_cq(int eid, int cq_head)
 	cq->cq = kzalloc(sizeof(struct nvme_completion *) * num_pages, GFP_KERNEL);
 	for (i = 0; i < num_pages; i++) {
 		cq->cq[i] = prp_address_offset(cmd->prp1, i);
-		if (!cq->cq[i]) {
-			NVMEV_ERROR("CREATE_CQ prp invalid: prp1=0x%llx page=%u\n",
-				    cmd->prp1, i);
-			kfree(cq->cq);
-			kfree(cq);
-			nvmev_admin_complete(queue, cq_head, eid, NVME_SC_INVALID_FIELD);
-			return;
-		}
 	}
 
 	nvmev_vdev->cqes[cq->qid] = cq;
@@ -224,9 +103,6 @@ static void __nvmev_admin_create_sq(int eid, int cq_head)
 
 	sq->sq_priority = cmd->sq_flags & 0xFFFE;
 	sq->queue_size = cmd->qsize + 1;
-	atomic_set(&sq->refcnt, 1);
-	init_waitqueue_head(&sq->ref_wait);
-	sq->deleting = false;
 
 	/* TODO Physically non-contiguous prp list */
 	sq->phys_contig = (cmd->sq_flags & NVME_QUEUE_PHYS_CONTIG) ? true : false;
@@ -237,14 +113,6 @@ static void __nvmev_admin_create_sq(int eid, int cq_head)
 
 	for (i = 0; i < num_pages; i++) {
 		sq->sq[i] = prp_address_offset(cmd->prp1, i);
-		if (!sq->sq[i]) {
-			NVMEV_ERROR("CREATE_SQ prp invalid: prp1=0x%llx page=%u\n",
-				    cmd->prp1, i);
-			kfree(sq->sq);
-			kfree(sq);
-			nvmev_admin_complete(queue, cq_head, eid, NVME_SC_INVALID_FIELD);
-			return;
-		}
 	}
 	nvmev_vdev->sqes[sq->qid] = sq;
 
@@ -271,15 +139,9 @@ static void __nvmev_admin_delete_sq(int eid, int cq_head)
 	qid = sq_entry(eid).delete_queue.qid;
 
 	sq = nvmev_vdev->sqes[qid];
-	if (sq) {
-		WRITE_ONCE(sq->deleting, true);
-		smp_mb();
-	}
 	nvmev_vdev->sqes[qid] = NULL;
 
 	if (sq) {
-		nvmev_sq_put(sq);
-		wait_event(sq->ref_wait, atomic_read(&sq->refcnt) == 0);
 		kfree(sq->sq);
 		kfree(sq);
 	}
@@ -295,12 +157,7 @@ static void __nvmev_admin_identify_ctrl(int eid, int cq_head)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_id_ctrl *ctrl;
 
-	ctrl = prp_address_len(sq_entry(eid).identify.prp1, sizeof(*ctrl));
-	if (!ctrl)
-		goto invalid_prp;
-	NVMEV_ADMIN_LOG("identify ctrl: prp1=0x%llx kaddr=%px len=%zu\n",
-			(unsigned long long)sq_entry(eid).identify.prp1,
-			ctrl, sizeof(*ctrl));
+	ctrl = prp_address(sq_entry(eid).identify.prp1);
 	memset(ctrl, 0x00, sizeof(*ctrl));
 
 	ctrl->nn = nvmev_vdev->nr_ns;
@@ -314,13 +171,10 @@ static void __nvmev_admin_identify_ctrl(int eid, int cq_head)
 	ctrl->sqes = 0x66;
 	ctrl->cqes = 0x44;
 
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_SUCCESS);
-	return;
-
-invalid_prp:
-	NVMEV_ERROR("Invalid PRP for identify ctrl: prp1=0x%llx\n",
-		    sq_entry(eid).identify.prp1);
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_INVALID_FIELD);
+	cq_entry(cq_head).command_id = sq_entry(eid).features.command_id;
+	cq_entry(cq_head).sq_id = 0;
+	cq_entry(cq_head).sq_head = eid;
+	cq_entry(cq_head).status = queue->phase | NVME_SC_SUCCESS << 1;
 }
 
 static void __nvmev_admin_get_log_page(int eid, int cq_head)
@@ -330,14 +184,7 @@ static void __nvmev_admin_get_log_page(int eid, int cq_head)
 	void *page;
 	uint32_t len = ((((uint32_t)cmd->numdu << 16) | cmd->numdl) + 1) << 2;
 
-	page = prp_address_len(cmd->prp1, len);
-	if (!page) {
-		NVMEV_ERROR("Invalid PRP for log page: prp1=0x%llx len=%u\n",
-			    cmd->prp1, len);
-		goto invalid_prp;
-	}
-	NVMEV_ADMIN_LOG("get_log_page: lid=0x%x prp1=0x%llx len=%u kaddr=%px\n",
-			cmd->lid, (unsigned long long)cmd->prp1, len, page);
+	page = prp_address(cmd->prp1);
 
 	switch (cmd->lid) {
 	case NVME_LOG_SMART: {
@@ -353,8 +200,6 @@ static void __nvmev_admin_get_log_page(int eid, int cq_head)
 
 		NVMEV_INFO("Handling NVME_LOG_SMART\n");
 
-		NVMEV_ADMIN_LOG("log_page copy: lid=0x%x len=%u kaddr=%px\n",
-				cmd->lid, len, page);
 		__memcpy(page, &smart_log, len);
 		break;
 	}
@@ -387,8 +232,6 @@ static void __nvmev_admin_get_log_page(int eid, int cq_head)
 
 		NVMEV_INFO("Handling NVME_LOG_CMD_EFFECTS\n");
 
-		NVMEV_ADMIN_LOG("log_page copy: lid=0x%x len=%u kaddr=%px\n",
-				cmd->lid, len, page);
 		__memcpy(page, &effects_log, len);
 		break;
 	}
@@ -406,17 +249,14 @@ static void __nvmev_admin_get_log_page(int eid, int cq_head)
 		NVMEV_ERROR("Unimplemented log page identifier: 0x%hhx,"
 			    "the system will be unstable!\n",
 			    cmd->lid);
-		NVMEV_ADMIN_LOG("log_page memset: lid=0x%x len=%u kaddr=%px\n",
-				cmd->lid, len, page);
 		__memset(page, 0, len);
 		break;
 	}
 
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_SUCCESS);
-	return;
-
-invalid_prp:
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_INVALID_FIELD);
+	cq_entry(cq_head).command_id = sq_entry(eid).features.command_id;
+	cq_entry(cq_head).sq_id = 0;
+	cq_entry(cq_head).sq_head = eid;
+	cq_entry(cq_head).status = queue->phase | NVME_SC_SUCCESS << 1;
 }
 
 static void __nvmev_admin_identify_namespace(int eid, int cq_head)
@@ -427,12 +267,7 @@ static void __nvmev_admin_identify_namespace(int eid, int cq_head)
 	size_t nsid = cmd->nsid - 1;
 	NVMEV_DEBUG("[%s] \n", __FUNCTION__);
 
-	ns = prp_address_len(cmd->prp1, PAGE_SIZE);
-	if (!ns)
-		goto invalid_prp;
-	NVMEV_ADMIN_LOG("identify ns: nsid=%u prp1=0x%llx kaddr=%px len=%lu\n",
-			cmd->nsid, (unsigned long long)cmd->prp1, ns,
-			(unsigned long)PAGE_SIZE);
+	ns = prp_address(cmd->prp1);
 	memset(ns, 0x0, PAGE_SIZE);
 
 	ns->lbaf[0].ms = 0;
@@ -471,13 +306,10 @@ static void __nvmev_admin_identify_namespace(int eid, int cq_head)
 	ns->flbas = 0;
 	ns->dps = 0;
 
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_SUCCESS);
-	return;
-
-invalid_prp:
-	NVMEV_ERROR("Invalid PRP for identify ns: prp1=0x%llx\n",
-		    cmd->prp1);
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_INVALID_FIELD);
+	cq_entry(cq_head).command_id = sq_entry(eid).features.command_id;
+	cq_entry(cq_head).sq_id = 0;
+	cq_entry(cq_head).sq_head = eid;
+	cq_entry(cq_head).status = queue->phase | NVME_SC_SUCCESS << 1;
 }
 
 static void __nvmev_admin_identify_namespaces(int eid, int cq_head)
@@ -489,12 +321,7 @@ static void __nvmev_admin_identify_namespaces(int eid, int cq_head)
 
 	NVMEV_DEBUG("[%s] ns %d\n", __FUNCTION__, cmd->nsid);
 
-	ns = prp_address_len(cmd->prp1, PAGE_SIZE * 2);
-	if (!ns)
-		goto invalid_prp;
-	NVMEV_ADMIN_LOG("identify ns list: nsid=%u prp1=0x%llx kaddr=%px len=%lu\n",
-			cmd->nsid, (unsigned long long)cmd->prp1, ns,
-			(unsigned long)(PAGE_SIZE * 2));
+	ns = prp_address(cmd->prp1);
 	memset(ns, 0x00, PAGE_SIZE * 2);
 
 	for (i = 1; i <= nvmev_vdev->nr_ns; i++) {
@@ -505,13 +332,10 @@ static void __nvmev_admin_identify_namespaces(int eid, int cq_head)
 		}
 	}
 
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_SUCCESS);
-	return;
-
-invalid_prp:
-	NVMEV_ERROR("Invalid PRP for identify ns list: prp1=0x%llx\n",
-		    cmd->prp1);
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_INVALID_FIELD);
+	cq_entry(cq_head).command_id = sq_entry(eid).features.command_id;
+	cq_entry(cq_head).sq_id = 0;
+	cq_entry(cq_head).sq_head = eid;
+	cq_entry(cq_head).status = queue->phase | NVME_SC_SUCCESS << 1;
 }
 
 static void __nvmev_admin_identify_namespace_desc(int eid, int cq_head)
@@ -523,12 +347,7 @@ static void __nvmev_admin_identify_namespace_desc(int eid, int cq_head)
 
 	NVMEV_DEBUG("[%s] ns %d\n", __FUNCTION__, cmd->nsid);
 
-	ns_desc = prp_address_len(cmd->prp1, sizeof(*ns_desc));
-	if (!ns_desc)
-		goto invalid_prp;
-	NVMEV_ADMIN_LOG("identify ns desc: nsid=%u prp1=0x%llx kaddr=%px len=%zu\n",
-			cmd->nsid, (unsigned long long)cmd->prp1, ns_desc,
-			sizeof(*ns_desc));
+	ns_desc = prp_address(cmd->prp1);
 	memset(ns_desc, 0x00, sizeof(*ns_desc));
 
 	ns_desc->nidt = NVME_NIDT_CSI;
@@ -536,13 +355,10 @@ static void __nvmev_admin_identify_namespace_desc(int eid, int cq_head)
 
 	ns_desc->nid[0] = nvmev_vdev->ns[nsid].csi; // Zoned Name Space Command Set
 
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_SUCCESS);
-	return;
-
-invalid_prp:
-	NVMEV_ERROR("Invalid PRP for identify ns desc: prp1=0x%llx\n",
-		    cmd->prp1);
-	nvmev_admin_complete(queue, cq_head, eid, NVME_SC_INVALID_FIELD);
+	cq_entry(cq_head).command_id = sq_entry(eid).features.command_id;
+	cq_entry(cq_head).sq_id = 0;
+	cq_entry(cq_head).sq_head = eid;
+	cq_entry(cq_head).status = queue->phase | NVME_SC_SUCCESS << 1;
 }
 
 #if 0  // Force disabled ZNS support - ZNS functions completely removed
@@ -666,10 +482,6 @@ static void __nvmev_admin_set_features(int eid, int cq_head)
 
 static void __nvmev_admin_get_features(int eid, int cq_head)
 {
-	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
-
-	NVMEV_ERROR("Get features not implemented: fid=%u\n", sq_entry(eid).features.fid);
-	nvmev_admin_complete_err(queue, cq_head, eid, NVME_SC_INVALID_FIELD);
 }
 
 static void __nvmev_proc_admin_req(int entry_id)
@@ -680,16 +492,6 @@ static void __nvmev_proc_admin_req(int entry_id)
 
 	NVMEV_DEBUG("%s: %x %d %d %d\n", __func__, sq_entry(entry_id).identify.opcode, entry_id,
 		    sq_entry(entry_id).common.command_id, cq_head);
-	NVMEV_ADMIN_LOG("admin req: opcode=0x%x cid=%u sq_head=%d cq_head=%d phase=%d prp1=0x%llx prp2=0x%llx nsid=%u\n",
-			sq_entry(entry_id).common.opcode,
-			sq_entry(entry_id).common.command_id,
-			entry_id, cq_head, queue->phase,
-			(unsigned long long)sq_entry(entry_id).common.prp1,
-			(unsigned long long)sq_entry(entry_id).common.prp2,
-			sq_entry(entry_id).identify.nsid);
-
-	/* Default to invalid opcode to avoid phantom completions */
-	nvmev_admin_complete_err(queue, cq_head, entry_id, NVME_SC_INVALID_OPCODE);
 
 	switch (sq_entry(entry_id).common.opcode) {
 	case nvme_admin_delete_sq:
@@ -732,18 +534,16 @@ static void __nvmev_proc_admin_req(int entry_id)
 #endif
 		default:
 			NVMEV_ERROR("I don't know %d\n", cns);
-			nvmev_admin_complete_err(queue, cq_head, entry_id, NVME_SC_INVALID_FIELD);
 		}
 		break;
 	case nvme_admin_abort_cmd:
-		NVMEV_ERROR("Abort cmd not implemented\n");
-		nvmev_admin_complete_err(queue, cq_head, entry_id, NVME_SC_INVALID_OPCODE);
 		break;
 	case nvme_admin_set_features:
 		__nvmev_admin_set_features(entry_id, cq_head);
 		break;
 	case nvme_admin_get_features:
 		__nvmev_admin_get_features(entry_id, cq_head);
+		break;
 		break;
 	case nvme_admin_async_event:
 		cq_entry(cq_head).command_id = sq_entry(entry_id).features.command_id;
@@ -777,18 +577,8 @@ void nvmev_proc_admin_sq(int new_db, int old_db)
 	int curr = old_db;
 	int seq;
 
-	if (!queue || !queue->nvme_sq || !queue->nvme_cq ||
-	    queue->sq_depth <= 0 || queue->cq_depth <= 0)
-		return;
-
-	if (!nvmev_vdev->bar->cc.en || !nvmev_vdev->bar->csts.rdy)
-		return;
-
 	if (num_proc < 0)
 		num_proc += queue->sq_depth;
-
-	/* Ensure SQ entries are visible after the host updates doorbell */
-	dma_rmb();
 
 	for (seq = 0; seq < num_proc; seq++) {
 		__nvmev_proc_admin_req(curr++);
@@ -798,8 +588,6 @@ void nvmev_proc_admin_sq(int new_db, int old_db)
 		}
 	}
 
-	/* Ensure PRP writes and CQEs are visible before raising IRQ */
-	wmb();
 	nvmev_signal_irq(0);
 }
 

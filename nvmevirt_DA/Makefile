@@ -15,6 +15,8 @@ ifeq ($(APPROACH),off)
 ccflags-y += -DDIEAFFINITY=0
 endif
 
+ccflags-y += $(NVMEV_EXTRA_CFLAGS)
+
 obj-m   := nvmev.o
 nvmev-objs := main.o pci.o admin.o io.o dma.o
 ccflags-y += -Wno-unused-variable -Wno-unused-function

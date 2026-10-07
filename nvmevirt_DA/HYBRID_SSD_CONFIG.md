@@ -118,9 +118,9 @@ dmesg | grep -E "(SLC|QLC|Migration|Write Stats)"
 
 ### 1. 初始化日志
 ```
-[nvmev] SLC blocks per plane: 1638 (20%), QLC blocks per plane: 6554 (80%)
+[nvmev] SLC blocks per plane: 512 (20%), QLC blocks per plane: 1920 (80%)
 [nvmev] Heat tracking initialized for 134217728 pages
-[nvmev] SLC/QLC Hybrid Mode: SLC 1638 blks, QLC 6554 blks (4 regions)
+[nvmev] SLC/QLC Hybrid Mode: SLC 512 blks, QLC 1920 blks (4 regions)
 ```
 
 ### 2. 运行时统计
